@@ -1,0 +1,62 @@
+[package]
+name = "xmr-ancap-gateway"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+authors = ["xmr-ancap-gateway contributors"]
+description = "Production-grade, non-custodial Monero (XMR) payment gateway and auto-sweep engine"
+license = "MIT"
+readme = "README.md"
+keywords = ["monero", "xmr", "payment-gateway", "cryptocurrency", "non-custodial"]
+categories = ["cryptography::cryptocurrencies", "web-programming::http-server"]
+
+[lib]
+name = "xmr_ancap_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "xmr-ancap-gateway"
+path = "src/main.rs"
+
+[dependencies]
+# Web framework & async runtime
+axum = { version = "0.8", features = ["json", "macros"] }
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.7", features = ["trace", "cors", "timeout", "request-id", "sensitive-headers"] }
+
+# Persistence (SQLite WAL mode)
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "migrate", "chrono", "uuid"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# HTTP client & RFC 2617/7616 Digest auth for monero-wallet-rpc
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+digest_auth = "0.3"
+url = "2.5"
+
+# Cryptography & constant-time authentication
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+subtle = "2.6"
+
+# QR code generation (PNG -> Base64)
+qrcode = { version = "0.14", default-features = false, features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+base64 = "0.22"
+
+# Observability, errors & utilities
+dotenvy = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+thiserror = "2.0"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.16", features = ["v4", "serde"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+http-body-util = "0.1"
+tempfile = "3.19"

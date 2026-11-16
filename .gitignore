@@ -1,0 +1,39 @@
+# Rust build artifacts & backups
+/target/
+**/*.rs.bk
+# Note: Cargo.lock is intentionally tracked for reproducible binary builds
+
+# Environment files & local overrides (keep .env.example tracked)
+.env
+.env.*
+*.env
+!.env.example
+
+# SQLite databases & WAL journals
+*.db
+*.db-shm
+*.db-wal
+*.sqlite*
+/data/
+/data.*/
+
+# Monero wallet files, keys, binaries, and logs
+*.keys
+*.wallet
+*.mms
+*.address.txt
+*.log
+*.log-*
+/bin/
+/wallets/
+
+# Temporary / IDE / OS files
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
