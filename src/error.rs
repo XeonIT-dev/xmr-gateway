@@ -1,4 +1,4 @@
-//! Unified error types and HTTP error mapping for `xmr-ancap-gateway`.
+//! Unified error types and HTTP error mapping for `xmr-gateway`.
 //!
 //! All fallible operations across configuration, domain validation, SQLite persistence,
 //! `monero-wallet-rpc` communication, QR code generation, and webhook delivery map into

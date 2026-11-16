@@ -273,7 +273,7 @@ impl WebhookDispatcher {
             .http
             .post(&delivery.target_url)
             .header(header::CONTENT_TYPE, "application/json")
-            .header(header::USER_AGENT, "xmr-ancap-gateway/0.1.0")
+            .header(header::USER_AGENT, "xmr-gateway/0.1.0")
             .header("X-Signature-256", &delivery.signature_hex)
             .header("X-Webhook-Event", delivery.event_type.as_str())
             .header("X-Delivery-Id", delivery.id.to_string())

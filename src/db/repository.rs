@@ -156,7 +156,7 @@ pub struct MarkSweptParams {
     pub now: DateTime<Utc>,
 }
 
-/// SQLite repository providing transactional persistence for `xmr-ancap-gateway`.
+/// SQLite repository providing transactional persistence for `xmr-gateway`.
 #[derive(Debug, Clone)]
 pub struct InvoiceRepository {
     pool: SqlitePool,

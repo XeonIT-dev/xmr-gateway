@@ -1,4 +1,9 @@
-# `xmr-ancap-gateway`
+# `xmr-gateway`
+
+[![CI](https://github.com/XeonIT-dev/xmr-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/XeonIT-dev/xmr-gateway/actions/workflows/ci.yml)
+[![Security Audit](https://github.com/XeonIT-dev/xmr-gateway/actions/workflows/security.yml/badge.svg)](https://github.com/XeonIT-dev/xmr-gateway/actions/workflows/security.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
 **A self-hosted, non-custodial Monero (XMR) payment gateway and isolated subaddress auto-sweep engine written in Rust.**
 
@@ -23,7 +28,7 @@ Designed for sovereign merchants, Telegram commerce bots, and privacy-first infr
 ```text
 +-----------------------+       POST /api/v1/invoices (X-API-Key)       +---------------------------+
 |                       | --------------------------------------------> |                           |
-|   Merchant Backend    |                                               |     xmr-ancap-gateway     |
+|   Merchant Backend    |                                               |     xmr-gateway     |
 | (Bot / Storefront)    | <-------------------------------------------- |      (Axum REST API)      |
 |                       |   POST Webhook + X-Signature-256 (HMAC-SHA256)|       127.0.0.1:8080      |
 +-----------------------+                                               +-------------+-------------+
@@ -127,8 +132,8 @@ Install Rust (`1.88+`) via [rustup](https://rustup.rs) and standard CLI tools:
 ### 2. Clone, Configure & Build
 
 ```bash
-git clone <repository-url>
-cd xmr-ancap-gateway
+git clone https://github.com/XeonIT-dev/xmr-gateway.git
+cd xmr-gateway
 
 cp .env.example .env
 openssl rand -hex 32   # API_SECRET_KEY
@@ -157,7 +162,7 @@ What `./start.sh` handles automatically:
 2. Downloads the official Linux x64 Monero CLI release (`monero-wallet-rpc` and `monero-wallet-cli`) into `./bin/` and verifies its SHA-256 digest against `https://www.getmonero.org/downloads/hashes.txt` (or run `make setup-rpc` beforehand).
 3. Initializes a local wallet in `./data/wallet/` at `WALLET_RESTORE_HEIGHT` (avoids scanning from genesis block `0`).
 4. Starts `monero-wallet-rpc` bound strictly to `127.0.0.1:18082` connected to `MONERO_REMOTE_NODE` (zero local blockchain disk bloat), optionally routed through Tor (`MONERO_RPC_PROXY=127.0.0.1:9050`).
-5. Starts `./target/release/xmr-ancap-gateway` and gracefully shuts down both processes on `SIGINT`/`SIGTERM`.
+5. Starts `./target/release/xmr-gateway` and gracefully shuts down both processes on `SIGINT`/`SIGTERM`.
 
 ### 4. Single-Terminal Stagenet Live Demo
 
@@ -185,7 +190,7 @@ curl -s http://127.0.0.1:8080/health | jq .
 ```json
 {
   "status": "ok",
-  "service": "xmr-ancap-gateway",
+  "service": "xmr-gateway",
   "version": "0.1.0",
   "database": "connected",
   "monero_rpc": {

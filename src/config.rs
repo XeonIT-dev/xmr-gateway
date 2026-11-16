@@ -35,7 +35,7 @@ impl LogFormat {
     }
 }
 
-/// Complete, validated configuration for `xmr-ancap-gateway`.
+/// Complete, validated configuration for `xmr-gateway`.
 ///
 /// # Security Invariants
 /// - `api_secret_key` and `webhook_secret` must be non-empty.

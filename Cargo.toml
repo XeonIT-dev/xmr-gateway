@@ -1,9 +1,9 @@
 [package]
-name = "xmr-ancap-gateway"
+name = "xmr-gateway"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-authors = ["xmr-ancap-gateway contributors"]
+authors = ["xmr-gateway contributors"]
 description = "Production-grade, non-custodial Monero (XMR) payment gateway and auto-sweep engine"
 license = "MIT"
 readme = "README.md"
@@ -11,11 +11,11 @@ keywords = ["monero", "xmr", "payment-gateway", "cryptocurrency", "non-custodial
 categories = ["cryptography::cryptocurrencies", "web-programming::http-server"]
 
 [lib]
-name = "xmr_ancap_gateway"
+name = "xmr_gateway"
 path = "src/lib.rs"
 
 [[bin]]
-name = "xmr-ancap-gateway"
+name = "xmr-gateway"
 path = "src/main.rs"
 
 [dependencies]

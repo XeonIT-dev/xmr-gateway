@@ -15,7 +15,7 @@ We aim to acknowledge reports within 48 hours and coordinate a fix before public
 
 ## Production Security Checklist
 
-Before deploying `xmr-ancap-gateway` on mainnet:
+Before deploying `xmr-gateway` on mainnet:
 
 - [ ] **Strong Secrets:** `API_SECRET_KEY`, `WEBHOOK_SECRET`, and `MONERO_RPC_PASS` are freshly generated with at least 32 random bytes (`openssl rand -hex 32`), not defaults or placeholders.
 - [ ] **Loopback Isolation:** `HOST=127.0.0.1` is retained, and external API access (if needed) is terminated through a TLS reverse proxy (Caddy/Nginx).

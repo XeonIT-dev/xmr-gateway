@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# xmr-ancap-gateway Native Bare-Metal Orchestrator (Fedora / Debian)
+# xmr-gateway Native Bare-Metal Orchestrator (Fedora / Debian)
 # ==============================================================================
 # Manages .env secret initialization, optional SHA256-verified Monero CLI setup,
 # non-interactive mainnet/stagenet wallet creation, local monero-wallet-rpc
@@ -22,7 +22,7 @@ WALLET_FILE="$WALLET_DIR/gateway_wallet"
 WALLET_PASS_FILE="$WALLET_DIR/gateway_wallet.password"
 RPC_LOG_FILE="$DATA_DIR/monero-wallet-rpc.log"
 CLI_LOG_FILE="$DATA_DIR/monero-wallet-cli.log"
-GATEWAY_BIN="$SCRIPT_DIR/target/release/xmr-ancap-gateway"
+GATEWAY_BIN="$SCRIPT_DIR/target/release/xmr-gateway"
 
 MONERO_CLI_URL="https://downloads.getmonero.org/cli/linux64"
 MONERO_HASHES_URL="https://www.getmonero.org/downloads/hashes.txt"
@@ -61,7 +61,7 @@ cleanup() {
     CLEANED_UP=1
 
     if [[ -n "$GATEWAY_PID" ]] && kill -0 "$GATEWAY_PID" 2>/dev/null; then
-        log_info "Stopping xmr-ancap-gateway (PID $GATEWAY_PID)..."
+        log_info "Stopping xmr-gateway (PID $GATEWAY_PID)..."
         kill -TERM "$GATEWAY_PID" 2>/dev/null || true
         wait "$GATEWAY_PID" 2>/dev/null || true
     fi
@@ -431,7 +431,7 @@ build_gateway_if_needed() {
     fi
 
     if [[ "$needs_build" -eq 1 ]]; then
-        log_info "Building xmr-ancap-gateway (--release)..."
+        log_info "Building xmr-gateway (--release)..."
         cargo build --release
     else
         log_info "Using up-to-date release binary: $GATEWAY_BIN"
@@ -481,7 +481,7 @@ main() {
     start_monero_wallet_rpc
     build_gateway_if_needed
 
-    log_info "Starting xmr-ancap-gateway on http://${HOST}:${PORT}..."
+    log_info "Starting xmr-gateway on http://${HOST}:${PORT}..."
     "$GATEWAY_BIN" &
     GATEWAY_PID=$!
     wait "$GATEWAY_PID"

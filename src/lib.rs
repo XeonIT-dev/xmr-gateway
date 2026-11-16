@@ -1,4 +1,4 @@
-//! `xmr-ancap-gateway`: Production-grade non-custodial Monero (XMR) payment gateway and
+//! `xmr-gateway`: Production-grade non-custodial Monero (XMR) payment gateway and
 //! isolated subaddress auto-sweep engine.
 //!
 //! # Architecture Overview

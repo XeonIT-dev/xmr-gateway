@@ -1,4 +1,4 @@
-//! Entrypoint binary for `xmr-ancap-gateway`.
+//! Entrypoint binary for `xmr-gateway`.
 //!
 //! Initializes structured tracing, loads validated environment configuration, runs SQLite
 //! WAL-mode migrations, spawns the background scanner and webhook retry workers, and serves
@@ -11,7 +11,7 @@ use std::{sync::Arc, time::Duration};
 use tokio::{net::TcpListener, sync::watch};
 use tracing_subscriber::{EnvFilter, fmt};
 
-use xmr_ancap_gateway::{
+use xmr_gateway::{
     api::{AppState, build_router},
     config::{Config, LogFormat},
     db::{init_sqlite_pool, repository::InvoiceRepository},
@@ -40,7 +40,7 @@ async fn run_gateway() -> GatewayResult<()> {
         auto_sweep = config.enable_auto_sweep,
         required_confirmations = config.required_confirmations,
         scan_interval_seconds = config.scan_interval_seconds,
-        "starting xmr-ancap-gateway"
+        "starting xmr-gateway"
     );
 
     let pool = init_sqlite_pool(&config.database_url).await?;
@@ -96,13 +96,13 @@ async fn run_gateway() -> GatewayResult<()> {
     }
 
     pool.close().await;
-    tracing::info!("xmr-ancap-gateway shutdown complete");
+    tracing::info!("xmr-gateway shutdown complete");
     Ok(())
 }
 
 fn init_tracing(format: LogFormat) {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,xmr_ancap_gateway=debug"));
+        .unwrap_or_else(|_| EnvFilter::new("info,xmr_gateway=debug"));
 
     match format {
         LogFormat::Json => {

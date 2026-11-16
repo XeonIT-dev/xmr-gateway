@@ -1,5 +1,5 @@
 -- ============================================================================
--- xmr-ancap-gateway Initial Schema (SQLite WAL Mode)
+-- xmr-gateway Initial Schema (SQLite WAL Mode)
 -- ============================================================================
 -- Financial Invariant:
 --   All monetary quantities are stored strictly as signed 64-bit INTEGERs

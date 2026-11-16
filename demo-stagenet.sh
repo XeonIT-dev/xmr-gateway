@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# xmr-ancap-gateway Single-Terminal Stagenet Live Demo
+# xmr-gateway Single-Terminal Stagenet Live Demo
 # ==============================================================================
-# Runs monero-wallet-rpc (Stagenet), xmr-ancap-gateway, and an HMAC-SHA256
+# Runs monero-wallet-rpc (Stagenet), xmr-gateway, and an HMAC-SHA256
 # verifying Python webhook listener in one terminal with prefixed, color-coded
 # logs ([RPC], [GATEWAY], [WEBHOOK]), creates a demo invoice (0.005 XMR),
 # writes its QR PNG to /tmp/stagenet_qr.png, and shuts everything down cleanly
@@ -19,7 +19,7 @@ DATA_DIR="$SCRIPT_DIR/data"
 WALLET_FILE="$DATA_DIR/wallet/gateway_wallet"
 WALLET_PASS_FILE="$DATA_DIR/wallet/gateway_wallet.password"
 RPC_LOG_FILE="$DATA_DIR/monero-wallet-rpc.log"
-GATEWAY_BIN="$SCRIPT_DIR/target/release/xmr-ancap-gateway"
+GATEWAY_BIN="$SCRIPT_DIR/target/release/xmr-gateway"
 QR_OUTPUT_PATH="/tmp/stagenet_qr.png"
 
 C_RESET=$'\033[0m'
@@ -62,7 +62,7 @@ cleanup() {
     fi
     CLEANED_UP=1
 
-    stop_pid "$GATEWAY_PID" "xmr-ancap-gateway"
+    stop_pid "$GATEWAY_PID" "xmr-gateway"
     stop_pid "$WEBHOOK_PID" "webhook listener"
     stop_pid "$RPC_TAIL_PID" "RPC log tailer"
     stop_pid "$RPC_PID" "monero-wallet-rpc"
@@ -137,7 +137,7 @@ main() {
     # Build release binary if missing or outdated
     if [[ ! -x "$GATEWAY_BIN" ]] || find "$SCRIPT_DIR/Cargo.toml" "$SCRIPT_DIR/src" "$SCRIPT_DIR/migrations" \
         -type f -newer "$GATEWAY_BIN" 2>/dev/null | grep -q .; then
-        demo_log "Building xmr-ancap-gateway (--release)..."
+        demo_log "Building xmr-gateway (--release)..."
         cargo build --release
     fi
 
@@ -250,15 +250,15 @@ ThreadingHTTPServer(("127.0.0.1", 9000), WebhookHandler).serve_forever()
 ' > >(prefix_stream "${C_HOOK}[WEBHOOK]${C_RESET}") 2>&1 &
     WEBHOOK_PID=$!
 
-    # 3) Start xmr-ancap-gateway on 127.0.0.1:8080
-    demo_log "Starting xmr-ancap-gateway on http://127.0.0.1:8080..."
+    # 3) Start xmr-gateway on 127.0.0.1:8080
+    demo_log "Starting xmr-gateway on http://127.0.0.1:8080..."
     "$GATEWAY_BIN" > >(prefix_stream "${C_GW}[GATEWAY]${C_RESET}") 2>&1 &
     GATEWAY_PID=$!
 
     attempt=0
     while [[ "$attempt" -lt 60 ]]; do
         if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
-            demo_err "xmr-ancap-gateway exited unexpectedly."
+            demo_err "xmr-gateway exited unexpectedly."
             exit 1
         fi
         local health_json

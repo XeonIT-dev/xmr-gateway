@@ -1,6 +1,6 @@
 .PHONY: build release run test lint fmt setup-rpc clean
 
-APP_NAME := xmr-ancap-gateway
+APP_NAME := xmr-gateway
 
 build:
 	cargo build
