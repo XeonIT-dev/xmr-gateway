@@ -21,7 +21,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      # RUSTSEC-2026-0459 (libsqlite3-sys < 0.39.0): upstream sqlx-sqlite 0.9.0 caps
+      # libsqlite3-sys at < 0.38.0. Attack vector requires opening untrusted .db/-wal
+      # files crafted by an attacker; xmr-gateway only opens its own local WAL DB.
       - name: Run cargo-audit security scan
-        uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo audit --ignore RUSTSEC-2026-0459

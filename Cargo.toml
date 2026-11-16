@@ -2,7 +2,7 @@
 name = "xmr-gateway"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.94"
 authors = ["xmr-gateway contributors"]
 description = "Production-grade, non-custodial Monero (XMR) payment gateway and auto-sweep engine"
 license = "MIT"
@@ -26,7 +26,7 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["trace", "cors", "timeout", "request-id", "sensitive-headers"] }
 
 # Persistence (SQLite WAL mode)
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "migrate", "chrono", "uuid"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate", "chrono", "uuid"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

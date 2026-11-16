@@ -25,3 +25,9 @@ Before deploying `xmr-gateway` on mainnet:
 - [ ] **Restrictive CORS:** Leave `CORS_ALLOWED_ORIGINS` empty unless explicitly required by a trusted web origin.
 - [ ] **Network Privacy:** Set `MONERO_RPC_PROXY=127.0.0.1:9050` with a local Tor daemon when connecting `monero-wallet-rpc` to an untrusted or public remote node, or run your own `monerod` node.
 - [ ] **File Permissions:** Ensure `.env`, `./data/`, and `./data/wallet/` are readable only by the service user (`chmod 600` / `chmod 700`) and excluded from git commits.
+
+---
+
+## Known Upstream Dependency Exceptions (`cargo audit`)
+
+- **`RUSTSEC-2026-0459` (`libsqlite3-sys` `< 0.39.0`):** Explicitly ignored in `.github/workflows/security.yml` via `--ignore RUSTSEC-2026-0459`. Upstream `sqlx-sqlite 0.9.0` currently restricts `libsqlite3-sys` to `< 0.38.0` (`0.37.0` in `Cargo.lock`). The underlying SQLite flaw (`CVE-2026-119375`) requires opening a crafted untrusted database and mismatched `-wal` file pair; `xmr-gateway` creates and exclusively accesses its own local WAL database in `./data/`. Once an upstream `sqlx-sqlite` release permits `libsqlite3-sys >= 0.39.0`, this exception should be removed.

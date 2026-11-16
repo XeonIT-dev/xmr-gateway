@@ -3,7 +3,7 @@
 [![CI](https://github.com/XeonIT-dev/xmr-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/XeonIT-dev/xmr-gateway/actions/workflows/ci.yml)
 [![Security Audit](https://github.com/XeonIT-dev/xmr-gateway/actions/workflows/security.yml/badge.svg)](https://github.com/XeonIT-dev/xmr-gateway/actions/workflows/security.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/Rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/Rust-1.94%2B-orange.svg)](https://www.rust-lang.org)
 
 **A self-hosted, non-custodial Monero (XMR) payment gateway and isolated subaddress auto-sweep engine written in Rust.**
 
@@ -118,7 +118,7 @@ Designed for sovereign merchants, Telegram commerce bots, and privacy-first infr
 
 ### 1. System Dependencies
 
-Install Rust (`1.88+`) via [rustup](https://rustup.rs) and standard CLI tools:
+Install Rust (`1.94+`) via [rustup](https://rustup.rs) and standard CLI tools:
 
 - **Fedora:**
   ```bash
