@@ -116,7 +116,9 @@ main() {
     export PORT="8080"
     export MONERO_RPC_URL="http://127.0.0.1:18082/json_rpc"
     export LOG_FORMAT="pretty"
+    export ALLOW_PRIVATE_WEBHOOKS="${ALLOW_PRIVATE_WEBHOOKS:-true}"
     : "${MONERO_REMOTE_NODE:=node.monerodevs.org:38089}"
+    : "${MONERO_TRUSTED_DAEMON:=false}"
     : "${MONERO_RPC_USER:=xmr_gateway_user}"
     : "${MONERO_RPC_PASS:=}"
 
@@ -152,12 +154,16 @@ main() {
         --wallet-file "$WALLET_FILE"
         --password-file "$WALLET_PASS_FILE"
         --daemon-address "$MONERO_REMOTE_NODE"
-        --trusted-daemon
         --rpc-bind-ip 127.0.0.1
         --rpc-bind-port 18082
         --log-file "$RPC_LOG_FILE"
         --log-level 1
     )
+    if [[ "${MONERO_TRUSTED_DAEMON,,}" == "true" || "${MONERO_TRUSTED_DAEMON}" == "1" ]]; then
+        rpc_args+=(--trusted-daemon)
+    else
+        rpc_args+=(--untrusted-daemon)
+    fi
     if [[ -n "$MONERO_RPC_USER" ]]; then
         rpc_args+=(--rpc-login "${MONERO_RPC_USER}:${MONERO_RPC_PASS}")
     else

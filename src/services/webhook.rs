@@ -26,6 +26,7 @@ use crate::{
         invoice::{Invoice, InvoiceStatus, WebhookEventType},
     },
     error::{GatewayError, GatewayResult},
+    security::url_policy::{WebhookUrlPolicy, resolve_and_validate_webhook_url},
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -76,6 +77,12 @@ pub struct WebhookPayload {
     pub sweep_amount_piconero: Option<u64>,
     /// Total network fee paid for sweep (populated on `SWEPT` events).
     pub sweep_fee_piconero: Option<u64>,
+    /// Transaction hash that triggered a `LATE_PAYMENT` or `OVERPAYMENT` anomaly webhook.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub txid: Option<String>,
+    /// Triggering transfer or excess amount in piconero for `LATE_PAYMENT` / `OVERPAYMENT`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub trigger_amount_piconero: Option<u64>,
     /// Event creation UTC timestamp.
     pub timestamp: DateTime<Utc>,
 }
@@ -119,7 +126,9 @@ pub fn verify_payload_hmac_sha256(secret: &str, raw_body: &[u8], signature_hex: 
 /// # Deduplication Strategy
 /// - `UNDERPAID` uses `"{invoice_id}:UNDERPAID:{received_piconero}"` so additional partial
 ///   payments emit fresh progress alerts while identical polling cycles remain idempotent.
-/// - All other events use `"{invoice_id}:{event_type}"` to fire at most once per invoice.
+/// - `REORGED` includes received/confirmation state so subsequent reorgs fire cleanly.
+/// - `SWEPT` appends the sweep tx count when residual overpayments trigger additional sweeps.
+/// - All other lifecycle events use `"{invoice_id}:{event_type}"` to fire at most once per invoice.
 ///
 /// # Errors
 /// Returns [`GatewayError::Webhook`] if JSON serialization or HMAC signing fails.
@@ -149,6 +158,8 @@ pub fn build_webhook_delivery(
         sweep_tx_hashes: invoice.sweep_tx_hashes.clone(),
         sweep_amount_piconero: invoice.sweep_amount_piconero.map(Piconero::as_u64),
         sweep_fee_piconero: invoice.sweep_fee_piconero.map(Piconero::as_u64),
+        txid: None,
+        trigger_amount_piconero: None,
         timestamp: now,
     };
 
@@ -164,8 +175,75 @@ pub fn build_webhook_delivery(
                 invoice.received_piconero.as_u64()
             )
         }
+        WebhookEventType::Reorged => {
+            format!(
+                "{}:REORGED:{}:{}",
+                invoice.id,
+                invoice.received_piconero.as_u64(),
+                invoice.confirmations
+            )
+        }
+        WebhookEventType::Swept if invoice.sweep_tx_hashes.len() > 1 => {
+            format!("{}:SWEPT:{}", invoice.id, invoice.sweep_tx_hashes.len())
+        }
         _ => format!("{}:{}", invoice.id, event_type.as_str()),
     };
+
+    Ok(NewWebhookDelivery {
+        id: delivery_id,
+        invoice_id: invoice.id,
+        event_type,
+        dedupe_key,
+        target_url: target_url.to_string(),
+        payload_json,
+        signature_hex,
+        max_attempts: DEFAULT_WEBHOOK_MAX_ATTEMPTS,
+        now,
+    })
+}
+
+/// Builds a signed [`NewWebhookDelivery`] for per-transaction `LATE_PAYMENT` or `OVERPAYMENT`
+/// accounting events deduplicated by `"{invoice_id}:{event_type}:{txid}"`.
+///
+/// # Errors
+/// Returns [`GatewayError::Webhook`] if JSON serialization or HMAC signing fails.
+pub fn build_transfer_anomaly_webhook_delivery(
+    webhook_secret: &str,
+    invoice: &Invoice,
+    event_type: WebhookEventType,
+    txid: &str,
+    trigger_amount_piconero: Piconero,
+    target_url: &str,
+    now: DateTime<Utc>,
+) -> GatewayResult<NewWebhookDelivery> {
+    let delivery_id = Uuid::new_v4();
+    let payload = WebhookPayload {
+        event_id: delivery_id,
+        event: event_type,
+        invoice_id: invoice.id,
+        order_id: invoice.order_id.clone(),
+        status: invoice.status,
+        subaddress: invoice.subaddress.clone(),
+        address_index: invoice.address_index,
+        amount_piconero: invoice.amount_piconero.as_u64(),
+        amount_xmr_formatted: invoice.amount_piconero.to_xmr_string(),
+        received_piconero: invoice.received_piconero.as_u64(),
+        received_xmr_formatted: invoice.received_piconero.to_xmr_string(),
+        confirmations: invoice.confirmations,
+        unlocked: invoice.unlocked,
+        double_spend_seen: invoice.double_spend_seen,
+        sweep_tx_hashes: invoice.sweep_tx_hashes.clone(),
+        sweep_amount_piconero: invoice.sweep_amount_piconero.map(Piconero::as_u64),
+        sweep_fee_piconero: invoice.sweep_fee_piconero.map(Piconero::as_u64),
+        txid: Some(txid.to_string()),
+        trigger_amount_piconero: Some(trigger_amount_piconero.as_u64()),
+        timestamp: now,
+    };
+
+    let payload_json = serde_json::to_string(&payload)
+        .map_err(|e| GatewayError::Webhook(format!("failed to serialize webhook payload: {e}")))?;
+    let signature_hex = sign_payload_hmac_sha256(webhook_secret, payload_json.as_bytes())?;
+    let dedupe_key = format!("{}:{}:{}", invoice.id, event_type.as_str(), txid);
 
     Ok(NewWebhookDelivery {
         id: delivery_id,
@@ -197,10 +275,11 @@ pub struct WebhookDispatcher {
     http: reqwest::Client,
     enable_auto_sweep: bool,
     poll_interval: Duration,
+    url_policy: WebhookUrlPolicy,
 }
 
 impl WebhookDispatcher {
-    /// Constructs a new [`WebhookDispatcher`].
+    /// Constructs a new [`WebhookDispatcher`] permitting loopback targets for local tests.
     ///
     /// # Errors
     /// Returns [`GatewayError::Config`] if the HTTP client fails TLS initialization.
@@ -209,9 +288,34 @@ impl WebhookDispatcher {
         enable_auto_sweep: bool,
         poll_interval: Duration,
     ) -> GatewayResult<Self> {
+        Self::new_with_policy(
+            repo,
+            enable_auto_sweep,
+            poll_interval,
+            WebhookUrlPolicy {
+                allow_private_webhooks: true,
+                require_https_webhooks: false,
+            },
+        )
+    }
+
+    /// Constructs a new [`WebhookDispatcher`] enforcing an explicit [`WebhookUrlPolicy`].
+    ///
+    /// Configures `redirect::Policy::none()` so HTTP 3xx responses cannot pivot webhook traffic to
+    /// internal hosts, and validates + pins DNS answers on every dispatch attempt.
+    ///
+    /// # Errors
+    /// Returns [`GatewayError::Config`] if the HTTP client fails TLS initialization.
+    pub fn new_with_policy(
+        repo: InvoiceRepository,
+        enable_auto_sweep: bool,
+        poll_interval: Duration,
+        url_policy: WebhookUrlPolicy,
+    ) -> GatewayResult<Self> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| GatewayError::Config(format!("failed to create webhook client: {e}")))?;
 
@@ -220,6 +324,7 @@ impl WebhookDispatcher {
             http,
             enable_auto_sweep,
             poll_interval,
+            url_policy,
         })
     }
 
@@ -269,9 +374,46 @@ impl WebhookDispatcher {
 
     async fn deliver_one(&self, delivery: &WebhookDelivery) -> GatewayResult<()> {
         let now = Utc::now();
-        let send_result = self
-            .http
-            .post(&delivery.target_url)
+
+        let validated = match resolve_and_validate_webhook_url(
+            &delivery.target_url,
+            "webhook target_url",
+            self.url_policy,
+        )
+        .await
+        {
+            Ok(target) => target,
+            Err(err) => {
+                let err_msg = format!("SSRF policy rejected webhook target: {err}");
+                self.schedule_retry_or_fail(delivery, None, &err_msg, now)
+                    .await?;
+                return Ok(());
+            }
+        };
+
+        // Pin resolved socket addresses at connect time to prevent DNS rebinding TOCTOU attacks.
+        let client = if validated.is_ip_literal {
+            self.http.clone()
+        } else {
+            match reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
+                .resolve_to_addrs(&validated.host, &validated.resolved_addrs)
+                .build()
+            {
+                Ok(pinned) => pinned,
+                Err(err) => {
+                    let err_msg = format!("failed to construct pinned HTTP client: {err}");
+                    self.schedule_retry_or_fail(delivery, None, &err_msg, now)
+                        .await?;
+                    return Ok(());
+                }
+            }
+        };
+
+        let send_result = client
+            .post(validated.url)
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::USER_AGENT, "xmr-gateway/0.1.0")
             .header("X-Signature-256", &delivery.signature_hex)
@@ -402,6 +544,7 @@ mod tests {
             updated_at: now,
             expires_at: now + ChronoDuration::hours(1),
             confirmed_at: Some(now),
+            settled_at: None,
             swept_at: None,
             completed_at: None,
         }
@@ -544,12 +687,138 @@ mod tests {
             WebhookDispatcher::new(repo.clone(), true, Duration::from_secs(5)).unwrap();
         dispatcher.process_due_deliveries().await.unwrap();
 
-        let webhooks = repo.list_webhooks_for_invoice(inv.id).await.unwrap();
+        let hooks = repo.list_webhooks_for_invoice(inv.id).await.unwrap();
         assert_eq!(
-            webhooks[0].status,
+            hooks[0].status,
             crate::db::repository::WebhookDeliveryStatus::Failed
         );
-        assert_eq!(webhooks[0].attempts, 1);
-        assert_eq!(webhooks[0].last_status_code, Some(500));
+        assert_eq!(hooks[0].attempts, 1);
+        assert_eq!(hooks[0].last_status_code, Some(500));
+    }
+
+    #[tokio::test]
+    async fn blocks_redirects_and_ssrf_targets_on_delivery() {
+        let pool = init_sqlite_pool("sqlite::memory:").await.unwrap();
+        let repo = InvoiceRepository::new(pool);
+
+        // 1) Strict policy blocks delivery to 127.0.0.1 even if enqueued beforehand
+        let mock_server = MockServer::start().await;
+        let mut inv = sample_invoice(InvoiceStatus::Confirmed);
+        inv.order_id = "ord-ssrf-block".to_string();
+        let hook_url = format!("{}/hook", mock_server.uri());
+        inv.callback_url = Some(hook_url.clone());
+        repo.insert_invoice(&inv).await.unwrap();
+
+        let delivery = build_webhook_delivery(
+            "webhook-secret-key-0123456789abcdef",
+            &inv,
+            WebhookEventType::Confirmed,
+            &hook_url,
+            Utc::now(),
+        )
+        .unwrap();
+        repo.apply_scan_update(crate::db::repository::ApplyScanUpdateParams {
+            invoice_id: inv.id,
+            received_piconero: inv.received_piconero,
+            confirmations: 2,
+            unlocked: false,
+            double_spend_seen: false,
+            next_status: InvoiceStatus::Confirmed,
+            transfers: Vec::new(),
+            webhook: Some(delivery),
+            now: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let strict_dispatcher = WebhookDispatcher::new_with_policy(
+            repo.clone(),
+            true,
+            Duration::from_secs(5),
+            WebhookUrlPolicy {
+                allow_private_webhooks: false,
+                require_https_webhooks: false,
+            },
+        )
+        .unwrap();
+        strict_dispatcher.process_due_deliveries().await.unwrap();
+        let hooks = repo.list_webhooks_for_invoice(inv.id).await.unwrap();
+        assert_eq!(hooks[0].attempts, 1);
+        assert!(
+            hooks[0]
+                .last_error
+                .as_deref()
+                .unwrap_or("")
+                .contains("SSRF policy")
+        );
+
+        // 2) Redirect responses (302 -> metadata endpoint) are NOT followed even when private hosts permitted
+        let mock_redir = MockServer::start().await;
+        let mut inv2 = sample_invoice(InvoiceStatus::Confirmed);
+        inv2.order_id = "ord-redirect-block".to_string();
+        inv2.address_index = 2;
+        let hook_url2 = format!("{}/redir", mock_redir.uri());
+        inv2.callback_url = Some(hook_url2.clone());
+        repo.insert_invoice(&inv2).await.unwrap();
+
+        let delivery2 = build_webhook_delivery(
+            "webhook-secret-key-0123456789abcdef",
+            &inv2,
+            WebhookEventType::Confirmed,
+            &hook_url2,
+            Utc::now(),
+        )
+        .unwrap();
+        repo.apply_scan_update(crate::db::repository::ApplyScanUpdateParams {
+            invoice_id: inv2.id,
+            received_piconero: inv2.received_piconero,
+            confirmations: 2,
+            unlocked: false,
+            double_spend_seen: false,
+            next_status: InvoiceStatus::Confirmed,
+            transfers: Vec::new(),
+            webhook: Some(delivery2),
+            now: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/redir"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", "http://169.254.169.254/latest/meta-data/"),
+            )
+            .expect(1)
+            .mount(&mock_redir)
+            .await;
+
+        let permissive_dispatcher = WebhookDispatcher::new_with_policy(
+            repo.clone(),
+            true,
+            Duration::from_secs(5),
+            WebhookUrlPolicy {
+                allow_private_webhooks: true,
+                require_https_webhooks: false,
+            },
+        )
+        .unwrap();
+        permissive_dispatcher
+            .process_due_deliveries()
+            .await
+            .unwrap();
+        let hooks2 = repo.list_webhooks_for_invoice(inv2.id).await.unwrap();
+        assert_eq!(hooks2[0].last_status_code, Some(302));
+        assert_eq!(
+            hooks2[0].status,
+            crate::db::repository::WebhookDeliveryStatus::Pending
+        );
     }
 }

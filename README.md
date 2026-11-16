@@ -13,12 +13,12 @@ Designed for sovereign merchants, Telegram commerce bots, and privacy-first infr
 
 ## Key Features
 
-- **Non-Custodial Architecture:** Funds settle directly to subaddresses derived from your own `monero-wallet-rpc` wallet. Supports both **View-Only Zero-Trust Mode** (no spend key on the server) and **Hot Auto-Sweep Mode**.
+- **Non-Custodial Architecture:** Funds settle directly to subaddresses derived from your own `monero-wallet-rpc` wallet. Enforces fail-closed **View-Only Zero-Trust Mode** (`WALLET_MODE=view_only`, verified against `query_key(spend_key)`) and explicit **Hot Auto-Sweep Mode** (`WALLET_MODE=hot_wallet`).
 - **Subaddress-Per-Invoice Isolation:** Each invoice allocates a unique Monero subaddress (`account_index: 0`, unique `address_index`) enforced at the SQLite schema level (`UNIQUE(account_index, address_index)`), preventing address reuse and cross-customer correlation.
-- **Strict Piconero Integer Accounting:** Floating-point arithmetic (`f32`/`f64`) is strictly banned across the entire codebase. Every amount, transfer, fee, and SQLite column uses atomic integer `Piconero(u64)` ($1\text{ XMR} = 10^{12}\text{ piconero}$).
-- **Idempotent Payment State Machine:** Tracks `PENDING`, `UNDERPAID` (multi-tx partial payments), `MEMPOOL` (`0-conf`), `CONFIRMED` (`>= REQUIRED_CONFIRMATIONS`), `COMPLETED` (View-Only terminal state), `SWEPT` (Auto-Sweep terminal state), and `EXPIRED`.
-- **Double-Spend & 10-Block Consensus Protection:** Outputs flagged `double_spend_seen == true` are excluded from paid totals. Sweeps strictly enforce Monero's 10-block output lock (`confirmations >= 10` and `!locked`) and isolate `sweep_all` to `subaddr_indices: [address_index]`.
-- **Durable HMAC-SHA256 Webhooks:** Payloads are serialized once, persisted in a SQLite WAL outbox, signed using `HMAC-SHA256` (`X-Signature-256`), and retried with capped exponential backoff (`5s` up to `3600s`, 10 attempts).
+- **Strict Piconero Integer Accounting:** Floating-point arithmetic (`f32`/`f64`) is strictly banned across the entire codebase. Every amount, transfer, fee, and SQLite column uses atomic integer `Piconero(u64)` ($1\text{ XMR} = 10^{12}\text{ piconero}$) in SQLite WAL mode with `synchronous = FULL`.
+- **Reorg-Safe Payment State Machine & Continuous Subaddress Accounting:** Tracks `PENDING`, `UNDERPAID`, `MEMPOOL` (`0-conf`), `CONFIRMING` (`1..REQUIRED_CONFIRMATIONS`), `CONFIRMED` (`>= REQUIRED_CONFIRMATIONS`, default `10`), `SETTLED` (`>= SETTLEMENT_CONFIRMATIONS`, default `10`), `REORGED`, `COMPLETED`, `SWEPT`, and `EXPIRED`, plus `LATE_PAYMENT` and `OVERPAYMENT` ledger tracking for `SUBADDRESS_MONITOR_DAYS` (`90` days default).
+- **Double-Spend Protection & Crash-Safe Sweeps:** Outputs flagged `double_spend_seen == true` are excluded from paid totals. Isolated `sweep_all` operations record durable `sweep_attempts` (`PREPARED` → `SUBMITTED` → `CONFIRMED` / `RECONCILED` | `FAILED`) so crashed sweeps recover via `get_transfers(out, pending)` without double-sweeping.
+- **SSRF-Hardened Durable HMAC-SHA256 Webhooks:** Outbound `callback_url` targets undergo IP/DNS SSRF filtering (`ALLOW_PRIVATE_WEBHOOKS=false`, `REQUIRE_HTTPS_WEBHOOKS`), connection-time socket pinning against DNS rebinding, zero redirect following, and SQLite WAL outbox retries (`5s` up to `3600s`, 10 attempts).
 - **Constant-Time API Authentication:** `/api/v1/*` routes verify `X-API-Key` by hashing both presented and expected secrets with SHA-256 before `subtle::ConstantTimeEq` comparison, preventing length timing side-channels.
 
 ---
@@ -78,39 +78,50 @@ Designed for sovereign merchants, Telegram commerce bots, and privacy-first infr
       +-------+-------+                 |                 |    MEMPOOL    |
               |                         v                 +-------+-------+
               |                 +---------------+                 |
-              |                 |    EXPIRED    |                 |
-              |                 +---------------+                 |
-              |                   (Terminal)                      |
+              |                 |    EXPIRED    |       (1 <= conf < REQ_CONF)
+              |                 +-------+-------+                 |
+              |             (late tx)   |                         v
+              |                         v                 +-------+-------+
+              |                  LATE_PAYMENT             |  CONFIRMING   |
+              |                                           +-------+-------+
               |                                                   |
-              +-----------> (rx >= expected & conf >= REQ) <------+
+              +---------> (rx >= expected & conf >= REQ_CONF) <---+
                                         |
-                                        v
+                                        v     (depth drops / double-spend)
+                                +-------+-------+ ------------------------+
+                                |   CONFIRMED   |                         |
+                                +-------+-------+                         v
+                                        |                         +-------+-------+
+                       (conf >= SETTLEMENT_CONFIRMATIONS)         |    REORGED    |
+                                        |                         +---------------+
+                                        v                         (Webhook: REORGED)
                                 +-------+-------+
-                                |   CONFIRMED   | ---> Webhook: CONFIRMED
+                                |    SETTLED    | ---> Webhook: SETTLED
                                 +-------+-------+
                                         |
               +-------------------------+-------------------------+
               |                                                   |
  (ENABLE_AUTO_SWEEP=false,                            (ENABLE_AUTO_SWEEP=true,
-  after CONFIRMED webhook 2xx)                         all outputs unlocked >= 10 blocks)
+  after CONFIRMED/SETTLED 2xx)                         sweep_attempts PREPARED->SUBMITTED->CONFIRMED)
               |                                                   |
               v                                                   v
       +-------+-------+                                   +-------+-------+
       |   COMPLETED   |                                   |     SWEPT     | ---> Webhook: SWEPT
-      +---------------+                                   +---------------+
-         (Terminal)                                          (Terminal)
+      +---------------+                                   +-------+-------+
+      (monitored 90d for OVERPAYMENT)                     (monitored 90d; residual OVERPAYMENT sweepable)
 ```
 
 ---
 
 ## Custody Modes: View-Only vs. Hot Auto-Sweep
 
-| Feature | View-Only Mode (`ENABLE_AUTO_SWEEP=false`) | Hot Auto-Sweep Mode (`ENABLE_AUTO_SWEEP=true`) |
+| Feature | View-Only Mode (`WALLET_MODE=view_only`, `ENABLE_AUTO_SWEEP=false`) | Hot Auto-Sweep Mode (`WALLET_MODE=hot_wallet`, `ENABLE_AUTO_SWEEP=true`) |
 | :--- | :--- | :--- |
-| **Private Spend Key on Server** | **No** (view-only wallet only) | **Yes** (hot transit wallet) |
-| **Server Compromise Impact** | Attacker can observe incoming invoice amounts; **funds cannot be spent** | Attacker could spend unlocked funds waiting on transit subaddresses |
-| **Settlement Flow** | Funds remain directly in your offline/hardware wallet | Gateway sweeps each subaddress after 10 confirmations to `COLD_WALLET_ADDRESS` |
-| **Terminal State** | `COMPLETED` (on `CONFIRMED` webhook 2xx) | `SWEPT` (on `sweep_all` success) |
+| **Private Spend Key on Server** | **Forbidden** (`start.sh` and gateway verify `query_key(spend_key)` fails or returns zero) | **Yes** (hot transit wallet; explicit opt-in required) |
+| **First-Run Bootstrap** | Fail-closed unless `MONERO_VIEW_ONLY_ADDRESS` & `MONERO_VIEW_ONLY_KEY` are set | Generates hot transit wallet (`ENABLE_AUTO_SWEEP=true` or `ALLOW_HOT_WALLET_WITHOUT_SWEEP=true`) |
+| **Remote Daemon Policy** | `--untrusted-daemon` by default (`MONERO_TRUSTED_DAEMON=false`) | `--untrusted-daemon` unless `MONERO_TRUSTED_DAEMON=true` |
+| **Settlement Flow** | Funds remain directly in your offline/hardware wallet | Crash-safe `sweep_attempts` (`PREPARED`→`SUBMITTED`→`RECONCILED`) to `COLD_WALLET_ADDRESS` |
+| **Terminal State** | `COMPLETED` (monitored `SUBADDRESS_MONITOR_DAYS` days) | `SWEPT` (monitored `SUBADDRESS_MONITOR_DAYS` days; overpayments remain sweepable) |
 
 ---
 
@@ -264,7 +275,7 @@ curl -s -X POST http://127.0.0.1:8080/api/v1/invoices/3c8e0f18-7d66-4c31-97a0-6e
 | Header | Description |
 | :--- | :--- |
 | `X-Signature-256` | Lowercase hex `HMAC-SHA256` digest of the raw UTF-8 request body signed with `WEBHOOK_SECRET` |
-| `X-Webhook-Event` | Event type: `UNDERPAID`, `MEMPOOL`, `CONFIRMED`, `SWEPT`, or `EXPIRED` |
+| `X-Webhook-Event` | Event type: `UNDERPAID`, `MEMPOOL`, `CONFIRMED`, `SETTLED`, `REORGED`, `SWEPT`, `EXPIRED`, `LATE_PAYMENT`, or `OVERPAYMENT` |
 | `X-Delivery-Id` | Unique UUID of this webhook delivery record |
 | `X-Webhook-Timestamp` | RFC 3339 UTC timestamp matching `payload.timestamp` |
 
@@ -334,14 +345,10 @@ pub fn verify_webhook(secret: &str, raw_body: &[u8], signature_hex: &str) -> boo
 ## Security Best Practices
 
 - **Keep Loopback Bindings:** Leave `HOST=127.0.0.1` and expose the API only to local services or behind a TLS reverse proxy (Caddy/Nginx). Never expose `monero-wallet-rpc` (`127.0.0.1:18082`) to public interfaces.
-- **Reverse Proxy Example (Caddy):**
-  ```caddyfile
-  pay.example.com {
-      reverse_proxy 127.0.0.1:8080
-  }
-  ```
-- **Prefer View-Only Mode:** Unless you require automated hot treasury sweeping, set `ENABLE_AUTO_SWEEP=false` and run `monero-wallet-rpc` with a view-only wallet generated offline (`monero-wallet-cli --generate-from-view-key`).
-- **Route Remote Node Traffic via Tor:** Install `tor` and set `MONERO_RPC_PROXY=127.0.0.1:9050` in `.env` so remote node operators cannot observe your server IP.
+- **SSRF & DNS Rebinding Defense (`XMR-001`):** Leave `ALLOW_PRIVATE_WEBHOOKS=false` in production (and optionally set `REQUIRE_HTTPS_WEBHOOKS=true`) so webhook callbacks cannot target loopback, RFC1918 subnets, cloud metadata endpoints (`169.254.169.254`), or HTTP `3xx` redirects.
+- **Enforce Fail-Closed View-Only Mode (`XMR-002`):** Unless you require automated hot treasury sweeping, set `WALLET_MODE=view_only` and `ENABLE_AUTO_SWEEP=false`, providing `MONERO_VIEW_ONLY_ADDRESS` and `MONERO_VIEW_ONLY_KEY` in `.env`. Both `start.sh` and `xmr-gateway` abort startup if `monero-wallet-rpc` exposes a spend key in `view_only` mode.
+- **Untrusted Remote Nodes (`XMR-005`):** `MONERO_TRUSTED_DAEMON=false` passes `--untrusted-daemon` by default. Route traffic through Tor (`MONERO_RPC_PROXY=127.0.0.1:9050`) when connecting to third-party public nodes.
+- **SQLite Full Durability (`XMR-007`) & Crash-Safe Sweeps (`XMR-003`):** SQLite WAL runs with `synchronous = FULL`, and `sweep_attempts` (`PREPARED`→`SUBMITTED`→`RECONCILED`) recovers interrupted sweeps via `get_transfers(out, pending)` without duplicate `sweep_all` calls.
 - **Mainnet vs. Stagenet Checklist:**
   - Verify `MONERO_NETWORK=mainnet` and a mainnet `MONERO_REMOTE_NODE` before production launch.
   - Ensure `API_SECRET_KEY`, `WEBHOOK_SECRET`, and `MONERO_RPC_PASS` are freshly generated 32-byte random secrets (`openssl rand -hex 32`).

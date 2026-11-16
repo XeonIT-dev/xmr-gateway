@@ -6,9 +6,13 @@
 
 use std::{env, fmt, net::SocketAddr};
 
+use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::error::{GatewayError, GatewayResult};
+use crate::{
+    error::{GatewayError, GatewayResult},
+    security::url_policy::{WebhookUrlPolicy, validate_webhook_url_static},
+};
 
 /// Monero Base58 alphabet used in standard, integrated, and subaddress strings.
 const MONERO_BASE58_ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
@@ -35,13 +39,53 @@ impl LogFormat {
     }
 }
 
+/// Wallet custody mode enforced at startup and verified against `monero-wallet-rpc`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WalletMode {
+    /// Zero-trust watch-only wallet (`monero-wallet-rpc` must NOT hold a private spend key).
+    ViewOnly,
+    /// Hot transit wallet capable of signing `sweep_all` transactions to cold storage.
+    HotWallet,
+}
+
+impl WalletMode {
+    /// Returns canonical snake_case configuration representation (`"view_only"` or `"hot_wallet"`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ViewOnly => "view_only",
+            Self::HotWallet => "hot_wallet",
+        }
+    }
+
+    /// Parses `WALLET_MODE` environment variable value (`view_only` or `hot_wallet`).
+    fn parse(raw: &str) -> GatewayResult<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "view_only" | "view-only" => Ok(Self::ViewOnly),
+            "hot_wallet" | "hot-wallet" => Ok(Self::HotWallet),
+            other => Err(GatewayError::Config(format!(
+                "invalid WALLET_MODE '{other}': expected 'view_only' or 'hot_wallet'"
+            ))),
+        }
+    }
+}
+
+impl fmt::Display for WalletMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Complete, validated configuration for `xmr-gateway`.
 ///
 /// # Security Invariants
 /// - `api_secret_key` and `webhook_secret` must be non-empty.
 /// - `required_confirmations` must be `>= 1` so `CONFIRMED` never aliases `MEMPOOL` (`0-conf`).
-/// - When `enable_auto_sweep == true`, `cold_wallet_address` MUST be present and pass Monero
-///   address structural validation (length, network prefix, Base58 alphabet).
+/// - When `enable_auto_sweep == true`, `wallet_mode` must be `WalletMode::HotWallet` and
+///   `cold_wallet_address` MUST be present and pass Monero address structural validation.
+/// - `WalletMode::HotWallet` requires `ENABLE_AUTO_SWEEP=true` unless
+///   `ALLOW_HOT_WALLET_WITHOUT_SWEEP=true` is explicitly configured.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Config {
     /// Host IP/interface to bind the HTTP server on.
@@ -58,6 +102,10 @@ pub struct Config {
     pub webhook_secret: String,
     /// Optional fallback webhook URL used when invoice creation omits `callback_url`.
     pub default_webhook_url: Option<String>,
+    /// Permit private/loopback/link-local webhook URLs (`false` in production; `true` for local dev).
+    pub allow_private_webhooks: bool,
+    /// Require `https://` scheme on all outbound webhook URLs.
+    pub require_https_webhooks: bool,
     /// Full HTTP/HTTPS URL to `monero-wallet-rpc` JSON-RPC endpoint.
     pub monero_rpc_url: String,
     /// Optional RPC username for `--rpc-login` Digest/Basic authentication.
@@ -66,18 +114,29 @@ pub struct Config {
     pub monero_rpc_pass: Option<String>,
     /// Destination Monero address for automated and manual sweeps.
     pub cold_wallet_address: Option<String>,
+    /// Custody mode enforced against `monero-wallet-rpc` at startup (`view_only` | `hot_wallet`).
+    pub wallet_mode: WalletMode,
+    /// Whether `monero-wallet-rpc` connects to a trusted operator-owned daemon (`--trusted-daemon`).
+    pub monero_trusted_daemon: bool,
+    /// Explicit override permitting a hot wallet when `ENABLE_AUTO_SWEEP=false`.
+    pub allow_hot_wallet_without_sweep: bool,
     /// Custody mode flag: `false` = View-Only Zero-Trust, `true` = Hot Auto-Sweep.
     pub enable_auto_sweep: bool,
     /// Monero transaction priority (`0..=4`) passed to `sweep_all`.
     pub sweep_priority: u32,
     /// Minimum block confirmations required before transitioning an invoice to `CONFIRMED`.
     pub required_confirmations: u64,
+    /// Block confirmations required for full Monero lock/settlement finality (`SETTLED`, default `10`).
+    pub settlement_confirmations: u64,
     /// Default invoice expiration window in seconds.
     pub invoice_ttl_seconds: u64,
     /// Interval in seconds between background scanner polls against `monero-wallet-rpc`.
     pub scan_interval_seconds: u64,
     /// Interval in seconds between background webhook retry polls.
     pub webhook_poll_interval_seconds: u64,
+    /// Retention window in days for scanning terminal (`COMPLETED`/`SWEPT`/`EXPIRED`) subaddresses
+    /// to detect late payments and post-settlement overpayments (`SUBADDRESS_MONITOR_DAYS`, default `90`).
+    pub subaddress_monitor_days: u64,
     /// Tracing log output format.
     pub log_format: LogFormat,
 }
@@ -92,6 +151,8 @@ impl fmt::Debug for Config {
             .field("api_secret_key", &"[REDACTED]")
             .field("webhook_secret", &"[REDACTED]")
             .field("default_webhook_url", &self.default_webhook_url)
+            .field("allow_private_webhooks", &self.allow_private_webhooks)
+            .field("require_https_webhooks", &self.require_https_webhooks)
             .field("monero_rpc_url", &self.monero_rpc_url)
             .field("monero_rpc_user", &self.monero_rpc_user)
             .field(
@@ -99,15 +160,23 @@ impl fmt::Debug for Config {
                 &self.monero_rpc_pass.as_ref().map(|_| "[REDACTED]"),
             )
             .field("cold_wallet_address", &self.cold_wallet_address)
+            .field("wallet_mode", &self.wallet_mode)
+            .field("monero_trusted_daemon", &self.monero_trusted_daemon)
+            .field(
+                "allow_hot_wallet_without_sweep",
+                &self.allow_hot_wallet_without_sweep,
+            )
             .field("enable_auto_sweep", &self.enable_auto_sweep)
             .field("sweep_priority", &self.sweep_priority)
             .field("required_confirmations", &self.required_confirmations)
+            .field("settlement_confirmations", &self.settlement_confirmations)
             .field("invoice_ttl_seconds", &self.invoice_ttl_seconds)
             .field("scan_interval_seconds", &self.scan_interval_seconds)
             .field(
                 "webhook_poll_interval_seconds",
                 &self.webhook_poll_interval_seconds,
             )
+            .field("subaddress_monitor_days", &self.subaddress_monitor_days)
             .field("log_format", &self.log_format)
             .finish()
     }
@@ -134,16 +203,38 @@ impl Config {
         let api_secret_key = require_non_empty_env("API_SECRET_KEY")?;
         let webhook_secret = require_non_empty_env("WEBHOOK_SECRET")?;
         let default_webhook_url = optional_non_empty_env("DEFAULT_WEBHOOK_URL");
+        let allow_private_webhooks = parse_env_bool("ALLOW_PRIVATE_WEBHOOKS", false)?;
+        let require_https_webhooks = parse_env_bool("REQUIRE_HTTPS_WEBHOOKS", false)?;
         let monero_rpc_url = env_or_default("MONERO_RPC_URL", "http://127.0.0.1:18082/json_rpc");
         let monero_rpc_user = optional_non_empty_env("MONERO_RPC_USER");
         let monero_rpc_pass = optional_non_empty_env("MONERO_RPC_PASS");
         let cold_wallet_address = optional_non_empty_env("COLD_WALLET_ADDRESS");
         let enable_auto_sweep = parse_env_bool("ENABLE_AUTO_SWEEP", false)?;
+        let wallet_mode = match optional_non_empty_env("WALLET_MODE") {
+            Some(raw) => WalletMode::parse(&raw)?,
+            None => {
+                if enable_auto_sweep {
+                    WalletMode::HotWallet
+                } else {
+                    WalletMode::ViewOnly
+                }
+            }
+        };
+        let monero_trusted_daemon = parse_env_bool("MONERO_TRUSTED_DAEMON", false)?;
+        let allow_hot_wallet_without_sweep =
+            parse_env_bool("ALLOW_HOT_WALLET_WITHOUT_SWEEP", false)?;
         let sweep_priority = parse_env_u32("SWEEP_PRIORITY", 0)?;
-        let required_confirmations = parse_env_u64("REQUIRED_CONFIRMATIONS", 2)?;
+        let required_confirmations = parse_env_u64("REQUIRED_CONFIRMATIONS", 10)?;
+        let settlement_confirmations = match optional_non_empty_env("SETTLEMENT_CONFIRMATIONS") {
+            Some(raw) => raw.parse::<u64>().map_err(|err| {
+                GatewayError::Config(format!("invalid SETTLEMENT_CONFIRMATIONS '{raw}': {err}"))
+            })?,
+            None => required_confirmations.max(10),
+        };
         let invoice_ttl_seconds = parse_env_u64("INVOICE_TTL_SECONDS", 3600)?;
         let scan_interval_seconds = parse_env_u64("SCAN_INTERVAL_SECONDS", 10)?;
         let webhook_poll_interval_seconds = parse_env_u64("WEBHOOK_POLL_INTERVAL_SECONDS", 5)?;
+        let subaddress_monitor_days = parse_env_u64("SUBADDRESS_MONITOR_DAYS", 90)?;
         let log_format = LogFormat::parse(&env_or_default("LOG_FORMAT", "json"))?;
 
         let config = Self {
@@ -154,16 +245,23 @@ impl Config {
             api_secret_key,
             webhook_secret,
             default_webhook_url,
+            allow_private_webhooks,
+            require_https_webhooks,
             monero_rpc_url,
             monero_rpc_user,
             monero_rpc_pass,
             cold_wallet_address,
+            wallet_mode,
+            monero_trusted_daemon,
+            allow_hot_wallet_without_sweep,
             enable_auto_sweep,
             sweep_priority,
             required_confirmations,
+            settlement_confirmations,
             invoice_ttl_seconds,
             scan_interval_seconds,
             webhook_poll_interval_seconds,
+            subaddress_monitor_days,
             log_format,
         };
 
@@ -194,12 +292,23 @@ impl Config {
         validate_http_url(&self.monero_rpc_url, "MONERO_RPC_URL")?;
 
         if let Some(ref webhook_url) = self.default_webhook_url {
-            validate_http_url(webhook_url, "DEFAULT_WEBHOOK_URL")?;
+            validate_webhook_url_static(
+                webhook_url,
+                "DEFAULT_WEBHOOK_URL",
+                self.webhook_url_policy(),
+            )
+            .map_err(|e| GatewayError::Config(e.to_string()))?;
         }
 
         if self.required_confirmations == 0 {
             return Err(GatewayError::Config(
                 "REQUIRED_CONFIRMATIONS must be >= 1 (0-conf is tracked as MEMPOOL)".to_string(),
+            ));
+        }
+
+        if self.settlement_confirmations < self.required_confirmations {
+            return Err(GatewayError::Config(
+                "SETTLEMENT_CONFIRMATIONS must be >= REQUIRED_CONFIRMATIONS".to_string(),
             ));
         }
 
@@ -221,11 +330,33 @@ impl Config {
             ));
         }
 
+        if self.subaddress_monitor_days == 0 {
+            return Err(GatewayError::Config(
+                "SUBADDRESS_MONITOR_DAYS must be >= 1".to_string(),
+            ));
+        }
+
         if self.sweep_priority > 4 {
             return Err(GatewayError::Config(format!(
                 "SWEEP_PRIORITY must be between 0 and 4, got {}",
                 self.sweep_priority
             )));
+        }
+
+        if self.enable_auto_sweep && self.wallet_mode != WalletMode::HotWallet {
+            return Err(GatewayError::Config(
+                "ENABLE_AUTO_SWEEP=true requires WALLET_MODE=hot_wallet".to_string(),
+            ));
+        }
+
+        if self.wallet_mode == WalletMode::HotWallet
+            && !self.enable_auto_sweep
+            && !self.allow_hot_wallet_without_sweep
+        {
+            return Err(GatewayError::Config(
+                "WALLET_MODE=hot_wallet requires ENABLE_AUTO_SWEEP=true (or explicit ALLOW_HOT_WALLET_WITHOUT_SWEEP=true)"
+                    .to_string(),
+            ));
         }
 
         if self.enable_auto_sweep {
@@ -246,6 +377,15 @@ impl Config {
     #[must_use]
     pub fn bind_addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
+    }
+
+    /// Returns the configured [`WebhookUrlPolicy`] governing SSRF and HTTPS enforcement.
+    #[must_use]
+    pub const fn webhook_url_policy(&self) -> WebhookUrlPolicy {
+        WebhookUrlPolicy {
+            allow_private_webhooks: self.allow_private_webhooks,
+            require_https_webhooks: self.require_https_webhooks,
+        }
     }
 }
 
@@ -419,16 +559,23 @@ mod tests {
             api_secret_key: "a".repeat(32),
             webhook_secret: "b".repeat(32),
             default_webhook_url: Some("https://bot.example.org/webhook".to_string()),
+            allow_private_webhooks: false,
+            require_https_webhooks: false,
             monero_rpc_url: "http://127.0.0.1:18082/json_rpc".to_string(),
             monero_rpc_user: Some("rpcuser".to_string()),
             monero_rpc_pass: Some("super-secret-rpc-pass".to_string()),
             cold_wallet_address: None,
+            wallet_mode: WalletMode::ViewOnly,
+            monero_trusted_daemon: false,
+            allow_hot_wallet_without_sweep: false,
             enable_auto_sweep: false,
             sweep_priority: 0,
-            required_confirmations: 2,
+            required_confirmations: 10,
+            settlement_confirmations: 10,
             invoice_ttl_seconds: 3600,
             scan_interval_seconds: 10,
             webhook_poll_interval_seconds: 5,
+            subaddress_monitor_days: 90,
             log_format: LogFormat::Json,
         }
     }
@@ -451,6 +598,7 @@ mod tests {
     fn auto_sweep_requires_valid_cold_wallet_address() {
         let mut cfg = sample_valid_config();
         cfg.enable_auto_sweep = true;
+        cfg.wallet_mode = WalletMode::HotWallet;
         cfg.cold_wallet_address = None;
         assert!(cfg.validate().is_err());
 
@@ -459,6 +607,24 @@ mod tests {
 
         cfg.cold_wallet_address = Some(valid_mainnet_address());
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn wallet_mode_invariants_enforced() {
+        let mut cfg = sample_valid_config();
+        cfg.enable_auto_sweep = true;
+        cfg.wallet_mode = WalletMode::ViewOnly;
+        cfg.cold_wallet_address = Some(valid_mainnet_address());
+        assert!(cfg.validate().is_err());
+
+        let mut cfg2 = sample_valid_config();
+        cfg2.wallet_mode = WalletMode::HotWallet;
+        cfg2.enable_auto_sweep = false;
+        cfg2.allow_hot_wallet_without_sweep = false;
+        assert!(cfg2.validate().is_err());
+
+        cfg2.allow_hot_wallet_without_sweep = true;
+        assert!(cfg2.validate().is_ok());
     }
 
     #[test]

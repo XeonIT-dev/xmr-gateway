@@ -20,12 +20,12 @@ use crate::{
             RpcHealthStatus, SweepInvoiceResponse,
         },
     },
-    config::validate_http_url,
     domain::{
         amount::Piconero,
         invoice::{Invoice, InvoiceStatus, build_monero_uri, validate_order_id},
     },
     error::{GatewayError, GatewayResult},
+    security::url_policy::resolve_and_validate_webhook_url,
     services::qr::generate_qr_png_base64,
 };
 
@@ -142,9 +142,13 @@ pub async fn create_invoice(
                     "callback_url cannot be empty when specified".to_string(),
                 ));
             }
-            validate_http_url(&trimmed, "callback_url")
-                .map_err(|e| GatewayError::Validation(e.to_string()))?;
-            Some(trimmed)
+            let validated = resolve_and_validate_webhook_url(
+                &trimmed,
+                "callback_url",
+                state.config.webhook_url_policy(),
+            )
+            .await?;
+            Some(validated.url.to_string())
         }
         None => state.config.default_webhook_url.clone(),
     };
@@ -191,6 +195,7 @@ pub async fn create_invoice(
         updated_at: now,
         expires_at: now + ChronoDuration::seconds(ttl_i64),
         confirmed_at: None,
+        settled_at: None,
         swept_at: None,
         completed_at: None,
     };

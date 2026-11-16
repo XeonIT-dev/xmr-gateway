@@ -22,11 +22,12 @@ use tokio::sync::Mutex;
 use url::Url;
 
 use crate::{
+    config::WalletMode,
     error::{GatewayError, GatewayResult},
     rpc::types::{
         CreateAddressParams, CreateAddressResponse, EmptyParams, GetTransfersParams,
-        GetTransfersResponse, GetVersionResponse, JsonRpcRequest, JsonRpcResponse, SweepAllParams,
-        SweepAllResponse,
+        GetTransfersResponse, GetVersionResponse, JsonRpcRequest, JsonRpcResponse, QueryKeyParams,
+        QueryKeyResponse, SweepAllParams, SweepAllResponse,
     },
 };
 
@@ -109,6 +110,59 @@ impl MoneroRpcClient {
         self.call("get_version", EmptyParams {}).await
     }
 
+    /// Queries `monero-wallet-rpc` (`query_key` with `spend_key`) to determine whether the loaded
+    /// wallet is strictly watch-only (holds no private spend key).
+    ///
+    /// Returns `Ok(true)` if `monero-wallet-rpc` rejects `query_key(spend_key)` with a JSON-RPC
+    /// error (the standard behavior for watch-only wallets) or returns an empty/all-zero spend key.
+    ///
+    /// # Errors
+    /// Returns [`GatewayError::RpcTransport`] if `monero-wallet-rpc` is unreachable or returns
+    /// malformed HTTP responses.
+    pub async fn is_view_only_wallet(&self) -> GatewayResult<bool> {
+        let resp: GatewayResult<QueryKeyResponse> = self
+            .call(
+                "query_key",
+                QueryKeyParams {
+                    key_type: "spend_key",
+                },
+            )
+            .await;
+
+        match resp {
+            Ok(key_resp) => {
+                let trimmed = key_resp.key.trim();
+                Ok(trimmed.is_empty() || trimmed.bytes().all(|b| b == b'0'))
+            }
+            Err(GatewayError::Rpc { .. }) => Ok(true),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Verifies that the wallet loaded by `monero-wallet-rpc` strictly matches `expected_mode`.
+    ///
+    /// Fails closed if `WALLET_MODE=view_only` is configured while `monero-wallet-rpc` holds a
+    /// private spend key, or if `WALLET_MODE=hot_wallet` is configured with a watch-only wallet.
+    ///
+    /// # Errors
+    /// Returns [`GatewayError::Config`] on custody mode mismatch, or
+    /// [`GatewayError::RpcTransport`] if `monero-wallet-rpc` cannot be reached.
+    pub async fn verify_wallet_mode(&self, expected_mode: WalletMode) -> GatewayResult<()> {
+        let view_only = self.is_view_only_wallet().await?;
+
+        match (expected_mode, view_only) {
+            (WalletMode::ViewOnly, false) => Err(GatewayError::Config(
+                "SECURITY VIOLATION: WALLET_MODE=view_only is configured, but monero-wallet-rpc loaded a hot wallet holding a private spend key"
+                    .to_string(),
+            )),
+            (WalletMode::HotWallet, true) => Err(GatewayError::Config(
+                "WALLET_MODE=hot_wallet is configured, but monero-wallet-rpc loaded a view-only wallet without a private spend key"
+                    .to_string(),
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// Creates a new isolated subaddress under `account_index` with `label`.
     ///
     /// # Errors
@@ -150,6 +204,35 @@ impl MoneroRpcClient {
                 pool,
                 out: false,
                 pending: false,
+                failed: false,
+                account_index,
+                subaddr_indices,
+            },
+        )
+        .await
+    }
+
+    /// Queries outgoing mined (`out`) and mempool (`pending`) transfers for `subaddr_indices`
+    /// under `account_index` to reconcile crashed/interrupted `sweep_all` operations.
+    ///
+    /// # Errors
+    /// Returns [`GatewayError::RpcTransport`] or [`GatewayError::Rpc`] on failure.
+    pub async fn get_outgoing_transfers(
+        &self,
+        account_index: u32,
+        subaddr_indices: &[u32],
+    ) -> GatewayResult<GetTransfersResponse> {
+        if subaddr_indices.is_empty() {
+            return Ok(GetTransfersResponse::default());
+        }
+
+        self.call(
+            "get_transfers",
+            GetTransfersParams {
+                in_transfers: false,
+                pool: false,
+                out: true,
+                pending: true,
                 failed: false,
                 account_index,
                 subaddr_indices,
@@ -452,5 +535,79 @@ mod tests {
         assert!(res.in_transfers[0].is_unlocked(false));
         assert_eq!(res.pool.len(), 1);
         assert!(!res.pool[0].is_unlocked(true));
+    }
+
+    #[tokio::test]
+    async fn verify_wallet_mode_enforces_view_only_and_hot_wallet_invariants() {
+        let server = MockServer::start().await;
+        let client =
+            MoneroRpcClient::new(&format!("{}/json_rpc", server.uri()), None, None).unwrap();
+
+        // 1) Watch-only wallet returning JSON-RPC error on spend_key query
+        Mock::given(method("POST"))
+            .and(path("/json_rpc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "1",
+                "error": { "code": -1, "message": "Wallet is watch-only" }
+            })))
+            .mount(&server)
+            .await;
+
+        assert!(
+            client
+                .verify_wallet_mode(WalletMode::ViewOnly)
+                .await
+                .is_ok()
+        );
+        assert!(
+            client
+                .verify_wallet_mode(WalletMode::HotWallet)
+                .await
+                .is_err()
+        );
+
+        // 2) Watch-only wallet returning all-zero spend_key
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/json_rpc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "2",
+                "result": { "key": "0".repeat(64) }
+            })))
+            .mount(&server)
+            .await;
+
+        assert!(
+            client
+                .verify_wallet_mode(WalletMode::ViewOnly)
+                .await
+                .is_ok()
+        );
+
+        // 3) Hot wallet returning real non-zero spend_key MUST fail closed in ViewOnly mode!
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/json_rpc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "3",
+                "result": { "key": "a".repeat(64) }
+            })))
+            .mount(&server)
+            .await;
+
+        let mismatch_err = client
+            .verify_wallet_mode(WalletMode::ViewOnly)
+            .await
+            .unwrap_err();
+        assert!(matches!(mismatch_err, GatewayError::Config(_)));
+        assert!(
+            client
+                .verify_wallet_mode(WalletMode::HotWallet)
+                .await
+                .is_ok()
+        );
     }
 }

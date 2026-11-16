@@ -9,6 +9,7 @@
 //! - [`db`] — Transactional SQLite WAL persistence for invoices, transfer audit records, and
 //!   idempotent webhook outbox entries.
 //! - [`rpc`] — JSON-RPC 2.0 HTTP client for `monero-wallet-rpc` with RFC 2617/7616 Digest Auth.
+//! - [`security`] — Outbound SSRF protection, DNS rebinding guards, and URL validation policy.
 //! - [`services`] — Base64 PNG QR generator, HMAC-SHA256 webhook dispatcher, and background
 //!   blockchain scanner / 10-block unlock sweeper.
 //! - [`api`] — Axum REST server with constant-time `X-API-Key` authentication.
@@ -21,6 +22,7 @@ pub mod db;
 pub mod domain;
 pub mod error;
 pub mod rpc;
+pub mod security;
 pub mod services;
 
 #[cfg(test)]
@@ -46,7 +48,7 @@ mod integration_tests {
                 CreateInvoiceResponse, HealthResponse, InvoiceStatusResponse, SweepInvoiceResponse,
             },
         },
-        config::{Config, LogFormat},
+        config::{Config, LogFormat, WalletMode},
         db::{init_sqlite_pool, repository::InvoiceRepository},
         domain::invoice::InvoiceStatus,
         rpc::client::MoneroRpcClient,
@@ -69,6 +71,8 @@ mod integration_tests {
             api_secret_key: "integration-test-api-secret-key-0123456789".to_string(),
             webhook_secret: "integration-test-webhook-secret-0123456789".to_string(),
             default_webhook_url: default_webhook,
+            allow_private_webhooks: true,
+            require_https_webhooks: false,
             monero_rpc_url: rpc_url,
             monero_rpc_user: None,
             monero_rpc_pass: None,
@@ -77,12 +81,21 @@ mod integration_tests {
             } else {
                 None
             },
+            wallet_mode: if enable_auto_sweep {
+                WalletMode::HotWallet
+            } else {
+                WalletMode::ViewOnly
+            },
+            monero_trusted_daemon: false,
+            allow_hot_wallet_without_sweep: false,
             enable_auto_sweep,
             sweep_priority: 0,
             required_confirmations: 2,
+            settlement_confirmations: 10,
             invoice_ttl_seconds: 3600,
             scan_interval_seconds: 10,
             webhook_poll_interval_seconds: 5,
+            subaddress_monitor_days: 90,
             log_format: LogFormat::Json,
         })
     }
@@ -100,9 +113,13 @@ mod integration_tests {
         let cfg = integration_config(format!("{}/json_rpc", mock_rpc.uri()), Some(hook_url), true);
         let rpc = MoneroRpcClient::new(&cfg.monero_rpc_url, None, None).unwrap();
         let scanner = ScannerService::new(repo.clone(), rpc.clone(), cfg.clone());
-        let dispatcher =
-            WebhookDispatcher::new(repo.clone(), cfg.enable_auto_sweep, Duration::from_secs(5))
-                .unwrap();
+        let dispatcher = WebhookDispatcher::new_with_policy(
+            repo.clone(),
+            cfg.enable_auto_sweep,
+            Duration::from_secs(5),
+            cfg.webhook_url_policy(),
+        )
+        .unwrap();
 
         let state = AppState {
             config: cfg.clone(),
@@ -366,9 +383,13 @@ mod integration_tests {
 
         let rpc = MoneroRpcClient::new(&cfg.monero_rpc_url, None, None).unwrap();
         let scanner = ScannerService::new(repo.clone(), rpc.clone(), cfg.clone());
-        let dispatcher =
-            WebhookDispatcher::new(repo.clone(), cfg.enable_auto_sweep, Duration::from_secs(5))
-                .unwrap();
+        let dispatcher = WebhookDispatcher::new_with_policy(
+            repo.clone(),
+            cfg.enable_auto_sweep,
+            Duration::from_secs(5),
+            cfg.webhook_url_policy(),
+        )
+        .unwrap();
 
         let app = build_router(AppState {
             config: cfg.clone(),
@@ -559,5 +580,52 @@ mod integration_tests {
         assert!(status_dto.double_spend_seen);
         assert_eq!(status_dto.transfers.len(), 1);
         assert!(status_dto.transfers[0].double_spend_seen);
+    }
+
+    #[tokio::test]
+    async fn api_rejects_private_and_metadata_callback_urls_when_ssrf_guard_enabled() {
+        let mock_rpc = MockServer::start().await;
+        let pool = init_sqlite_pool("sqlite::memory:").await.unwrap();
+        let repo = InvoiceRepository::new(pool);
+
+        let mut cfg_val =
+            (*integration_config(format!("{}/json_rpc", mock_rpc.uri()), None, false)).clone();
+        cfg_val.allow_private_webhooks = false;
+        let cfg = Arc::new(cfg_val);
+
+        let rpc = MoneroRpcClient::new(&cfg.monero_rpc_url, None, None).unwrap();
+        let scanner = ScannerService::new(repo.clone(), rpc.clone(), cfg.clone());
+        let app = build_router(AppState {
+            config: cfg.clone(),
+            repo,
+            rpc,
+            scanner,
+        });
+
+        for bad_url in [
+            "http://127.0.0.1:9000/hook",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.1:8080/hook",
+            "http://[::1]:9000/hook",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/v1/invoices")
+                        .header("content-type", "application/json")
+                        .header("X-API-Key", cfg.api_secret_key.as_str())
+                        .body(Body::from(format!(
+                            r#"{{"order_id":"ssrf-test","amount_piconero":1000000,"callback_url":"{bad_url}"}}"#
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "expected 400 Bad Request for SSRF callback_url {bad_url}"
+            );
+        }
     }
 }

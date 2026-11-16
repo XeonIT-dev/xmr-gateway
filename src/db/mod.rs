@@ -1,9 +1,10 @@
 //! SQLite database initialization, WAL configuration, and repository exports.
 //!
 //! # Persistence Invariants
-//! - Write-Ahead Logging (`journal_mode = WAL`) is enabled at connection pool creation so
-//!   concurrent Axum readers and the background scanner/webhook writers do not block each
-//!   other unnecessarily.
+//! - Write-Ahead Logging (`journal_mode = WAL`) with full synchronous durability
+//!   (`synchronous = FULL`) is enabled at connection pool creation so concurrent Axum
+//!   readers and background scanner/webhook writers never roll back committed financial
+//!   transitions on abrupt OS crashes or power loss.
 //! - Foreign key enforcement (`PRAGMA foreign_keys = ON`) and a 5-second busy timeout are
 //!   applied to every pooled connection.
 //! - For in-memory SQLite databases (`sqlite::memory:`), pool size is pinned to `1` so all
@@ -37,7 +38,7 @@ pub async fn init_sqlite_pool(database_url: &str) -> GatewayResult<SqlitePool> {
     let connect_options = SqliteConnectOptions::from_str(database_url)?
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
-        .synchronous(SqliteSynchronous::Normal)
+        .synchronous(SqliteSynchronous::Full)
         .foreign_keys(true)
         .busy_timeout(Duration::from_secs(5));
 
@@ -83,4 +84,36 @@ fn ensure_sqlite_parent_dir(database_url: &str) -> GatewayResult<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sqlite_pool_enforces_full_synchronous_and_foreign_keys() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let db_path = tmp_dir.path().join("durability.db");
+        let db_url = format!("sqlite://{}", db_path.display());
+
+        let pool = init_sqlite_pool(&db_url).await.unwrap();
+
+        let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous;")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(synchronous, 2, "PRAGMA synchronous must be 2 (FULL)");
+
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys;")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(foreign_keys, 1, "PRAGMA foreign_keys must be 1 (ON)");
+
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode;")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+    }
 }

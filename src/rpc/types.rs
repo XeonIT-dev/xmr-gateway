@@ -55,6 +55,29 @@ pub struct GetVersionResponse {
     pub release: Option<bool>,
 }
 
+/// Request parameters for `query_key`.
+#[derive(Debug, Clone, Serialize)]
+pub struct QueryKeyParams<'a> {
+    /// Key type to query (`"spend_key"`, `"view_key"`, or `"mnemonic"`).
+    pub key_type: &'a str,
+}
+
+/// Response from `monero-wallet-rpc` method `query_key`.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+pub struct QueryKeyResponse {
+    /// Returned hex key material or seed phrase (redacted in [`std::fmt::Debug`]).
+    #[serde(default)]
+    pub key: String,
+}
+
+impl std::fmt::Debug for QueryKeyResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryKeyResponse")
+            .field("key", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// Request parameters for `create_address`.
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateAddressParams<'a> {
@@ -104,16 +127,33 @@ pub struct SubaddrIndex {
     pub minor: u32,
 }
 
-/// Individual incoming transfer record returned in `get_transfers.in` or `get_transfers.pool`.
+/// Outgoing transfer recipient amount/address entry returned by `monero-wallet-rpc`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TransferDestination {
+    /// Amount sent to this destination in piconero.
+    #[serde(default)]
+    pub amount: u64,
+    /// Destination Monero address string.
+    #[serde(default)]
+    pub address: String,
+}
+
+/// Individual incoming or outgoing transfer record returned by `monero-wallet-rpc` `get_transfers`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct TransferEntry {
     /// 64-character hex Monero transaction hash.
     pub txid: String,
-    /// Total piconero received in this entry.
+    /// Total piconero received/sent in this entry.
     pub amount: u64,
     /// Per-subaddress output amounts when a single tx pays multiple subaddresses.
     #[serde(default)]
     pub amounts: Vec<u64>,
+    /// Network transaction fee in piconero (populated for outgoing `out`/`pending` transfers).
+    #[serde(default)]
+    pub fee: u64,
+    /// Destination entries (populated for outgoing `out`/`pending` transfers).
+    #[serde(default)]
+    pub destinations: Vec<TransferDestination>,
     /// Block confirmations (`0` for mempool transactions).
     #[serde(default)]
     pub confirmations: u64,
@@ -141,12 +181,45 @@ pub struct TransferEntry {
     /// Unix timestamp in seconds.
     #[serde(default)]
     pub timestamp: u64,
-    /// Destination subaddress string.
+    /// Primary address string returned by RPC.
     #[serde(default)]
     pub address: String,
 }
 
 impl TransferEntry {
+    /// Returns `true` if this outgoing transfer entry originated from `(account_index, address_index)`
+    /// and targets `destination_address` (when destination metadata is present in the RPC entry).
+    #[must_use]
+    pub fn matches_sweep(
+        &self,
+        account_index: u32,
+        address_index: u32,
+        destination_address: &str,
+    ) -> bool {
+        let subaddr_match = (self.subaddr_index.major == account_index
+            && self.subaddr_index.minor == address_index)
+            || self
+                .subaddr_indices
+                .iter()
+                .any(|idx| idx.major == account_index && idx.minor == address_index);
+
+        if !subaddr_match {
+            return false;
+        }
+
+        if !self.destinations.is_empty() {
+            return self
+                .destinations
+                .iter()
+                .any(|dest| dest.address == destination_address);
+        }
+
+        if !self.address.is_empty() {
+            return self.address == destination_address;
+        }
+
+        true
+    }
     /// Determines whether this incoming output has cleared Monero's 10-block consensus lock.
     ///
     /// # Security Invariants
@@ -196,6 +269,12 @@ pub struct GetTransfersResponse {
     /// Unconfirmed incoming transactions currently in the mempool.
     #[serde(default)]
     pub pool: Vec<TransferEntry>,
+    /// Confirmed outgoing transactions.
+    #[serde(default)]
+    pub out: Vec<TransferEntry>,
+    /// Pending outgoing transactions in the mempool.
+    #[serde(default)]
+    pub pending: Vec<TransferEntry>,
 }
 
 /// Request parameters for `sweep_all`.

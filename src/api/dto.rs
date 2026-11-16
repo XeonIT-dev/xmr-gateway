@@ -182,6 +182,8 @@ pub struct InvoiceStatusResponse {
     pub expires_at: DateTime<Utc>,
     /// Timestamp when `CONFIRMED` was reached.
     pub confirmed_at: Option<DateTime<Utc>>,
+    /// Timestamp when `SETTLED` (10-block Monero lock finality) was reached.
+    pub settled_at: Option<DateTime<Utc>>,
     /// Timestamp when `SWEPT` completed.
     pub swept_at: Option<DateTime<Utc>>,
     /// Timestamp when `COMPLETED` (View-Only terminal state) completed.
@@ -217,6 +219,7 @@ impl InvoiceStatusResponse {
             updated_at: inv.updated_at,
             expires_at: inv.expires_at,
             confirmed_at: inv.confirmed_at,
+            settled_at: inv.settled_at,
             swept_at: inv.swept_at,
             completed_at: inv.completed_at,
         }

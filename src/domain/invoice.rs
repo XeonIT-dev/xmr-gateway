@@ -34,9 +34,15 @@ pub enum InvoiceStatus {
     Underpaid,
     /// Full amount (`received >= expected`) detected in mempool (`0-conf`) without double-spend.
     Mempool,
+    /// Full amount mined (`1 <= confirmations < REQUIRED_CONFIRMATIONS`), accumulating confirmations.
+    Confirming,
     /// Full amount reached `REQUIRED_CONFIRMATIONS`; fulfillment webhook dispatched.
     Confirmed,
-    /// Terminal state in View-Only mode (`ENABLE_AUTO_SWEEP=false`) after `CONFIRMED` webhook delivery.
+    /// Full amount reached `SETTLEMENT_CONFIRMATIONS` (default 10 blocks); reorg-resistant finality.
+    Settled,
+    /// Previously `MEMPOOL`/`CONFIRMING`/`CONFIRMED`/`SETTLED` payment dropped depth, disappeared, or saw a double-spend.
+    Reorged,
+    /// Terminal state in View-Only mode (`ENABLE_AUTO_SWEEP=false`) after `CONFIRMED`/`SETTLED` webhook delivery.
     Completed,
     /// Terminal state in Hot Auto-Sweep mode after unlocked funds (`>= 10` blocks) were swept to cold storage.
     Swept,
@@ -52,26 +58,29 @@ impl InvoiceStatus {
             Self::Pending => "PENDING",
             Self::Underpaid => "UNDERPAID",
             Self::Mempool => "MEMPOOL",
+            Self::Confirming => "CONFIRMING",
             Self::Confirmed => "CONFIRMED",
+            Self::Settled => "SETTLED",
+            Self::Reorged => "REORGED",
             Self::Completed => "COMPLETED",
             Self::Swept => "SWEPT",
             Self::Expired => "EXPIRED",
         }
     }
 
-    /// Returns `true` if no further automated state transitions are possible.
+    /// Returns `true` if no further automated primary lifecycle transitions occur.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Swept | Self::Expired)
     }
 
-    /// Returns `true` if the background scanner should continue monitoring this invoice.
+    /// Returns `true` if the background scanner should continue active status evaluation.
     #[must_use]
     pub const fn is_active(self) -> bool {
         !self.is_terminal()
     }
 
-    /// Validates whether transitioning from `self` to `next` obeys the state machine graph.
+    /// Validates whether transitioning from `self` to `next` obeys the reorg-safe state machine graph.
     ///
     /// # Errors
     /// Returns [`DomainError::InvalidStateTransition`] if `self -> next` is forbidden.
@@ -83,14 +92,45 @@ impl InvoiceStatus {
         let allowed = match self {
             Self::Pending => matches!(
                 next,
-                Self::Underpaid | Self::Mempool | Self::Confirmed | Self::Completed | Self::Expired
+                Self::Underpaid
+                    | Self::Mempool
+                    | Self::Confirming
+                    | Self::Confirmed
+                    | Self::Settled
+                    | Self::Completed
+                    | Self::Expired
             ),
             Self::Underpaid => matches!(
                 next,
-                Self::Mempool | Self::Confirmed | Self::Completed | Self::Expired
+                Self::Mempool
+                    | Self::Confirming
+                    | Self::Confirmed
+                    | Self::Settled
+                    | Self::Completed
+                    | Self::Expired
+                    | Self::Reorged
             ),
-            Self::Mempool => matches!(next, Self::Confirmed | Self::Completed),
-            Self::Confirmed => matches!(next, Self::Completed | Self::Swept),
+            Self::Mempool => matches!(
+                next,
+                Self::Confirming
+                    | Self::Confirmed
+                    | Self::Settled
+                    | Self::Completed
+                    | Self::Reorged
+            ),
+            Self::Confirming => matches!(
+                next,
+                Self::Confirmed | Self::Settled | Self::Completed | Self::Reorged
+            ),
+            Self::Confirmed => matches!(
+                next,
+                Self::Settled | Self::Completed | Self::Swept | Self::Reorged
+            ),
+            Self::Settled => matches!(next, Self::Completed | Self::Swept | Self::Reorged),
+            Self::Reorged => matches!(
+                next,
+                Self::Confirming | Self::Confirmed | Self::Settled | Self::Expired
+            ),
             Self::Completed | Self::Swept | Self::Expired => false,
         };
 
@@ -120,7 +160,10 @@ impl FromStr for InvoiceStatus {
             "PENDING" => Ok(Self::Pending),
             "UNDERPAID" => Ok(Self::Underpaid),
             "MEMPOOL" => Ok(Self::Mempool),
+            "CONFIRMING" => Ok(Self::Confirming),
             "CONFIRMED" => Ok(Self::Confirmed),
+            "SETTLED" => Ok(Self::Settled),
+            "REORGED" => Ok(Self::Reorged),
             "COMPLETED" => Ok(Self::Completed),
             "SWEPT" => Ok(Self::Swept),
             "EXPIRED" => Ok(Self::Expired),
@@ -131,7 +174,7 @@ impl FromStr for InvoiceStatus {
     }
 }
 
-/// Outbound webhook notification event emitted on invoice state transitions.
+/// Outbound webhook notification event emitted on invoice state transitions or subaddress anomalies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum WebhookEventType {
@@ -141,10 +184,18 @@ pub enum WebhookEventType {
     Mempool,
     /// Full amount reached `REQUIRED_CONFIRMATIONS`.
     Confirmed,
+    /// Full amount reached `SETTLEMENT_CONFIRMATIONS` (default 10 blocks).
+    Settled,
+    /// Chain reorganization or post-payment double-spend compromised a confirming/confirmed invoice.
+    Reorged,
     /// Unlocked balance swept to `COLD_WALLET_ADDRESS`.
     Swept,
     /// Invoice expired before full payment arrived.
     Expired,
+    /// Confirmed payment arrived on an already `EXPIRED` invoice subaddress.
+    LatePayment,
+    /// Additional confirmed payment arrived exceeding `expected_amount` after settlement/sweep.
+    Overpayment,
 }
 
 impl WebhookEventType {
@@ -155,8 +206,12 @@ impl WebhookEventType {
             Self::Underpaid => "UNDERPAID",
             Self::Mempool => "MEMPOOL",
             Self::Confirmed => "CONFIRMED",
+            Self::Settled => "SETTLED",
+            Self::Reorged => "REORGED",
             Self::Swept => "SWEPT",
             Self::Expired => "EXPIRED",
+            Self::LatePayment => "LATE_PAYMENT",
+            Self::Overpayment => "OVERPAYMENT",
         }
     }
 }
@@ -175,8 +230,12 @@ impl FromStr for WebhookEventType {
             "UNDERPAID" => Ok(Self::Underpaid),
             "MEMPOOL" => Ok(Self::Mempool),
             "CONFIRMED" => Ok(Self::Confirmed),
+            "SETTLED" => Ok(Self::Settled),
+            "REORGED" => Ok(Self::Reorged),
             "SWEPT" => Ok(Self::Swept),
             "EXPIRED" => Ok(Self::Expired),
+            "LATE_PAYMENT" => Ok(Self::LatePayment),
+            "OVERPAYMENT" => Ok(Self::Overpayment),
             other => Err(DomainError::Validation(format!(
                 "unknown webhook event type '{other}'"
             ))),
@@ -231,10 +290,78 @@ pub struct Invoice {
     pub expires_at: DateTime<Utc>,
     /// UTC timestamp when `CONFIRMED` was reached.
     pub confirmed_at: Option<DateTime<Utc>>,
+    /// UTC timestamp when `SETTLED` (10-block Monero lock finality) was reached.
+    pub settled_at: Option<DateTime<Utc>>,
     /// UTC timestamp when `SWEPT` completed.
     pub swept_at: Option<DateTime<Utc>>,
     /// UTC timestamp when `COMPLETED` (View-Only mode terminal state) completed.
     pub completed_at: Option<DateTime<Utc>>,
+}
+
+/// Classification of a confirmed incoming transfer persisted in `subaddress_transfers` (`XMR-004`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TransferClassification {
+    /// Expected invoice fulfillment payment received before expiration within invoice amount.
+    Expected,
+    /// Confirmed payment arriving after the invoice transitioned to `EXPIRED`.
+    LatePayment,
+    /// Confirmed payment exceeding `expected_amount` after fulfillment/settlement/sweep.
+    Overpayment,
+}
+
+impl TransferClassification {
+    /// Returns canonical uppercase database/wire representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Expected => "EXPECTED",
+            Self::LatePayment => "LATE_PAYMENT",
+            Self::Overpayment => "OVERPAYMENT",
+        }
+    }
+}
+
+impl fmt::Display for TransferClassification {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for TransferClassification {
+    type Err = DomainError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "EXPECTED" => Ok(Self::Expected),
+            "LATE_PAYMENT" => Ok(Self::LatePayment),
+            "OVERPAYMENT" => Ok(Self::Overpayment),
+            other => Err(DomainError::Validation(format!(
+                "unknown transfer classification '{other}'"
+            ))),
+        }
+    }
+}
+
+/// Ledger entry recording a classified confirmed incoming transfer on a monitored subaddress.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubaddressTransferRecord {
+    /// Monero transaction hash (primary key in `subaddress_transfers`).
+    pub txid: String,
+    /// Associated invoice UUID.
+    pub invoice_id: Uuid,
+    /// Monero subaddress minor index under account `0`.
+    pub address_index: u32,
+    /// Atomic piconero amount attributed to this ledger entry.
+    pub amount_piconero: Piconero,
+    /// Block confirmations observed when recorded.
+    pub confirmations: u64,
+    /// Accounting classification (`EXPECTED`, `LATE_PAYMENT`, `OVERPAYMENT`).
+    pub classification: TransferClassification,
+    /// Whether the funds represented by this transfer have been swept to cold storage.
+    pub swept: bool,
+    /// UTC creation timestamp.
+    pub created_at: DateTime<Utc>,
 }
 
 /// Snapshot of an individual incoming transfer observed on an invoice's subaddress.
@@ -346,14 +473,8 @@ pub fn evaluate_subaddress_transfers(
     }
 }
 
-/// Computes the next [`InvoiceStatus`] from the current status, scan metrics, and clock.
-///
-/// # State Machine Guarantees
-/// - Terminal states (`COMPLETED`, `SWEPT`, `EXPIRED`) never transition.
-/// - `CONFIRMED` never regresses to `MEMPOOL`, `UNDERPAID`, `PENDING`, or `EXPIRED`.
-/// - `MEMPOOL` never expires (`EXPIRED`) while waiting for block inclusion.
-/// - In `PENDING` or `UNDERPAID`, if full payment has NOT arrived and `now >= expires_at`,
-///   the invoice transitions to `EXPIRED`.
+/// Computes the next [`InvoiceStatus`] using `MONERO_UNLOCK_CONFIRMATIONS` (`10`) as the
+/// default settlement finality threshold.
 #[must_use]
 pub fn compute_next_status(
     current: InvoiceStatus,
@@ -363,26 +484,123 @@ pub fn compute_next_status(
     now: DateTime<Utc>,
     expires_at: DateTime<Utc>,
 ) -> InvoiceStatus {
-    if current.is_terminal() || current == InvoiceStatus::Confirmed {
+    compute_next_status_with_settlement(
+        current,
+        expected_amount,
+        eval,
+        required_confirmations,
+        MONERO_UNLOCK_CONFIRMATIONS.max(required_confirmations),
+        now,
+        expires_at,
+    )
+}
+
+/// Computes the next [`InvoiceStatus`] with explicit confirmation and settlement thresholds and
+/// full chain-reorganization detection.
+///
+/// # State Machine Guarantees
+/// - Terminal states (`COMPLETED`, `SWEPT`, `EXPIRED`) never transition.
+/// - `CONFIRMED` continues tracking confirmations until `settlement_confirmations` (reaching
+///   `SETTLED`), and drops into `REORGED` if confirmations fall below `required_confirmations`,
+///   observed balance drops below `expected_amount`, or `double_spend_seen` is flagged.
+/// - `CONFIRMING` tracks mined invoices (`1 <= conf < required_confirmations`) and transitions
+///   to `REORGED` if orphaned back to `0` confirmations or double-spent.
+/// - `MEMPOOL` never expires (`EXPIRED`) while waiting for block inclusion, but moves to
+///   `REORGED` if previously full payment vanishes or gets double-spent.
+/// - Always passes through `CONFIRMED` when first reaching `required_confirmations` so merchants
+///   consistently receive the `CONFIRMED` webhook before `SETTLED`.
+#[must_use]
+pub fn compute_next_status_with_settlement(
+    current: InvoiceStatus,
+    expected_amount: Piconero,
+    eval: &SubaddressEvaluation,
+    required_confirmations: u64,
+    settlement_confirmations: u64,
+    now: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+) -> InvoiceStatus {
+    if current.is_terminal() {
         return current;
     }
 
-    if eval.received_piconero >= expected_amount {
-        if eval.effective_confirmations >= required_confirmations {
-            return InvoiceStatus::Confirmed;
+    match current {
+        InvoiceStatus::Settled => {
+            if eval.double_spend_seen
+                || eval.received_piconero < expected_amount
+                || eval.effective_confirmations < settlement_confirmations
+            {
+                return InvoiceStatus::Reorged;
+            }
+            InvoiceStatus::Settled
         }
-        return InvoiceStatus::Mempool;
-    }
+        InvoiceStatus::Confirmed => {
+            if eval.double_spend_seen
+                || eval.received_piconero < expected_amount
+                || eval.effective_confirmations < required_confirmations
+            {
+                return InvoiceStatus::Reorged;
+            }
+            if eval.effective_confirmations >= settlement_confirmations {
+                return InvoiceStatus::Settled;
+            }
+            InvoiceStatus::Confirmed
+        }
+        InvoiceStatus::Confirming => {
+            if eval.double_spend_seen
+                || eval.received_piconero < expected_amount
+                || eval.effective_confirmations == 0
+            {
+                return InvoiceStatus::Reorged;
+            }
+            if eval.effective_confirmations >= required_confirmations {
+                return InvoiceStatus::Confirmed;
+            }
+            InvoiceStatus::Confirming
+        }
+        InvoiceStatus::Reorged => {
+            if !eval.double_spend_seen
+                && eval.received_piconero >= expected_amount
+                && eval.effective_confirmations >= required_confirmations
+            {
+                return InvoiceStatus::Confirmed;
+            }
+            InvoiceStatus::Reorged
+        }
+        InvoiceStatus::Mempool => {
+            if eval.double_spend_seen || eval.received_piconero < expected_amount {
+                return InvoiceStatus::Reorged;
+            }
+            if eval.effective_confirmations >= required_confirmations {
+                return InvoiceStatus::Confirmed;
+            }
+            if eval.effective_confirmations >= 1 {
+                return InvoiceStatus::Confirming;
+            }
+            InvoiceStatus::Mempool
+        }
+        InvoiceStatus::Pending | InvoiceStatus::Underpaid => {
+            if eval.received_piconero >= expected_amount {
+                if eval.effective_confirmations >= required_confirmations {
+                    return InvoiceStatus::Confirmed;
+                }
+                if eval.effective_confirmations >= 1 {
+                    return InvoiceStatus::Confirming;
+                }
+                return InvoiceStatus::Mempool;
+            }
 
-    if now >= expires_at {
-        return InvoiceStatus::Expired;
-    }
+            if now >= expires_at {
+                return InvoiceStatus::Expired;
+            }
 
-    if !eval.received_piconero.is_zero() {
-        return InvoiceStatus::Underpaid;
-    }
+            if !eval.received_piconero.is_zero() {
+                return InvoiceStatus::Underpaid;
+            }
 
-    current
+            current
+        }
+        InvoiceStatus::Completed | InvoiceStatus::Swept | InvoiceStatus::Expired => current,
+    }
 }
 
 /// Validates a merchant-supplied `order_id`.
@@ -606,5 +824,56 @@ mod tests {
             uri,
             "monero:888tNkZrPN6JsEgekjMnABU4TBzc2Dt29EPAvkRxbANsAnjyPbb3iQ1YBRk1UXcdRsiKc9dhwMVgN5S9cQUiyoogDavup3H?tx_amount=1.000000000000&tx_description=ord%3A42"
         );
+    }
+
+    #[test]
+    fn reorg_and_settlement_state_transitions() {
+        let expected = Piconero(1_000_000_000_000);
+        let now = Utc::now();
+        let expires = now + Duration::hours(1);
+
+        // 0-conf -> MEMPOOL -> CONFIRMING (1 conf with req=2) -> CONFIRMED (2 conf) -> SETTLED (10 conf)
+        let eval0 =
+            evaluate_subaddress_transfers(expected, &[mk_tx("tx1", expected.0, 0, false, true)]);
+        let s1 = compute_next_status_with_settlement(
+            InvoiceStatus::Pending,
+            expected,
+            &eval0,
+            2,
+            10,
+            now,
+            expires,
+        );
+        assert_eq!(s1, InvoiceStatus::Mempool);
+
+        let eval1 =
+            evaluate_subaddress_transfers(expected, &[mk_tx("tx1", expected.0, 1, false, false)]);
+        let s2 = compute_next_status_with_settlement(s1, expected, &eval1, 2, 10, now, expires);
+        assert_eq!(s2, InvoiceStatus::Confirming);
+
+        let eval2 =
+            evaluate_subaddress_transfers(expected, &[mk_tx("tx1", expected.0, 2, false, false)]);
+        let s3 = compute_next_status_with_settlement(s2, expected, &eval2, 2, 10, now, expires);
+        assert_eq!(s3, InvoiceStatus::Confirmed);
+
+        // Reorg drops confirmation depth below required_confirmations (2 -> 1) => REORGED!
+        let s_reorg_depth =
+            compute_next_status_with_settlement(s3, expected, &eval1, 2, 10, now, expires);
+        assert_eq!(s_reorg_depth, InvoiceStatus::Reorged);
+
+        // Double spend seen while CONFIRMED => REORGED!
+        let mut ds_tx = mk_tx("tx1", expected.0, 3, false, false);
+        ds_tx.double_spend_seen = true;
+        let eval_ds = evaluate_subaddress_transfers(expected, &[ds_tx]);
+        let s_reorg_ds =
+            compute_next_status_with_settlement(s3, expected, &eval_ds, 2, 10, now, expires);
+        assert_eq!(s_reorg_ds, InvoiceStatus::Reorged);
+
+        // Normal progression CONFIRMED (2) -> SETTLED (10)
+        let eval10 =
+            evaluate_subaddress_transfers(expected, &[mk_tx("tx1", expected.0, 10, true, false)]);
+        let s_settled =
+            compute_next_status_with_settlement(s3, expected, &eval10, 2, 10, now, expires);
+        assert_eq!(s_settled, InvoiceStatus::Settled);
     }
 }

@@ -37,6 +37,8 @@ async fn run_gateway() -> GatewayResult<()> {
 
     tracing::info!(
         bind_addr = %config.bind_addr(),
+        wallet_mode = config.wallet_mode.as_str(),
+        monero_trusted_daemon = config.monero_trusted_daemon,
         auto_sweep = config.enable_auto_sweep,
         required_confirmations = config.required_confirmations,
         scan_interval_seconds = config.scan_interval_seconds,
@@ -50,12 +52,26 @@ async fn run_gateway() -> GatewayResult<()> {
         config.monero_rpc_user.clone(),
         config.monero_rpc_pass.clone(),
     )?;
+    rpc.verify_wallet_mode(config.wallet_mode).await?;
 
     let scanner = ScannerService::new(repo.clone(), rpc.clone(), config.clone());
-    let webhook_dispatcher = WebhookDispatcher::new(
+    match scanner.reconcile_in_flight_sweeps().await {
+        Ok(0) => {}
+        Ok(count) => tracing::warn!(
+            reconciled_sweeps = count,
+            "reconciled interrupted in-flight sweep attempts at startup"
+        ),
+        Err(err) => tracing::warn!(
+            error = %err,
+            "startup sweep reconciliation deferred to background scanner"
+        ),
+    }
+
+    let webhook_dispatcher = WebhookDispatcher::new_with_policy(
         repo.clone(),
         config.enable_auto_sweep,
         Duration::from_secs(config.webhook_poll_interval_seconds),
+        config.webhook_url_policy(),
     )?;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

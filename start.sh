@@ -160,6 +160,40 @@ ensure_env_file() {
     : "${MONERO_REMOTE_NODE:=xmr-node.cakewallet.com:18081}"
     : "${WALLET_RESTORE_HEIGHT:=3280000}"
     : "${ENABLE_AUTO_SWEEP:=false}"
+    : "${MONERO_TRUSTED_DAEMON:=false}"
+    : "${ALLOW_HOT_WALLET_WITHOUT_SWEEP:=false}"
+
+    if [[ -z "${WALLET_MODE:-}" ]]; then
+        if [[ "${ENABLE_AUTO_SWEEP,,}" == "true" || "${ENABLE_AUTO_SWEEP}" == "1" ]]; then
+            WALLET_MODE="hot_wallet"
+        else
+            WALLET_MODE="view_only"
+        fi
+    else
+        WALLET_MODE="${WALLET_MODE,,}"
+        WALLET_MODE="${WALLET_MODE//-/_}"
+    fi
+    export WALLET_MODE MONERO_TRUSTED_DAEMON ALLOW_HOT_WALLET_WITHOUT_SWEEP
+
+    case "$WALLET_MODE" in
+        view_only|hot_wallet) ;;
+        *)
+            log_err "Invalid WALLET_MODE='$WALLET_MODE': expected 'view_only' or 'hot_wallet'."
+            exit 1
+            ;;
+    esac
+
+    if [[ "${ENABLE_AUTO_SWEEP,,}" == "true" || "${ENABLE_AUTO_SWEEP}" == "1" ]] && [[ "$WALLET_MODE" != "hot_wallet" ]]; then
+        log_err "ENABLE_AUTO_SWEEP=true requires WALLET_MODE=hot_wallet (got '$WALLET_MODE')."
+        exit 1
+    fi
+
+    if [[ "$WALLET_MODE" == "hot_wallet" ]] \
+        && [[ "${ENABLE_AUTO_SWEEP,,}" != "true" && "${ENABLE_AUTO_SWEEP}" != "1" ]] \
+        && [[ "${ALLOW_HOT_WALLET_WITHOUT_SWEEP,,}" != "true" && "${ALLOW_HOT_WALLET_WITHOUT_SWEEP}" != "1" ]]; then
+        log_err "WALLET_MODE=hot_wallet requires ENABLE_AUTO_SWEEP=true (or explicit ALLOW_HOT_WALLET_WITHOUT_SWEEP=true)."
+        exit 1
+    fi
 
     case "$MONERO_NETWORK" in
         mainnet|stagenet) ;;
@@ -168,6 +202,17 @@ ensure_env_file() {
             exit 1
             ;;
     esac
+}
+
+validate_wallet_bootstrap_policy() {
+    if [[ ! -f "${WALLET_FILE}.keys" && "$WALLET_MODE" == "view_only" ]]; then
+        if [[ -z "${MONERO_VIEW_ONLY_ADDRESS:-}" || -z "${MONERO_VIEW_ONLY_KEY:-}" ]]; then
+            log_err "WALLET_MODE=view_only requires MONERO_VIEW_ONLY_ADDRESS and MONERO_VIEW_ONLY_KEY in .env when no existing wallet exists."
+            log_err "Refusing to silently generate a hot wallet with a private spend key in View-Only Zero-Trust mode."
+            log_err "Provide view-only keys in .env, or explicitly opt into WALLET_MODE=hot_wallet (+ ENABLE_AUTO_SWEEP=true or ALLOW_HOT_WALLET_WITHOUT_SWEEP=true)."
+            exit 1
+        fi
+    fi
 }
 
 network_flags() {
@@ -298,7 +343,11 @@ ensure_wallet() {
 
     log_info "Initializing $MONERO_NETWORK wallet at $WALLET_FILE (restore height: $WALLET_RESTORE_HEIGHT)..."
 
-    if [[ -n "${MONERO_VIEW_ONLY_ADDRESS:-}" && -n "${MONERO_VIEW_ONLY_KEY:-}" ]]; then
+    if [[ "$WALLET_MODE" == "view_only" ]]; then
+        if [[ -z "${MONERO_VIEW_ONLY_ADDRESS:-}" || -z "${MONERO_VIEW_ONLY_KEY:-}" ]]; then
+            log_err "WALLET_MODE=view_only requires MONERO_VIEW_ONLY_ADDRESS and MONERO_VIEW_ONLY_KEY in .env."
+            exit 1
+        fi
         log_info "Creating View-Only wallet non-interactively from MONERO_VIEW_ONLY_ADDRESS/KEY..."
         printf '%s\n%s\n%s\nN\n' \
             "$MONERO_VIEW_ONLY_ADDRESS" \
@@ -311,8 +360,8 @@ ensure_wallet() {
             --restore-height "$WALLET_RESTORE_HEIGHT" \
             --log-file "$CLI_LOG_FILE" \
             --command address
-    else
-        log_warn "Generating new $MONERO_NETWORK wallet at $WALLET_FILE. Back up the 25-word seed phrase below!"
+    elif [[ "$WALLET_MODE" == "hot_wallet" ]]; then
+        log_warn "WALLET_MODE=hot_wallet: generating new $MONERO_NETWORK wallet at $WALLET_FILE. Back up the 25-word seed phrase below!"
         printf 'N\n' | "$wallet_cli" \
             --offline \
             "${net_args[@]}" \
@@ -322,6 +371,9 @@ ensure_wallet() {
             --mnemonic-language English \
             --log-file "$CLI_LOG_FILE" \
             --command address
+    else
+        log_err "Refusing wallet generation for unrecognized WALLET_MODE='$WALLET_MODE'."
+        exit 1
     fi
 
     if [[ ! -f "${WALLET_FILE}.keys" ]]; then
@@ -359,12 +411,19 @@ start_monero_wallet_rpc() {
         --wallet-file "$WALLET_FILE"
         --password-file "$WALLET_PASS_FILE"
         --daemon-address "$MONERO_REMOTE_NODE"
-        --trusted-daemon
         --rpc-bind-ip 127.0.0.1
         --rpc-bind-port "$rpc_port"
         --log-file "$RPC_LOG_FILE"
         --log-level 1
     )
+
+    if [[ "${MONERO_TRUSTED_DAEMON,,}" == "true" || "${MONERO_TRUSTED_DAEMON}" == "1" ]]; then
+        log_warn "MONERO_TRUSTED_DAEMON=true: passing --trusted-daemon to monero-wallet-rpc"
+        rpc_args+=(--trusted-daemon)
+    else
+        log_info "MONERO_TRUSTED_DAEMON=false: running monero-wallet-rpc with --untrusted-daemon"
+        rpc_args+=(--untrusted-daemon)
+    fi
 
     if [[ "$MONERO_NETWORK" == "stagenet" ]]; then
         rpc_args+=(--stagenet)
@@ -407,6 +466,7 @@ start_monero_wallet_rpc() {
 
         if [[ "$resp" == *'"result"'* ]]; then
             log_info "monero-wallet-rpc is ready."
+            verify_rpc_wallet_mode "$rpc_port"
             return 0
         fi
 
@@ -417,6 +477,43 @@ start_monero_wallet_rpc() {
     log_err "Timed out waiting for monero-wallet-rpc on 127.0.0.1:${rpc_port}. Tail of $RPC_LOG_FILE:"
     tail -n 25 "$RPC_LOG_FILE" >&2 || true
     exit 1
+}
+
+verify_rpc_wallet_mode() {
+    local rpc_port="$1"
+    local curl_auth_args=()
+    if [[ -n "${MONERO_RPC_USER:-}" ]]; then
+        curl_auth_args=(--digest -u "${MONERO_RPC_USER}:${MONERO_RPC_PASS}")
+    fi
+
+    local key_resp
+    key_resp="$(curl -sS "${curl_auth_args[@]}" \
+        -H 'Content-Type: application/json' \
+        -d '{"jsonrpc":"2.0","id":"verify_mode","method":"query_key","params":{"key_type":"spend_key"}}' \
+        "http://127.0.0.1:${rpc_port}/json_rpc" 2>/dev/null || true)"
+
+    if [[ "$key_resp" != *'"error"'* && "$key_resp" != *'"result"'* ]]; then
+        log_err "Failed to verify wallet custody mode via query_key (unexpected RPC response). Aborting."
+        exit 1
+    fi
+
+    if [[ "$WALLET_MODE" == "view_only" ]]; then
+        local spend_key=""
+        if [[ "$key_resp" =~ \"key\"[[:space:]]*:[[:space:]]*\"([^\"]*)\" ]]; then
+            spend_key="${BASH_REMATCH[1]}"
+        fi
+        if [[ -n "$spend_key" && ! "$spend_key" =~ ^0+$ ]]; then
+            log_err "SECURITY VIOLATION: WALLET_MODE=view_only is configured, but the loaded wallet contains a private spend key! Aborting startup."
+            exit 1
+        fi
+        log_info "Verified view-only wallet status via monero-wallet-rpc (no spend key present)."
+    else
+        if [[ "$key_resp" == *'"error"'* ]]; then
+            log_err "WALLET_MODE=hot_wallet is configured, but the loaded wallet is view-only (missing spend key)! Aborting startup."
+            exit 1
+        fi
+        log_info "Verified hot wallet status via monero-wallet-rpc."
+    fi
 }
 
 build_gateway_if_needed() {
@@ -471,6 +568,7 @@ main() {
 
     require_cmd curl
     ensure_env_file
+    validate_wallet_bootstrap_policy
     ensure_monero_binaries 0
     ensure_wallet
 
