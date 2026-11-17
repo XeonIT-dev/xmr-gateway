@@ -72,11 +72,13 @@ fn test_config(
         cors_allowed_origins: vec!["*".to_string()],
         database_url: "sqlite::memory:".to_string(),
         api_secret_key: "hardening-suite-api-secret-key-0123456789".to_string(),
+        operator_api_key: None,
         webhook_secret: "hardening-suite-webhook-secret-0123456789".to_string(),
         default_webhook_url: default_webhook,
         allow_private_webhooks: true,
         require_https_webhooks: false,
         monero_rpc_url: rpc_url,
+        monero_daemon_rpc_url: None,
         monero_rpc_user: None,
         monero_rpc_pass: None,
         allow_unauthenticated_rpc: true,
@@ -2574,7 +2576,7 @@ async fn regression_xmr_041_sweep_incident_resolution_enforces_rpc_check_and_unb
             Request::post(format!("/api/v1/invoices/{}/sweep/resolve", inv.id))
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"action":"allow_resweep","operator_note":"check"}"#,
+                    r#"{"action":"allow_resweep","confirm_absent_on_chain":true,"operator_note":"check"}"#,
                 ))
                 .unwrap(),
         )
@@ -2589,7 +2591,7 @@ async fn regression_xmr_041_sweep_incident_resolution_enforces_rpc_check_and_unb
                 .header("content-type", "application/json")
                 .header("X-API-Key", cfg.api_secret_key.as_str())
                 .body(Body::from(
-                    r#"{"action":"allow_resweep","operator_note":"   "}"#,
+                    r#"{"action":"allow_resweep","confirm_absent_on_chain":true,"operator_note":"   "}"#,
                 ))
                 .unwrap(),
         )
@@ -2599,6 +2601,26 @@ async fn regression_xmr_041_sweep_incident_resolution_enforces_rpc_check_and_unb
 
     // 3) RPC still reports old_sweep_tx alive in pending -> allow_resweep MUST reject with 409 Conflict!
     mock_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_height"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "h1",
+            "result": { "height": 3_400_100_u64 }
+        })))
+        .mount(&mock_rpc)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "i1",
+            "result": { "height": 3_400_100_u64, "synchronized": true, "status": "OK" }
+        })))
+        .mount(&mock_rpc)
+        .await;
     Mock::given(method("POST"))
         .and(path("/json_rpc"))
         .and(body_string_contains(r#""pool":true"#))
@@ -2628,7 +2650,7 @@ async fn regression_xmr_041_sweep_incident_resolution_enforces_rpc_check_and_unb
                 .header("content-type", "application/json")
                 .header("X-API-Key", cfg.api_secret_key.as_str())
                 .body(Body::from(
-                    r#"{"action":"allow_resweep","operator_note":"operator attempting early unlock"}"#,
+                    r#"{"action":"allow_resweep","confirm_absent_on_chain":true,"operator_note":"operator attempting early unlock"}"#,
                 ))
                 .unwrap(),
         )
@@ -2642,6 +2664,26 @@ async fn regression_xmr_041_sweep_incident_resolution_enforces_rpc_check_and_unb
 
     // 4) Old sweep tx confirmed dead in RPC (absent from out/pending/pool) -> allow_resweep succeeds!
     mock_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_height"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "h2",
+            "result": { "height": 3_400_105_u64 }
+        })))
+        .mount(&mock_rpc)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "i2",
+            "result": { "height": 3_400_105_u64, "synchronized": true, "status": "OK" }
+        })))
+        .mount(&mock_rpc)
+        .await;
     Mock::given(method("POST"))
         .and(path("/json_rpc"))
         .and(body_string_contains(r#""pool":true"#))
@@ -2660,7 +2702,7 @@ async fn regression_xmr_041_sweep_incident_resolution_enforces_rpc_check_and_unb
                 .header("content-type", "application/json")
                 .header("X-API-Key", cfg.api_secret_key.as_str())
                 .body(Body::from(
-                    r#"{"action":"allow_resweep","operator_note":"confirmed old sweep tx absent in daemon mempool and chain"}"#,
+                    r#"{"action":"allow_resweep","confirm_absent_on_chain":true,"operator_note":"confirmed old sweep tx absent in daemon mempool and chain"}"#,
                 ))
                 .unwrap(),
         )
@@ -2679,9 +2721,17 @@ async fn regression_xmr_041_sweep_incident_resolution_enforces_rpc_check_and_unb
         Some(SweepResolutionAction::AllowResweep)
     );
     assert!(resolved_dto.resolved_attempt.resolved_at.is_some());
-    assert_eq!(
-        resolved_dto.resolved_attempt.resolution_note.as_deref(),
-        Some("confirmed old sweep tx absent in daemon mempool and chain")
+    assert!(
+        resolved_dto
+            .resolved_attempt
+            .resolution_note
+            .as_deref()
+            .is_some_and(|n| {
+                n.starts_with("confirmed old sweep tx absent in daemon mempool and chain")
+                    && n.contains("wallet_height=3400105")
+                    && n.contains("daemon_height=3400105")
+                    && n.contains(&old_sweep_tx)
+            })
     );
 
     // Audit row retained without deletion and subaddress_transfers reverted to ACTIVE (unswept)
@@ -2960,4 +3010,715 @@ async fn regression_xmr_042_expired_invoice_late_payment_sweep_reorg_emits_webho
     assert!(reorg_hook.dedupe_key.contains(":REORGED:epoch:1:"));
     assert!(reorg_hook.payload_json.contains(r#""event":"REORGED""#));
     assert!(reorg_hook.payload_json.contains(r#""status":"EXPIRED""#));
+}
+
+#[tokio::test]
+async fn regression_xmr_043_allow_resweep_blocks_lagging_wallet_and_requires_confirmation() {
+    let pool = init_sqlite_pool("sqlite::memory:").await.unwrap();
+    let repo = InvoiceRepository::new(pool);
+    let mock_rpc = MockServer::start().await;
+
+    let mut inv = make_invoice(112, 1_000_000_000_000, None);
+    inv.status = InvoiceStatus::Settled;
+    inv.received_piconero = Piconero(1_000_000_000_000);
+    inv.confirmations = 15;
+    inv.unlocked = true;
+    repo.insert_invoice(&inv).await.unwrap();
+
+    let cfg = test_config(format!("{}/json_rpc", mock_rpc.uri()), None, true, 10, 15);
+    let cold_addr = cfg.cold_wallet_address.as_deref().unwrap();
+    let old_tx = "b".repeat(64);
+    let att = repo
+        .create_prepared_sweep_attempt(inv.id, inv.address_index, cold_addr, Utc::now())
+        .await
+        .unwrap();
+    repo.complete_sweep_attempt(CompleteSweepAttemptParams {
+        attempt_id: att.id,
+        invoice_id: inv.id,
+        attempt_status: SweepAttemptStatus::Submitted,
+        sweep_tx_hashes: vec![old_tx.clone()],
+        sweep_amount_piconero: Piconero(999_900_000_000),
+        sweep_fee_piconero: Piconero(100_000_000),
+        webhook: None,
+        now: Utc::now(),
+    })
+    .await
+    .unwrap();
+    repo.mark_sweep_attempt_reorged(
+        att.id,
+        inv.id,
+        "SWEEP_REORG_DETECTED: missing",
+        None,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+
+    let rpc = MoneroRpcClient::new(&cfg.monero_rpc_url, None, None).unwrap();
+    let scanner = ScannerService::new(repo.clone(), rpc.clone(), cfg.clone());
+    let app = build_router(AppState {
+        config: cfg.clone(),
+        repo: repo.clone(),
+        rpc,
+        scanner,
+    });
+
+    // 1) Missing or false confirm_absent_on_chain -> 400 Bad Request
+    for payload in [
+        r#"{"action":"allow_resweep","operator_note":"missing confirm"}"#,
+        r#"{"action":"allow_resweep","confirm_absent_on_chain":false,"operator_note":"false confirm"}"#,
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/invoices/{}/sweep/resolve", inv.id))
+                    .header("content-type", "application/json")
+                    .header("X-API-Key", cfg.api_secret_key.as_str())
+                    .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // 2) Lagging wallet (wallet_height=100 < daemon_height=110) -> 409 Conflict
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_height"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": { "height": 100_u64 }
+        })))
+        .mount(&mock_rpc)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "2",
+            "result": { "height": 110_u64, "synchronized": true, "status": "OK" }
+        })))
+        .mount(&mock_rpc)
+        .await;
+
+    let lag_resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/invoices/{}/sweep/resolve", inv.id))
+                .header("content-type", "application/json")
+                .header("X-API-Key", cfg.api_secret_key.as_str())
+                .body(Body::from(
+                    r#"{"action":"allow_resweep","confirm_absent_on_chain":true,"operator_note":"checking sync lag"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(lag_resp.status(), StatusCode::CONFLICT);
+
+    // 3) RPC error on get_info/get_height -> 503 Service Unavailable (fail-closed)
+    mock_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock_rpc)
+        .await;
+
+    let rpc_err_resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/invoices/{}/sweep/resolve", inv.id))
+                .header("content-type", "application/json")
+                .header("X-API-Key", cfg.api_secret_key.as_str())
+                .body(Body::from(
+                    r#"{"action":"allow_resweep","confirm_absent_on_chain":true,"operator_note":"rpc outage check"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rpc_err_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // 4) Synced wallet (wallet_height >= daemon_height), empty get_transfers, confirm_absent_on_chain=true -> 200 OK + audit metadata
+    mock_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_height"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "3",
+            "result": { "height": 3_400_500_u64 }
+        })))
+        .mount(&mock_rpc)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "4",
+            "result": { "height": 3_400_500_u64, "synchronized": true, "status": "OK" }
+        })))
+        .mount(&mock_rpc)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains(r#""pool":true"#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "5",
+            "result": { "out": [], "pending": [], "pool": [] }
+        })))
+        .mount(&mock_rpc)
+        .await;
+
+    let ok_resp = app
+        .oneshot(
+            Request::post(format!("/api/v1/invoices/{}/sweep/resolve", inv.id))
+                .header("content-type", "application/json")
+                .header("X-API-Key", cfg.api_secret_key.as_str())
+                .body(Body::from(
+                    r#"{"action":"allow_resweep","confirm_absent_on_chain":true,"operator_note":"manual sync & block explorer check OK"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok_resp.status(), StatusCode::OK);
+    let ok_dto: ResolveSweepIncidentResponse =
+        serde_json::from_slice(&ok_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(ok_dto.resolved_attempt.status, SweepAttemptStatus::Failed);
+    let note = ok_dto.resolved_attempt.resolution_note.unwrap();
+    assert!(note.starts_with("manual sync & block explorer check OK"));
+    assert!(note.contains("verified_at_utc="));
+    assert!(note.contains("wallet_height=3400500"));
+    assert!(note.contains("daemon_height=3400500"));
+    assert!(note.contains(&format!("prior_tx_hashes={old_tx}")));
+}
+
+#[tokio::test]
+async fn regression_xmr_044_045_mark_reconciled_validates_64_hex_verifies_rpc_and_prevents_resweep()
+{
+    let pool = init_sqlite_pool("sqlite::memory:").await.unwrap();
+    let repo = InvoiceRepository::new(pool);
+    let mock_rpc = MockServer::start().await;
+
+    let cfg = test_config(format!("{}/json_rpc", mock_rpc.uri()), None, true, 10, 15);
+    let cold_addr = cfg.cold_wallet_address.as_deref().unwrap();
+
+    // Invoice A: SWEPT -> REORGED -> MARK_RECONCILED -> SWEPT
+    let mut inv = make_invoice(113, 1_000_000_000_000, None);
+    inv.status = InvoiceStatus::Settled;
+    inv.received_piconero = Piconero(1_000_000_000_000);
+    inv.confirmations = 15;
+    inv.unlocked = true;
+    repo.insert_invoice(&inv).await.unwrap();
+
+    let old_tx = "c".repeat(64);
+    let rep_upper = "D".repeat(64);
+    let rep_lower = "d".repeat(64);
+
+    let att = repo
+        .create_prepared_sweep_attempt(inv.id, inv.address_index, cold_addr, Utc::now())
+        .await
+        .unwrap();
+    repo.complete_sweep_attempt(CompleteSweepAttemptParams {
+        attempt_id: att.id,
+        invoice_id: inv.id,
+        attempt_status: SweepAttemptStatus::Submitted,
+        sweep_tx_hashes: vec![old_tx],
+        sweep_amount_piconero: Piconero(999_900_000_000),
+        sweep_fee_piconero: Piconero(100_000_000),
+        webhook: None,
+        now: Utc::now(),
+    })
+    .await
+    .unwrap();
+    repo.mark_sweep_attempt_reorged(
+        att.id,
+        inv.id,
+        "SWEEP_REORG_DETECTED: reorged",
+        None,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+
+    let rpc = MoneroRpcClient::new(&cfg.monero_rpc_url, None, None).unwrap();
+    let scanner = ScannerService::new(repo.clone(), rpc.clone(), cfg.clone());
+    let app = build_router(AppState {
+        config: cfg.clone(),
+        repo: repo.clone(),
+        rpc,
+        scanner: scanner.clone(),
+    });
+
+    // 1) Reject invalid replacement_tx_hash formats with 400 Bad Request
+    for bad_hash in [
+        "abc",
+        &"e".repeat(63),
+        &"e".repeat(65),
+        &format!("{}g", "a".repeat(63)),
+    ] {
+        let body = serde_json::json!({
+            "action": "mark_reconciled",
+            "replacement_tx_hash": bad_hash,
+            "operator_note": "verifying hash format"
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/invoices/{}/sweep/resolve", inv.id))
+                    .header("content-type", "application/json")
+                    .header("X-API-Key", cfg.api_secret_key.as_str())
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "expected 400 for bad hash '{bad_hash}'"
+        );
+    }
+
+    // 2) Reject 64-hex replacement_tx_hash if absent from RPC (409 Conflict)
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains(r#""pool":true"#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": { "out": [], "pending": [], "pool": [] }
+        })))
+        .mount(&mock_rpc)
+        .await;
+
+    let missing_rep = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/invoices/{}/sweep/resolve", inv.id))
+                .header("content-type", "application/json")
+                .header("X-API-Key", cfg.api_secret_key.as_str())
+                .body(Body::from(
+                    serde_json::json!({
+                        "action": "mark_reconciled",
+                        "replacement_tx_hash": rep_upper,
+                        "operator_note": "hash absent in RPC"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_rep.status(), StatusCode::CONFLICT);
+
+    // 3) Reject 64-hex replacement_tx_hash if double_spend_seen=true in RPC (409 Conflict)
+    mock_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains(r#""pool":true"#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "2",
+            "result": {
+                "out": [{
+                    "txid": rep_lower,
+                    "amount": 999_900_000_000_u64,
+                    "fee": 100_000_000_u64,
+                    "confirmations": 5,
+                    "double_spend_seen": true,
+                    "subaddr_index": { "major": 0, "minor": 113 }
+                }],
+                "pending": [],
+                "pool": []
+            }
+        })))
+        .mount(&mock_rpc)
+        .await;
+
+    let ds_rep = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/invoices/{}/sweep/resolve", inv.id))
+                .header("content-type", "application/json")
+                .header("X-API-Key", cfg.api_secret_key.as_str())
+                .body(Body::from(
+                    serde_json::json!({
+                        "action": "mark_reconciled",
+                        "replacement_tx_hash": rep_upper,
+                        "operator_note": "double spend check"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ds_rep.status(), StatusCode::CONFLICT);
+
+    // 4) Valid replacement_tx_hash (uppercase -> normalized lowercase) present in out without double-spend -> 200 OK
+    mock_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains(r#""pool":true"#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "3",
+            "result": {
+                "out": [{
+                    "txid": rep_lower,
+                    "amount": 999_900_000_000_u64,
+                    "fee": 100_000_000_u64,
+                    "confirmations": 15,
+                    "double_spend_seen": false,
+                    "subaddr_index": { "major": 0, "minor": 113 }
+                }],
+                "pending": [],
+                "pool": []
+            }
+        })))
+        .mount(&mock_rpc)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains(r#""in":true"#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "4",
+            "result": { "in": [], "pool": [] }
+        })))
+        .mount(&mock_rpc)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("sweep_all"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock_rpc)
+        .await;
+
+    let ok_rep = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/invoices/{}/sweep/resolve", inv.id))
+                .header("content-type", "application/json")
+                .header("X-API-Key", cfg.api_secret_key.as_str())
+                .body(Body::from(
+                    serde_json::json!({
+                        "action": "mark_reconciled",
+                        "replacement_tx_hash": rep_upper,
+                        "operator_note": "confirmed settlement of replacement sweep on cold wallet"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok_rep.status(), StatusCode::OK);
+    let ok_dto: ResolveSweepIncidentResponse =
+        serde_json::from_slice(&ok_rep.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(ok_dto.status, InvoiceStatus::Swept);
+    assert_eq!(
+        ok_dto.resolved_attempt.status,
+        SweepAttemptStatus::Reconciled
+    );
+    assert_eq!(
+        ok_dto.resolved_attempt.resolution_action,
+        Some(SweepResolutionAction::MarkReconciled)
+    );
+    assert!(ok_dto.resolved_attempt.resolved_at.is_some());
+    assert!(ok_dto.resolved_attempt.tx_hashes.contains(&rep_lower));
+    assert!(!ok_dto.resolved_attempt.tx_hashes.contains(&rep_upper));
+
+    // Replaying /sweep/resolve returns 409 Conflict (idempotent protection against double reconciliation)
+    let replay_resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/invoices/{}/sweep/resolve", inv.id))
+                .header("content-type", "application/json")
+                .header("X-API-Key", cfg.api_secret_key.as_str())
+                .body(Body::from(
+                    serde_json::json!({
+                        "action": "mark_reconciled",
+                        "operator_note": "replay attempt"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay_resp.status(), StatusCode::CONFLICT);
+
+    // Subsequent scan_once & manual /sweep refuse to double-sweep
+    let scan_after = scanner.scan_once().await.unwrap();
+    assert_eq!(scan_after.invoices_swept, 0);
+    let post_sweep_resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/invoices/{}/sweep", inv.id))
+                .header("X-API-Key", cfg.api_secret_key.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(post_sweep_resp.status(), StatusCode::CONFLICT);
+
+    // 5) EXPIRED invoice late-payment sweep reorg -> MARK_RECONCILED keeps status=EXPIRED
+    let mut exp_inv = make_invoice(114, 1_000_000_000_000, None);
+    exp_inv.status = InvoiceStatus::Expired;
+    exp_inv.expires_at = Utc::now() - ChronoDuration::minutes(30);
+    repo.insert_invoice(&exp_inv).await.unwrap();
+
+    let exp_att = repo
+        .create_prepared_sweep_attempt(exp_inv.id, exp_inv.address_index, cold_addr, Utc::now())
+        .await
+        .unwrap();
+    repo.complete_sweep_attempt(CompleteSweepAttemptParams {
+        attempt_id: exp_att.id,
+        invoice_id: exp_inv.id,
+        attempt_status: SweepAttemptStatus::Submitted,
+        sweep_tx_hashes: vec!["f".repeat(64)],
+        sweep_amount_piconero: Piconero(999_900_000_000),
+        sweep_fee_piconero: Piconero(100_000_000),
+        webhook: None,
+        now: Utc::now(),
+    })
+    .await
+    .unwrap();
+    repo.mark_sweep_attempt_reorged(
+        exp_att.id,
+        exp_inv.id,
+        "SWEEP_REORG_DETECTED: expired sweep",
+        None,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+
+    let exp_res = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/invoices/{}/sweep/resolve", exp_inv.id))
+                .header("content-type", "application/json")
+                .header("X-API-Key", cfg.api_secret_key.as_str())
+                .body(Body::from(
+                    r#"{"action":"mark_reconciled","operator_note":"expired late sweep arrived safely on cold wallet"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(exp_res.status(), StatusCode::OK);
+    let exp_dto: ResolveSweepIncidentResponse =
+        serde_json::from_slice(&exp_res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(exp_dto.status, InvoiceStatus::Expired);
+    assert_eq!(
+        exp_dto.resolved_attempt.status,
+        SweepAttemptStatus::Reconciled
+    );
+    assert_eq!(
+        exp_dto.resolved_attempt.resolution_action,
+        Some(SweepResolutionAction::MarkReconciled)
+    );
+}
+
+#[tokio::test]
+async fn regression_operator_api_key_isolates_incident_resolution_from_merchant_key() {
+    let pool = init_sqlite_pool("sqlite::memory:").await.unwrap();
+    let repo = InvoiceRepository::new(pool);
+    let mock_rpc = MockServer::start().await;
+
+    let mut cfg_val =
+        (*test_config(format!("{}/json_rpc", mock_rpc.uri()), None, true, 10, 15)).clone();
+    let op_key = "operator-privileged-secret-key-0123456789abcdef".to_string();
+    cfg_val.operator_api_key = Some(op_key.clone());
+    let cfg = Arc::new(cfg_val);
+
+    let subaddr = encode_monero_base58_address(24, &[0x33; 32], &[0x44; 32], None);
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("create_address"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": { "address": subaddr, "address_index": 115 }
+        })))
+        .mount(&mock_rpc)
+        .await;
+
+    let rpc = MoneroRpcClient::new(&cfg.monero_rpc_url, None, None).unwrap();
+    let scanner = ScannerService::new(repo.clone(), rpc.clone(), cfg.clone());
+    let app = build_router(AppState {
+        config: cfg.clone(),
+        repo: repo.clone(),
+        rpc,
+        scanner,
+    });
+
+    // 1) Merchant API_SECRET_KEY can create & read invoices
+    let create_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/invoices")
+                .header("content-type", "application/json")
+                .header("X-API-Key", cfg.api_secret_key.as_str())
+                .body(Body::from(
+                    r#"{"order_id":"op-rbac-order-1","amount_piconero":1000000000000}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+    let created: CreateInvoiceResponse =
+        serde_json::from_slice(&create_resp.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+
+    let get_resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/invoices/{}", created.invoice_id))
+                .header("X-API-Key", cfg.api_secret_key.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get_resp.status(), StatusCode::OK);
+
+    // Advance invoice through SETTLED -> SWEPT -> REORGED sweep incident
+    repo.apply_scan_update(ApplyScanUpdateParams {
+        invoice_id: created.invoice_id,
+        received_piconero: Piconero(1_000_000_000_000),
+        confirmations: 15,
+        unlocked: true,
+        double_spend_seen: false,
+        next_status: InvoiceStatus::Settled,
+        transfers: vec![ObservedTransfer {
+            txid: "e".repeat(64),
+            amount_piconero: Piconero(1_000_000_000_000),
+            confirmations: 15,
+            unlocked: true,
+            double_spend_seen: false,
+            in_pool: false,
+            orphaned: false,
+        }],
+        webhook: None,
+        now: Utc::now(),
+    })
+    .await
+    .unwrap();
+    let att = repo
+        .create_prepared_sweep_attempt(
+            created.invoice_id,
+            115,
+            cfg.cold_wallet_address.as_deref().unwrap(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    repo.complete_sweep_attempt(CompleteSweepAttemptParams {
+        attempt_id: att.id,
+        invoice_id: created.invoice_id,
+        attempt_status: SweepAttemptStatus::Submitted,
+        sweep_tx_hashes: vec!["f".repeat(64)],
+        sweep_amount_piconero: Piconero(999_900_000_000),
+        sweep_fee_piconero: Piconero(100_000_000),
+        webhook: None,
+        now: Utc::now(),
+    })
+    .await
+    .unwrap();
+    repo.mark_sweep_attempt_reorged(
+        att.id,
+        created.invoice_id,
+        "SWEEP_REORG_DETECTED: test rbac",
+        None,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+
+    // 2) Merchant API_SECRET_KEY is rejected (403 Forbidden) on /sweep/resolve and /sweep, and unknown key -> 401
+    let merchant_forbidden = app
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/v1/invoices/{}/sweep/resolve",
+                created.invoice_id
+            ))
+            .header("content-type", "application/json")
+            .header("X-API-Key", cfg.api_secret_key.as_str())
+            .body(Body::from(
+                r#"{"action":"mark_reconciled","operator_note":"merchant should fail"}"#,
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(merchant_forbidden.status(), StatusCode::FORBIDDEN);
+
+    let merchant_sweep_forbidden = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/invoices/{}/sweep", created.invoice_id))
+                .header("X-API-Key", cfg.api_secret_key.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(merchant_sweep_forbidden.status(), StatusCode::FORBIDDEN);
+
+    let unknown_unauth = app
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/v1/invoices/{}/sweep/resolve",
+                created.invoice_id
+            ))
+            .header("content-type", "application/json")
+            .header("X-API-Key", "completely-wrong-key")
+            .body(Body::from(
+                r#"{"action":"mark_reconciled","operator_note":"unknown key"}"#,
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unknown_unauth.status(), StatusCode::UNAUTHORIZED);
+
+    // 3) OPERATOR_API_KEY successfully resolves the incident!
+    let operator_ok = app
+        .oneshot(
+            Request::post(format!(
+                "/api/v1/invoices/{}/sweep/resolve",
+                created.invoice_id
+            ))
+            .header("content-type", "application/json")
+            .header("X-API-Key", op_key.as_str())
+            .body(Body::from(
+                r#"{"action":"mark_reconciled","operator_note":"authorized operator resolution"}"#,
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(operator_ok.status(), StatusCode::OK);
+    let op_dto: ResolveSweepIncidentResponse =
+        serde_json::from_slice(&operator_ok.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert_eq!(
+        op_dto.resolved_attempt.status,
+        SweepAttemptStatus::Reconciled
+    );
 }

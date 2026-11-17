@@ -1266,23 +1266,36 @@ impl ScannerService {
             .await
     }
 
-    /// Resolves a `REORGED` (`SWEEP_REORG_DETECTED`) sweep incident under the per-invoice sweep lock (`XMR-041`).
+    /// Resolves a `REORGED` (`SWEEP_REORG_DETECTED`) sweep incident under the per-invoice sweep lock (`XMR-041` / `XMR-043` / `XMR-044`).
     ///
-    /// When `action == SweepResolutionAction::AllowResweep`, performs a fail-closed RPC check
-    /// (`get_transfers(out=true, pending=true, pool=true)`) and returns `409 Conflict` if any
-    /// transaction hash from the `REORGED` attempt is still alive (`double_spend_seen == false`).
+    /// - When `action == SweepResolutionAction::AllowResweep`:
+    ///   1. Requires explicit `confirm_absent_on_chain == Some(true)` (`400 Bad Request`).
+    ///   2. Verifies fail-closed wallet/daemon sync (`get_height` >= `get_info` height, non-zero;
+    ///      `503` on RPC error, `409` on lag).
+    ///   3. Verifies via `get_transfers(out=true, pending=true, pool=true)` that none of the
+    ///      `REORGED` attempt's transactions remain alive without `double_spend_seen=true`.
+    ///   4. Persists enriched audit metadata (`verified_at_utc`, `wallet_height`, `daemon_height`,
+    ///      `prior_tx_hashes`, `operator_note`) in `resolution_note`.
+    /// - When `action == SweepResolutionAction::MarkReconciled`:
+    ///   1. Validates any supplied `replacement_tx_hash` as strict 64-hex normalized to lowercase.
+    ///   2. Verifies via `get_transfers(out=true, pending=true, pool=true)` that
+    ///      `replacement_tx_hash` exists in `out` or `pending` with `double_spend_seen=false` (`409` otherwise).
     ///
     /// # Errors
-    /// - [`GatewayError::Validation`] if `operator_note` is blank or `replacement_tx_hash` is malformed.
-    /// - [`GatewayError::NotFound`] if the invoice or target `attempt_id` does not exist.
-    /// - [`GatewayError::Conflict`] if no `REORGED` attempt exists or the old sweep tx is still alive in RPC.
-    /// - [`GatewayError::Rpc`] / [`GatewayError::RpcTransport`] / [`GatewayError::Database`] on backend errors.
+    /// - [`GatewayError::Validation`] (`400`) on blank `operator_note`, missing
+    ///   `confirm_absent_on_chain=true`, or invalid non-64-hex `replacement_tx_hash`.
+    /// - [`GatewayError::NotFound`] (`404`) if invoice or `attempt_id` is missing.
+    /// - [`GatewayError::Conflict`] (`409`) if no `REORGED` attempt exists, wallet lags behind
+    ///   daemon tip, old sweep tx is still live, or replacement tx is absent/double-spent.
+    /// - [`GatewayError::ServiceUnavailable`] (`503`) / [`GatewayError::Rpc`] / [`GatewayError::Database`]
+    ///   on RPC sync unavailability or backend failure.
     pub async fn resolve_sweep_incident(
         &self,
         invoice_id: Uuid,
         attempt_id: Option<Uuid>,
         action: SweepResolutionAction,
         replacement_tx_hash: Option<&str>,
+        confirm_absent_on_chain: Option<bool>,
         operator_note: &str,
     ) -> GatewayResult<(Invoice, SweepAttempt)> {
         let trimmed_note = operator_note.trim();
@@ -1291,16 +1304,23 @@ impl ScannerService {
                 "operator_note must not be empty when resolving a sweep incident".to_string(),
             ));
         }
+        if action == SweepResolutionAction::AllowResweep && confirm_absent_on_chain != Some(true) {
+            return Err(GatewayError::Validation(
+                "confirm_absent_on_chain must be explicitly set to true for action=allow_resweep"
+                    .to_string(),
+            ));
+        }
+
         let cleaned_replacement = match replacement_tx_hash {
             Some(raw) => {
                 let t = raw.trim();
-                if t.is_empty() || t.len() > 128 || !t.chars().all(|c| c.is_ascii_hexdigit()) {
+                if t.len() != 64 || !t.chars().all(|c| c.is_ascii_hexdigit()) {
                     return Err(GatewayError::Validation(
-                        "replacement_tx_hash must be a valid hexadecimal transaction hash"
+                        "replacement_tx_hash must be an exact 64-character hexadecimal Monero transaction hash"
                             .to_string(),
                     ));
                 }
-                Some(t.to_string())
+                Some(t.to_ascii_lowercase())
             }
             None => None,
         };
@@ -1337,29 +1357,38 @@ impl ScannerService {
         let now = Utc::now();
         match action {
             SweepResolutionAction::AllowResweep => {
+                let (wallet_height, daemon_height) = self
+                    .rpc
+                    .verify_wallet_synced(self.config.monero_daemon_rpc_url.as_deref())
+                    .await?;
+
                 let verify_resp = self
                     .rpc
                     .get_sweep_verification_transfers(
                         invoice.account_index,
                         &[attempt.address_index],
                     )
-                    .await?;
-
-                let live_entries = verify_resp
-                    .out
-                    .iter()
-                    .chain(verify_resp.pending.iter())
-                    .chain(verify_resp.pool.iter());
+                    .await
+                    .map_err(|err| {
+                        GatewayError::ServiceUnavailable(format!(
+                            "unable to verify sweep transfers from monero-wallet-rpc: {err}"
+                        ))
+                    })?;
 
                 let still_alive = if attempt.tx_hashes.is_empty() {
-                    live_entries.clone().any(|entry| {
-                        !entry.double_spend_seen
-                            && entry.matches_sweep(
-                                invoice.account_index,
-                                attempt.address_index,
-                                &attempt.destination_address,
-                            )
-                    })
+                    verify_resp
+                        .out
+                        .iter()
+                        .chain(verify_resp.pending.iter())
+                        .chain(verify_resp.pool.iter())
+                        .any(|entry| {
+                            !entry.double_spend_seen
+                                && entry.matches_sweep(
+                                    invoice.account_index,
+                                    attempt.address_index,
+                                    &attempt.destination_address,
+                                )
+                        })
                 } else {
                     attempt.tx_hashes.iter().any(|txid| {
                         verify_resp
@@ -1367,7 +1396,9 @@ impl ScannerService {
                             .iter()
                             .chain(verify_resp.pending.iter())
                             .chain(verify_resp.pool.iter())
-                            .any(|entry| &entry.txid == txid && !entry.double_spend_seen)
+                            .any(|entry| {
+                                entry.txid.eq_ignore_ascii_case(txid) && !entry.double_spend_seen
+                            })
                     })
                 };
 
@@ -1378,23 +1409,61 @@ impl ScannerService {
                     )));
                 }
 
+                let verified_at_utc = now.to_rfc3339();
+                let prior_txids = if attempt.tx_hashes.is_empty() {
+                    "none".to_string()
+                } else {
+                    attempt.tx_hashes.join(",")
+                };
+                let audit_note = format!(
+                    "{operator_note} [verified_at_utc={verified_at_utc}; wallet_height={wallet_height}; daemon_height={daemon_height}; prior_tx_hashes={prior_txids}]"
+                );
+
                 tracing::warn!(
                     invoice_id = %invoice_id,
                     attempt_id = %attempt.id,
+                    verified_at_utc = %verified_at_utc,
+                    wallet_height = wallet_height,
+                    daemon_height = daemon_height,
+                    prior_tx_hashes = ?attempt.tx_hashes,
                     operator_note = %operator_note,
-                    "operator resolved SWEEP_REORG_DETECTED via ALLOW_RESWEEP after fail-closed RPC check"
+                    "operator resolved SWEEP_REORG_DETECTED via ALLOW_RESWEEP after fail-closed height sync & RPC transfer check"
                 );
 
                 self.repo
-                    .resolve_sweep_incident_allow_resweep(
-                        attempt.id,
-                        invoice_id,
-                        operator_note,
-                        now,
-                    )
+                    .resolve_sweep_incident_allow_resweep(attempt.id, invoice_id, &audit_note, now)
                     .await
             }
             SweepResolutionAction::MarkReconciled => {
+                if let Some(rep_txid) = replacement_tx_hash {
+                    let verify_resp = self
+                        .rpc
+                        .get_sweep_verification_transfers(
+                            invoice.account_index,
+                            &[attempt.address_index],
+                        )
+                        .await
+                        .map_err(|err| {
+                            GatewayError::ServiceUnavailable(format!(
+                                "unable to verify replacement_tx_hash from monero-wallet-rpc: {err}"
+                            ))
+                        })?;
+
+                    let verified_replacement = verify_resp
+                        .out
+                        .iter()
+                        .chain(verify_resp.pending.iter())
+                        .any(|entry| {
+                            entry.txid.eq_ignore_ascii_case(rep_txid) && !entry.double_spend_seen
+                        });
+
+                    if !verified_replacement {
+                        return Err(GatewayError::Conflict(format!(
+                            "replacement_tx_hash {rep_txid} was not found in outgoing wallet transfers (out/pending) or is flagged double_spend_seen=true"
+                        )));
+                    }
+                }
+
                 tracing::warn!(
                     invoice_id = %invoice_id,
                     attempt_id = %attempt.id,
@@ -1552,11 +1621,13 @@ mod tests {
             cors_allowed_origins: vec!["*".to_string()],
             database_url: "sqlite::memory:".to_string(),
             api_secret_key: "a".repeat(32),
+            operator_api_key: None,
             webhook_secret: "b".repeat(32),
             default_webhook_url: None,
             allow_private_webhooks: true,
             require_https_webhooks: false,
             monero_rpc_url: rpc_url,
+            monero_daemon_rpc_url: None,
             monero_rpc_user: None,
             monero_rpc_pass: None,
             allow_unauthenticated_rpc: true,

@@ -312,15 +312,18 @@ impl InvoiceStatusResponse {
     }
 }
 
-/// Request payload for `POST /api/v1/invoices/{invoice_id}/sweep/resolve` (`XMR-041`).
+/// Request payload for `POST /api/v1/invoices/{invoice_id}/sweep/resolve` (`XMR-041` / `XMR-043`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResolveSweepIncidentRequest {
     /// Optional target `sweep_attempts.id` UUID; defaults to the latest `REORGED` attempt.
     pub attempt_id: Option<String>,
     /// Resolution action: `"allow_resweep"` or `"mark_reconciled"`.
     pub action: SweepResolutionAction,
-    /// Optional replacement sweep transaction hash when `action == "mark_reconciled"`.
+    /// Optional 64-hex replacement sweep transaction hash when `action == "mark_reconciled"`.
     pub replacement_tx_hash: Option<String>,
+    /// Mandatory explicit operator confirmation (`true`) required when `action == "allow_resweep"`.
+    #[serde(default)]
+    pub confirm_absent_on_chain: Option<bool>,
     /// Mandatory non-empty operator audit note explaining the manual reconciliation verification.
     pub operator_note: String,
 }

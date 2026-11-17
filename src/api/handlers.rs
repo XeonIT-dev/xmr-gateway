@@ -376,6 +376,7 @@ pub async fn resolve_sweep_incident(
             attempt_id,
             req.action,
             req.replacement_tx_hash.as_deref(),
+            req.confirm_absent_on_chain,
             &req.operator_note,
         )
         .await?;

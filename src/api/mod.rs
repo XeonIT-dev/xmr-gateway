@@ -45,9 +45,19 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 /// Constructs the complete Axum [`Router`] with public healthcheck, authenticated `/api/v1/*`
 /// endpoints, sensitive header redaction, request body bounds, timeouts, CORS, and tracing.
 pub fn build_router(state: AppState) -> Router {
-    let protected_v1 = Router::new()
+    let merchant_v1 = Router::new()
         .route("/invoices", post(handlers::create_invoice))
         .route("/invoices/{invoice_id}", get(handlers::get_invoice))
+        .route(
+            "/invoices/{invoice_id}/webhooks/retry",
+            post(handlers::retry_invoice_webhooks),
+        )
+        .route_layer(axum_mw::from_fn_with_state(
+            state.clone(),
+            middleware::require_api_key,
+        ));
+
+    let operator_v1 = Router::new()
         .route(
             "/invoices/{invoice_id}/sweep",
             post(handlers::sweep_invoice),
@@ -57,21 +67,20 @@ pub fn build_router(state: AppState) -> Router {
             post(handlers::resolve_sweep_incident),
         )
         .route(
-            "/invoices/{invoice_id}/webhooks/retry",
-            post(handlers::retry_invoice_webhooks),
-        )
-        .route(
             "/webhooks/{webhook_id}/retry",
             post(handlers::retry_webhook),
         )
         .route_layer(axum_mw::from_fn_with_state(
             state.clone(),
-            middleware::require_api_key,
+            middleware::require_operator_key,
         ));
+
+    let protected_v1 = merchant_v1.merge(operator_v1);
 
     let cors = build_cors_layer(&state.config.cors_allowed_origins);
     let x_request_id = HeaderName::from_static("x-request-id");
     let x_api_key = HeaderName::from_static(middleware::API_KEY_HEADER);
+    let x_operator_key = HeaderName::from_static(middleware::OPERATOR_API_KEY_HEADER);
 
     Router::new()
         .route("/health", get(handlers::health_check))
@@ -86,6 +95,7 @@ pub fn build_router(state: AppState) -> Router {
         .layer(TraceLayer::new_for_http())
         .layer(SetSensitiveRequestHeadersLayer::new([
             x_api_key,
+            x_operator_key,
             header::AUTHORIZATION,
             header::COOKIE,
         ]))
@@ -99,6 +109,7 @@ fn build_cors_layer(origins: &[String]) -> CorsLayer {
         .allow_headers([
             HeaderName::from_static("content-type"),
             HeaderName::from_static(middleware::API_KEY_HEADER),
+            HeaderName::from_static(middleware::OPERATOR_API_KEY_HEADER),
         ]);
 
     if origins.is_empty() {

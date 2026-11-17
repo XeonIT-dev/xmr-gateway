@@ -25,10 +25,10 @@ use crate::{
     config::WalletMode,
     error::{GatewayError, GatewayResult},
     rpc::types::{
-        CreateAddressParams, CreateAddressResponse, EmptyParams, GetTransfersParams,
-        GetTransfersResponse, GetVersionResponse, JsonRpcRequest, JsonRpcResponse, QueryKeyParams,
-        QueryKeyResponse, SweepAllParams, SweepAllResponse, ValidateAddressParams,
-        ValidateAddressResult,
+        CreateAddressParams, CreateAddressResponse, EmptyParams, GetHeightResponse,
+        GetInfoResponse, GetTransfersParams, GetTransfersResponse, GetVersionResponse,
+        JsonRpcRequest, JsonRpcResponse, QueryKeyParams, QueryKeyResponse, SweepAllParams,
+        SweepAllResponse, ValidateAddressParams, ValidateAddressResult,
     },
 };
 
@@ -138,6 +138,79 @@ impl MoneroRpcClient {
     /// unreachable or returns an error.
     pub async fn get_version(&self) -> GatewayResult<GetVersionResponse> {
         self.call("get_version", EmptyParams {}).await
+    }
+
+    /// Queries `monero-wallet-rpc` `get_height` for the wallet's current synced height (`XMR-043`).
+    ///
+    /// # Errors
+    /// Returns [`GatewayError::RpcTransport`] or [`GatewayError::Rpc`] on failure.
+    pub async fn get_height(&self) -> GatewayResult<GetHeightResponse> {
+        self.call("get_height", EmptyParams {}).await
+    }
+
+    /// Queries `monerod` `get_info` for canonical node height and sync status (`XMR-043`).
+    ///
+    /// # Errors
+    /// Returns [`GatewayError::RpcTransport`] or [`GatewayError::Rpc`] on failure.
+    pub async fn get_info(&self) -> GatewayResult<GetInfoResponse> {
+        self.call("get_info", EmptyParams {}).await
+    }
+
+    /// Verifies fail-closed that `monero-wallet-rpc` is fully caught up with `monerod` (`XMR-043`):
+    /// `wallet_height > 0`, `daemon_height > 0`, daemon `synchronized != Some(false)`, and
+    /// `wallet_height >= daemon_height`.
+    ///
+    /// # Errors
+    /// - [`GatewayError::ServiceUnavailable`] (`503`) if wallet or daemon RPC fails/unreachable.
+    /// - [`GatewayError::Conflict`] (`409`) if wallet lags behind daemon height or height is zero.
+    pub async fn verify_wallet_synced(
+        &self,
+        daemon_rpc_url: Option<&str>,
+    ) -> GatewayResult<(u64, u64)> {
+        let wallet_height = self
+            .get_height()
+            .await
+            .map_err(|err| {
+                GatewayError::ServiceUnavailable(format!(
+                    "unable to verify wallet sync height via get_height: {err}"
+                ))
+            })?
+            .height;
+
+        let daemon_info = match daemon_rpc_url {
+            Some(url) if url != self.endpoint.as_str() => {
+                let daemon_client = Self::new(url, None, None).map_err(|err| {
+                    GatewayError::ServiceUnavailable(format!(
+                        "invalid MONERO_DAEMON_RPC_URL configuration: {err}"
+                    ))
+                })?;
+                daemon_client.get_info().await
+            }
+            _ => self.get_info().await,
+        }
+        .map_err(|err| {
+            GatewayError::ServiceUnavailable(format!(
+                "unable to verify daemon tip height via get_info: {err}"
+            ))
+        })?;
+
+        let effective_daemon_tip = daemon_info
+            .target_height
+            .filter(|&th| th > daemon_info.height)
+            .unwrap_or(daemon_info.height);
+
+        if wallet_height == 0
+            || effective_daemon_tip == 0
+            || daemon_info.synchronized == Some(false)
+            || wallet_height < effective_daemon_tip
+        {
+            return Err(GatewayError::Conflict(format!(
+                "wallet is not fully synced with daemon tip (wallet_height={}, daemon_height={}, synchronized={:?}); refusing unsafe unlock",
+                wallet_height, effective_daemon_tip, daemon_info.synchronized
+            )));
+        }
+
+        Ok((wallet_height, effective_daemon_tip))
     }
 
     /// Queries `monero-wallet-rpc` (`query_key` with `spend_key`) to determine whether the loaded

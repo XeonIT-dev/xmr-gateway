@@ -55,6 +55,29 @@ pub struct GetVersionResponse {
     pub release: Option<bool>,
 }
 
+/// Response from `monero-wallet-rpc` method `get_height`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GetHeightResponse {
+    /// Current synced blockchain height observed by the wallet.
+    pub height: u64,
+}
+
+/// Response from `monerod` JSON-RPC method `get_info`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GetInfoResponse {
+    /// Current tip height reported by the daemon.
+    pub height: u64,
+    /// Optional target height when daemon is still syncing.
+    #[serde(default)]
+    pub target_height: Option<u64>,
+    /// Optional synchronization status reported by `monerod`.
+    #[serde(default)]
+    pub synchronized: Option<bool>,
+    /// Optional RPC status string (`"OK"`).
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
 /// Request parameters for `query_key`.
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryKeyParams<'a> {

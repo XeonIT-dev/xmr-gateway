@@ -98,6 +98,8 @@ pub struct Config {
     pub database_url: String,
     /// API secret key expected in `X-API-Key` header.
     pub api_secret_key: String,
+    /// Optional privileged operator secret key isolating sweep/recovery routes (`OPERATOR_API_KEY`).
+    pub operator_api_key: Option<String>,
     /// Shared secret for HMAC-SHA256 webhook body signatures (`X-Signature-256`).
     pub webhook_secret: String,
     /// Optional fallback webhook URL used when invoice creation omits `callback_url`.
@@ -108,6 +110,9 @@ pub struct Config {
     pub require_https_webhooks: bool,
     /// Full HTTP/HTTPS URL to `monero-wallet-rpc` JSON-RPC endpoint.
     pub monero_rpc_url: String,
+    /// Optional explicit `monerod` JSON-RPC URL (`MONERO_DAEMON_RPC_URL`) used for `get_info` height
+    /// verification; falls back to `monero_rpc_url` when omitted.
+    pub monero_daemon_rpc_url: Option<String>,
     /// Optional RPC username for `--rpc-login` Digest/Basic authentication.
     pub monero_rpc_user: Option<String>,
     /// Optional RPC password for `--rpc-login` Digest/Basic authentication.
@@ -153,11 +158,16 @@ impl fmt::Debug for Config {
             .field("cors_allowed_origins", &self.cors_allowed_origins)
             .field("database_url", &self.database_url)
             .field("api_secret_key", &"[REDACTED]")
+            .field(
+                "operator_api_key",
+                &self.operator_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("webhook_secret", &"[REDACTED]")
             .field("default_webhook_url", &self.default_webhook_url)
             .field("allow_private_webhooks", &self.allow_private_webhooks)
             .field("require_https_webhooks", &self.require_https_webhooks)
             .field("monero_rpc_url", &self.monero_rpc_url)
+            .field("monero_daemon_rpc_url", &self.monero_daemon_rpc_url)
             .field("monero_rpc_user", &self.monero_rpc_user)
             .field(
                 "monero_rpc_pass",
@@ -207,11 +217,13 @@ impl Config {
 
         let database_url = env_or_default("DATABASE_URL", "sqlite://data/xmr_gateway.db");
         let api_secret_key = require_non_empty_env("API_SECRET_KEY")?;
+        let operator_api_key = optional_non_empty_env("OPERATOR_API_KEY");
         let webhook_secret = require_non_empty_env("WEBHOOK_SECRET")?;
         let default_webhook_url = optional_non_empty_env("DEFAULT_WEBHOOK_URL");
         let allow_private_webhooks = parse_env_bool("ALLOW_PRIVATE_WEBHOOKS", false)?;
         let require_https_webhooks = parse_env_bool("REQUIRE_HTTPS_WEBHOOKS", false)?;
         let monero_rpc_url = env_or_default("MONERO_RPC_URL", "http://127.0.0.1:18082/json_rpc");
+        let monero_daemon_rpc_url = optional_non_empty_env("MONERO_DAEMON_RPC_URL");
         let monero_rpc_user = optional_non_empty_env("MONERO_RPC_USER");
         let monero_rpc_pass = optional_non_empty_env("MONERO_RPC_PASS");
         let allow_unauthenticated_rpc = parse_env_bool("ALLOW_UNAUTHENTICATED_RPC", false)?;
@@ -251,11 +263,13 @@ impl Config {
             cors_allowed_origins,
             database_url,
             api_secret_key,
+            operator_api_key,
             webhook_secret,
             default_webhook_url,
             allow_private_webhooks,
             require_https_webhooks,
             monero_rpc_url,
+            monero_daemon_rpc_url,
             monero_rpc_user,
             monero_rpc_pass,
             allow_unauthenticated_rpc,
@@ -297,9 +311,15 @@ impl Config {
         }
 
         validate_secret("API_SECRET_KEY", &self.api_secret_key)?;
+        if let Some(ref op_key) = self.operator_api_key {
+            validate_secret("OPERATOR_API_KEY", op_key)?;
+        }
         validate_secret("WEBHOOK_SECRET", &self.webhook_secret)?;
 
         let rpc_url = validate_http_url(&self.monero_rpc_url, "MONERO_RPC_URL")?;
+        if let Some(ref daemon_url) = self.monero_daemon_rpc_url {
+            validate_http_url(daemon_url, "MONERO_DAEMON_RPC_URL")?;
+        }
         validate_rpc_security(
             &rpc_url,
             self.monero_rpc_user.as_deref(),
@@ -850,11 +870,13 @@ mod tests {
             cors_allowed_origins: vec!["*".to_string()],
             database_url: "sqlite::memory:".to_string(),
             api_secret_key: "a".repeat(32),
+            operator_api_key: None,
             webhook_secret: "b".repeat(32),
             default_webhook_url: Some("https://bot.example.org/webhook".to_string()),
             allow_private_webhooks: false,
             require_https_webhooks: false,
             monero_rpc_url: "http://127.0.0.1:18082/json_rpc".to_string(),
+            monero_daemon_rpc_url: None,
             monero_rpc_user: Some("rpcuser".to_string()),
             monero_rpc_pass: Some("super-secret-rpc-pass".to_string()),
             allow_unauthenticated_rpc: false,

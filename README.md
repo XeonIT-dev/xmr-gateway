@@ -272,16 +272,16 @@ curl -s -X POST http://127.0.0.1:8080/api/v1/invoices/3c8e0f18-7d66-4c31-97a0-6e
 
 ### `POST /api/v1/invoices/{invoice_id}/sweep/resolve`
 
-Safely resolves a `SWEEP_REORG_DETECTED` (`REORGED`) sweep incident while preserving immutable `sweep_attempts` audit history (`resolved_at`, `resolution_action`, `resolution_note`) (`XMR-041`):
+Safely resolves a `SWEEP_REORG_DETECTED` (`REORGED`) sweep incident while preserving immutable `sweep_attempts` audit history (`resolved_at`, `resolution_action`, `resolution_note`) (`XMR-041` / `XMR-043` / `XMR-044`). Protected by `OPERATOR_API_KEY` when configured (otherwise `API_SECRET_KEY`):
 
-- **`"action": "allow_resweep"`:** Fail-closed queries `monero-wallet-rpc` `get_transfers(out=true, pending=true, pool=true)`; if any recorded `tx_hash` is still present without `double_spend_seen=true`, rejects with `409 Conflict`. Otherwise marks the attempt `FAILED`, restores captured `subaddress_transfers` rows back to `ACTIVE` (`swept=0`), and unblocks re-sweep.
-- **`"action": "mark_reconciled"`:** Marks the attempt `RECONCILED` (optionally recording `replacement_tx_hash`) and restores `SWEPT` status (or preserves `EXPIRED` for late-payment sweeps on expired invoices).
+- **`"action": "allow_resweep"`:** Requires `"confirm_absent_on_chain": true` and non-empty `operator_note`; fail-closed verifies wallet sync (`get_height` >= daemon `get_info` height, non-zero; `409 Conflict` if lagging, `503 Service Unavailable` if RPC unavailable) (`XMR-043`) and queries `get_transfers(out=true, pending=true, pool=true)`. If any prior `tx_hash` is still present without `double_spend_seen=true`, rejects with `409 Conflict`. Otherwise marks the attempt `FAILED`, appends verified height/txid metadata to `resolution_note`, restores `subaddress_transfers` to `ACTIVE`, and unblocks re-sweep.
+- **`"action": "mark_reconciled"`:** Validates optional `replacement_tx_hash` strictly as 64 hex chars (normalized lowercase) and verifies it exists in wallet `out`/`pending` without `double_spend_seen=true` (`XMR-044`), marks the attempt `RECONCILED`, and restores `SWEPT` status (or preserves `EXPIRED` for late-payment sweeps).
 
 ```bash
 curl -s -X POST http://127.0.0.1:8080/api/v1/invoices/3c8e0f18-7d66-4c31-97a0-6e8df4e53c12/sweep/resolve \
-  -H "X-API-Key: ${API_SECRET_KEY}" \
+  -H "X-API-Key: ${OPERATOR_API_KEY:-${API_SECRET_KEY}}" \
   -H "Content-Type: application/json" \
-  -d '{"action":"allow_resweep","operator_note":"verified old sweep tx absent in daemon mempool and explorer"}' | jq .
+  -d '{"action":"allow_resweep","confirm_absent_on_chain":true,"operator_note":"verified old sweep tx absent in daemon mempool and explorer"}' | jq .
 ```
 
 ### `POST /api/v1/webhooks/{webhook_id}/retry` & `POST /api/v1/invoices/{invoice_id}/webhooks/retry`

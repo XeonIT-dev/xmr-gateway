@@ -59,6 +59,14 @@ pub enum GatewayError {
     #[error("unauthorized: {0}")]
     Unauthorized(String),
 
+    /// Caller authenticated with merchant key but lacks operator privileges (`OPERATOR_API_KEY`).
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+
+    /// Upstream Monero RPC dependency is unavailable or failed a fail-closed safety check.
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
+
     /// Requested resource does not exist.
     #[error("not found: {0}")]
     NotFound(String),
@@ -140,6 +148,12 @@ impl IntoResponse for GatewayError {
                 self.to_string(),
             ),
             Self::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, "UNAUTHORIZED", msg.clone()),
+            Self::Forbidden(msg) => (StatusCode::FORBIDDEN, "FORBIDDEN", msg.clone()),
+            Self::ServiceUnavailable(msg) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "SERVICE_UNAVAILABLE",
+                msg.clone(),
+            ),
             Self::NotFound(msg) => (StatusCode::NOT_FOUND, "NOT_FOUND", msg.clone()),
             Self::Conflict(msg) => (StatusCode::CONFLICT, "CONFLICT", msg.clone()),
             Self::Rpc { message, .. } => {
