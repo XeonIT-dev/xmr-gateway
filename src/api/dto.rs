@@ -4,9 +4,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::domain::{
-    amount::Piconero,
-    invoice::{Invoice, InvoiceStatus, ObservedTransfer},
+use crate::{
+    db::repository::{SweepAttempt, SweepAttemptStatus, SweepResolutionAction},
+    domain::{
+        amount::Piconero,
+        invoice::{Invoice, InvoiceStatus, ObservedTransfer},
+    },
 };
 
 /// Monero RPC connectivity details returned inside [`HealthResponse`].
@@ -187,6 +190,9 @@ pub struct InvoiceStatusResponse {
     pub last_sweep_error: Option<String>,
     /// Individual incoming Monero transfers observed on this subaddress.
     pub transfers: Vec<InvoiceTransferDto>,
+    /// Durable outbound sweep execution attempts recorded for this invoice (`XMR-003` / `XMR-041`).
+    #[serde(default)]
+    pub sweep_attempts: Vec<SweepAttemptDto>,
     /// Creation timestamp (UTC).
     pub created_at: DateTime<Utc>,
     /// Last update timestamp (UTC).
@@ -203,10 +209,76 @@ pub struct InvoiceStatusResponse {
     pub completed_at: Option<DateTime<Utc>>,
 }
 
+/// Durable sweep attempt audit record returned in [`InvoiceStatusResponse`] and
+/// [`ResolveSweepIncidentResponse`] (`XMR-041`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SweepAttemptDto {
+    /// Sweep attempt UUID.
+    pub id: Uuid,
+    /// Parent invoice UUID.
+    pub invoice_id: Uuid,
+    /// Wallet subaddress minor index swept.
+    pub address_index: u32,
+    /// Destination cold-wallet address.
+    pub destination_address: String,
+    /// Lifecycle status (`PREPARED`, `SUBMITTED`, `CONFIRMED`, `RECONCILED`, `FAILED`, `REORGED`).
+    pub status: SweepAttemptStatus,
+    /// Outgoing sweep transaction hashes associated with this attempt.
+    pub tx_hashes: Vec<String>,
+    /// Net piconero swept across this attempt (if broadcast).
+    pub swept_amount_piconero: Option<u64>,
+    /// Network fee paid in piconero (if broadcast).
+    pub fee_piconero: Option<u64>,
+    /// Incident or failure diagnostic message (e.g. `SWEEP_REORG_DETECTED: ...`).
+    pub error_message: Option<String>,
+    /// Operator incident resolution timestamp (UTC), if resolved (`XMR-041`).
+    pub resolved_at: Option<DateTime<Utc>>,
+    /// Operator resolution action (`ALLOW_RESWEEP` | `MARK_RECONCILED`), if resolved.
+    pub resolution_action: Option<SweepResolutionAction>,
+    /// Mandatory operator justification/audit note recorded on resolution.
+    pub resolution_note: Option<String>,
+    /// Creation timestamp (UTC).
+    pub created_at: DateTime<Utc>,
+    /// Last modification timestamp (UTC).
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<&SweepAttempt> for SweepAttemptDto {
+    fn from(attempt: &SweepAttempt) -> Self {
+        Self {
+            id: attempt.id,
+            invoice_id: attempt.invoice_id,
+            address_index: attempt.address_index,
+            destination_address: attempt.destination_address.clone(),
+            status: attempt.status,
+            tx_hashes: attempt.tx_hashes.clone(),
+            swept_amount_piconero: attempt.swept_amount_piconero.map(Piconero::as_u64),
+            fee_piconero: attempt.fee_piconero.map(Piconero::as_u64),
+            error_message: attempt.error_message.clone(),
+            resolved_at: attempt.resolved_at,
+            resolution_action: attempt.resolution_action,
+            resolution_note: attempt.resolution_note.clone(),
+            created_at: attempt.created_at,
+            updated_at: attempt.updated_at,
+        }
+    }
+}
+
 impl InvoiceStatusResponse {
     /// Builds an [`InvoiceStatusResponse`] from a persisted [`Invoice`] and its observed transfers.
     #[must_use]
     pub fn from_invoice(inv: &Invoice, transfers: &[ObservedTransfer]) -> Self {
+        Self::from_invoice_with_attempts(inv, transfers, &[])
+    }
+
+    /// Builds an [`InvoiceStatusResponse`] from a persisted [`Invoice`], its observed transfers,
+    /// and its recorded [`SweepAttempt`] ledger entries.
+    #[must_use]
+    pub fn from_invoice_with_attempts(
+        inv: &Invoice,
+        transfers: &[ObservedTransfer],
+        sweep_attempts: &[SweepAttempt],
+    ) -> Self {
         Self {
             invoice_id: inv.id,
             order_id: inv.order_id.clone(),
@@ -228,6 +300,7 @@ impl InvoiceStatusResponse {
             sweep_fee_piconero: inv.sweep_fee_piconero.map(Piconero::as_u64),
             last_sweep_error: inv.last_sweep_error.clone(),
             transfers: transfers.iter().map(InvoiceTransferDto::from).collect(),
+            sweep_attempts: sweep_attempts.iter().map(SweepAttemptDto::from).collect(),
             created_at: inv.created_at,
             updated_at: inv.updated_at,
             expires_at: inv.expires_at,
@@ -237,6 +310,30 @@ impl InvoiceStatusResponse {
             completed_at: inv.completed_at,
         }
     }
+}
+
+/// Request payload for `POST /api/v1/invoices/{invoice_id}/sweep/resolve` (`XMR-041`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResolveSweepIncidentRequest {
+    /// Optional target `sweep_attempts.id` UUID; defaults to the latest `REORGED` attempt.
+    pub attempt_id: Option<String>,
+    /// Resolution action: `"allow_resweep"` or `"mark_reconciled"`.
+    pub action: SweepResolutionAction,
+    /// Optional replacement sweep transaction hash when `action == "mark_reconciled"`.
+    pub replacement_tx_hash: Option<String>,
+    /// Mandatory non-empty operator audit note explaining the manual reconciliation verification.
+    pub operator_note: String,
+}
+
+/// Response payload returned by `POST /api/v1/invoices/{invoice_id}/sweep/resolve` (`XMR-041`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolveSweepIncidentResponse {
+    /// Gateway invoice UUID.
+    pub invoice_id: Uuid,
+    /// Updated invoice status after incident resolution.
+    pub status: InvoiceStatus,
+    /// Updated `sweep_attempts` record containing audit timestamps and resolution metadata.
+    pub resolved_attempt: SweepAttemptDto,
 }
 
 /// Response payload returned by `POST /api/v1/invoices/{invoice_id}/sweep`.

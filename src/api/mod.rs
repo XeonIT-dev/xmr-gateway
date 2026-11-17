@@ -53,6 +53,10 @@ pub fn build_router(state: AppState) -> Router {
             post(handlers::sweep_invoice),
         )
         .route(
+            "/invoices/{invoice_id}/sweep/resolve",
+            post(handlers::resolve_sweep_incident),
+        )
+        .route(
             "/invoices/{invoice_id}/webhooks/retry",
             post(handlers::retry_invoice_webhooks),
         )

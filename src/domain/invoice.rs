@@ -129,7 +129,7 @@ impl InvoiceStatus {
             Self::Settled => matches!(next, Self::Completed | Self::Swept | Self::Reorged),
             Self::Reorged => matches!(
                 next,
-                Self::Confirming | Self::Confirmed | Self::Settled | Self::Expired
+                Self::Confirming | Self::Confirmed | Self::Settled | Self::Swept | Self::Expired
             ),
             Self::Completed | Self::Swept => matches!(next, Self::Reorged),
             Self::Expired => false,

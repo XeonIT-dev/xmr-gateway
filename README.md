@@ -254,7 +254,7 @@ curl -s -X POST http://127.0.0.1:8080/api/v1/invoices \
 
 ### `GET /api/v1/invoices/{invoice_id}`
 
-Returns invoice status, received piconero, effective confirmations, transfer breakdown, and sweep hashes.
+Returns invoice status, received piconero, effective confirmations, transfer breakdown, `sweep_attempts` audit ledger (including incident resolution fields), and sweep hashes.
 
 ```bash
 curl -s http://127.0.0.1:8080/api/v1/invoices/3c8e0f18-7d66-4c31-97a0-6e8df4e53c12 \
@@ -263,11 +263,25 @@ curl -s http://127.0.0.1:8080/api/v1/invoices/3c8e0f18-7d66-4c31-97a0-6e8df4e53c
 
 ### `POST /api/v1/invoices/{invoice_id}/sweep`
 
-Manually triggers `sweep_all` for a `SETTLED` and unlocked (`>= SETTLEMENT_CONFIRMATIONS` / `10+` blocks) invoice, or for residual unswept `OVERPAYMENT`/`LATE_PAYMENT` inflows on `SWEPT` or `EXPIRED` invoices (preserving `EXPIRED` status on late-payment sweeps) when `ENABLE_AUTO_SWEEP=true`.
+Manually triggers `sweep_all` for a `SETTLED` and unlocked (`>= SETTLEMENT_CONFIRMATIONS` / `10+` blocks) invoice, or for residual unswept `OVERPAYMENT`/`LATE_PAYMENT` inflows on `SWEPT` or `EXPIRED` invoices (preserving `EXPIRED` status on late-payment sweeps) when `ENABLE_AUTO_SWEEP=true`. Fails with `409 Conflict` if an unresolved `REORGED` (`SWEEP_REORG_DETECTED`) sweep attempt exists.
 
 ```bash
 curl -s -X POST http://127.0.0.1:8080/api/v1/invoices/3c8e0f18-7d66-4c31-97a0-6e8df4e53c12/sweep \
   -H "X-API-Key: ${API_SECRET_KEY}" | jq .
+```
+
+### `POST /api/v1/invoices/{invoice_id}/sweep/resolve`
+
+Safely resolves a `SWEEP_REORG_DETECTED` (`REORGED`) sweep incident while preserving immutable `sweep_attempts` audit history (`resolved_at`, `resolution_action`, `resolution_note`) (`XMR-041`):
+
+- **`"action": "allow_resweep"`:** Fail-closed queries `monero-wallet-rpc` `get_transfers(out=true, pending=true, pool=true)`; if any recorded `tx_hash` is still present without `double_spend_seen=true`, rejects with `409 Conflict`. Otherwise marks the attempt `FAILED`, restores captured `subaddress_transfers` rows back to `ACTIVE` (`swept=0`), and unblocks re-sweep.
+- **`"action": "mark_reconciled"`:** Marks the attempt `RECONCILED` (optionally recording `replacement_tx_hash`) and restores `SWEPT` status (or preserves `EXPIRED` for late-payment sweeps on expired invoices).
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/api/v1/invoices/3c8e0f18-7d66-4c31-97a0-6e8df4e53c12/sweep/resolve \
+  -H "X-API-Key: ${API_SECRET_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"allow_resweep","operator_note":"verified old sweep tx absent in daemon mempool and explorer"}' | jq .
 ```
 
 ### `POST /api/v1/webhooks/{webhook_id}/retry` & `POST /api/v1/invoices/{invoice_id}/webhooks/retry`

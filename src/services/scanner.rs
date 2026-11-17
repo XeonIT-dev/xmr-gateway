@@ -29,7 +29,7 @@ use crate::{
     config::Config,
     db::repository::{
         ApplyScanUpdateParams, CompleteSweepAttemptParams, InvoiceRepository,
-        RecordSubaddressTransferParams, SweepAttempt, SweepAttemptStatus,
+        RecordSubaddressTransferParams, SweepAttempt, SweepAttemptStatus, SweepResolutionAction,
     },
     domain::{
         amount::Piconero,
@@ -293,6 +293,12 @@ impl ScannerService {
             )));
         }
 
+        if self.repo.has_reorged_sweep_attempt(invoice.id).await? {
+            return Err(GatewayError::Conflict(format!(
+                "invoice {invoice_id} has an unresolved SWEEP_REORG_DETECTED sweep incident requiring manual operator reconciliation via /sweep/resolve"
+            )));
+        }
+
         let transfers_resp = self
             .rpc
             .get_transfers(invoice.account_index, &[invoice.address_index], true)
@@ -304,22 +310,28 @@ impl ScannerService {
             .unwrap_or(&[]);
 
         let eval = evaluate_subaddress_transfers(invoice.amount_piconero, subaddr_transfers);
-        let updated = if matches!(
+        let mut updated = if matches!(
             invoice.status,
             InvoiceStatus::Swept | InvoiceStatus::Expired
         ) {
-            invoice
+            invoice.clone()
         } else {
             self.persist_evaluation(&invoice, &eval).await?
         };
-        let updated = self
-            .reconcile_subaddress_transfer_ledger(&updated, &eval)
-            .await?;
-
         let min_sweep_confs = self
             .config
             .settlement_confirmations
             .max(MONERO_UNLOCK_CONFIRMATIONS);
+        if invoice.status == InvoiceStatus::Reorged
+            && updated.status == InvoiceStatus::Confirmed
+            && updated.confirmations >= min_sweep_confs
+            && eval.all_unlocked
+        {
+            updated = self.persist_evaluation(&updated, &eval).await?;
+        }
+        let updated = self
+            .reconcile_subaddress_transfer_ledger(&updated, &eval)
+            .await?;
 
         if updated.status == InvoiceStatus::Expired {
             if !self.repo.has_unswept_inflows(updated.id).await? {
@@ -968,29 +980,27 @@ impl ScannerService {
             let mut projected = invoice.clone();
             if invoice.status == InvoiceStatus::Swept {
                 projected.status = InvoiceStatus::Reorged;
-                projected.reorg_epoch = invoice.reorg_epoch.saturating_add(1);
             }
+            projected.reorg_epoch = invoice.reorg_epoch.saturating_add(1);
             projected.last_sweep_error = Some(err_msg.clone());
 
-            let webhook = if invoice.status == InvoiceStatus::Swept {
-                match invoice.callback_url.as_deref() {
-                    Some(url) => Some(build_webhook_delivery(
-                        &self.config.webhook_secret,
-                        &projected,
-                        WebhookEventType::Reorged,
-                        url,
-                        now,
-                    )?),
-                    None => None,
-                }
-            } else {
-                None
+            let webhook = match invoice.callback_url.as_deref() {
+                Some(url) => Some(build_webhook_delivery(
+                    &self.config.webhook_secret,
+                    &projected,
+                    WebhookEventType::Reorged,
+                    url,
+                    now,
+                )?),
+                None => None,
             };
 
             tracing::error!(
                 invoice_id = %invoice.id,
                 order_id = %invoice.order_id,
                 attempt_id = %attempt.id,
+                invoice_status = invoice.status.as_str(),
+                reorg_epoch = projected.reorg_epoch,
                 error = %err_msg,
                 "CRITICAL SECURITY ALERT: outbound sweep reorg/double-spend detected; auto re-sweep blocked pending manual reconciliation"
             );
@@ -1254,6 +1264,156 @@ impl ScannerService {
                 now,
             })
             .await
+    }
+
+    /// Resolves a `REORGED` (`SWEEP_REORG_DETECTED`) sweep incident under the per-invoice sweep lock (`XMR-041`).
+    ///
+    /// When `action == SweepResolutionAction::AllowResweep`, performs a fail-closed RPC check
+    /// (`get_transfers(out=true, pending=true, pool=true)`) and returns `409 Conflict` if any
+    /// transaction hash from the `REORGED` attempt is still alive (`double_spend_seen == false`).
+    ///
+    /// # Errors
+    /// - [`GatewayError::Validation`] if `operator_note` is blank or `replacement_tx_hash` is malformed.
+    /// - [`GatewayError::NotFound`] if the invoice or target `attempt_id` does not exist.
+    /// - [`GatewayError::Conflict`] if no `REORGED` attempt exists or the old sweep tx is still alive in RPC.
+    /// - [`GatewayError::Rpc`] / [`GatewayError::RpcTransport`] / [`GatewayError::Database`] on backend errors.
+    pub async fn resolve_sweep_incident(
+        &self,
+        invoice_id: Uuid,
+        attempt_id: Option<Uuid>,
+        action: SweepResolutionAction,
+        replacement_tx_hash: Option<&str>,
+        operator_note: &str,
+    ) -> GatewayResult<(Invoice, SweepAttempt)> {
+        let trimmed_note = operator_note.trim();
+        if trimmed_note.is_empty() {
+            return Err(GatewayError::Validation(
+                "operator_note must not be empty when resolving a sweep incident".to_string(),
+            ));
+        }
+        let cleaned_replacement = match replacement_tx_hash {
+            Some(raw) => {
+                let t = raw.trim();
+                if t.is_empty() || t.len() > 128 || !t.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err(GatewayError::Validation(
+                        "replacement_tx_hash must be a valid hexadecimal transaction hash"
+                            .to_string(),
+                    ));
+                }
+                Some(t.to_string())
+            }
+            None => None,
+        };
+
+        let lock = self.acquire_invoice_lock(invoice_id).await;
+        let guard = lock.lock().await;
+        let res = self
+            .resolve_sweep_incident_locked(
+                invoice_id,
+                attempt_id,
+                action,
+                cleaned_replacement.as_deref(),
+                trimmed_note,
+            )
+            .await;
+        drop(guard);
+        self.release_invoice_lock(invoice_id, lock).await;
+        res
+    }
+
+    async fn resolve_sweep_incident_locked(
+        &self,
+        invoice_id: Uuid,
+        attempt_id: Option<Uuid>,
+        action: SweepResolutionAction,
+        replacement_tx_hash: Option<&str>,
+        operator_note: &str,
+    ) -> GatewayResult<(Invoice, SweepAttempt)> {
+        let (invoice, attempt) = self
+            .repo
+            .get_reorged_sweep_attempt(invoice_id, attempt_id)
+            .await?;
+
+        let now = Utc::now();
+        match action {
+            SweepResolutionAction::AllowResweep => {
+                let verify_resp = self
+                    .rpc
+                    .get_sweep_verification_transfers(
+                        invoice.account_index,
+                        &[attempt.address_index],
+                    )
+                    .await?;
+
+                let live_entries = verify_resp
+                    .out
+                    .iter()
+                    .chain(verify_resp.pending.iter())
+                    .chain(verify_resp.pool.iter());
+
+                let still_alive = if attempt.tx_hashes.is_empty() {
+                    live_entries.clone().any(|entry| {
+                        !entry.double_spend_seen
+                            && entry.matches_sweep(
+                                invoice.account_index,
+                                attempt.address_index,
+                                &attempt.destination_address,
+                            )
+                    })
+                } else {
+                    attempt.tx_hashes.iter().any(|txid| {
+                        verify_resp
+                            .out
+                            .iter()
+                            .chain(verify_resp.pending.iter())
+                            .chain(verify_resp.pool.iter())
+                            .any(|entry| &entry.txid == txid && !entry.double_spend_seen)
+                    })
+                };
+
+                if still_alive {
+                    return Err(GatewayError::Conflict(format!(
+                        "cannot allow_resweep for invoice {invoice_id} attempt {}: recorded sweep tx is still live in wallet/mempool (out/pending/pool) without double_spend_seen=true",
+                        attempt.id
+                    )));
+                }
+
+                tracing::warn!(
+                    invoice_id = %invoice_id,
+                    attempt_id = %attempt.id,
+                    operator_note = %operator_note,
+                    "operator resolved SWEEP_REORG_DETECTED via ALLOW_RESWEEP after fail-closed RPC check"
+                );
+
+                self.repo
+                    .resolve_sweep_incident_allow_resweep(
+                        attempt.id,
+                        invoice_id,
+                        operator_note,
+                        now,
+                    )
+                    .await
+            }
+            SweepResolutionAction::MarkReconciled => {
+                tracing::warn!(
+                    invoice_id = %invoice_id,
+                    attempt_id = %attempt.id,
+                    replacement_tx_hash = ?replacement_tx_hash,
+                    operator_note = %operator_note,
+                    "operator resolved SWEEP_REORG_DETECTED via MARK_RECONCILED"
+                );
+
+                self.repo
+                    .resolve_sweep_incident_mark_reconciled(
+                        attempt.id,
+                        invoice_id,
+                        replacement_tx_hash,
+                        operator_note,
+                        now,
+                    )
+                    .await
+            }
+        }
     }
 
     async fn acquire_invoice_lock(&self, invoice_id: Uuid) -> Arc<Mutex<()>> {

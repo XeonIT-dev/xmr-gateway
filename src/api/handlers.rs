@@ -17,7 +17,8 @@ use crate::{
         AppState,
         dto::{
             CreateInvoiceRequest, CreateInvoiceResponse, HealthResponse, InvoiceStatusResponse,
-            RetryWebhookResponse, RpcHealthStatus, SweepInvoiceResponse,
+            ResolveSweepIncidentRequest, ResolveSweepIncidentResponse, RetryWebhookResponse,
+            RpcHealthStatus, SweepAttemptDto, SweepInvoiceResponse,
         },
         middleware::{API_KEY_HEADER, constant_time_key_match},
     },
@@ -300,9 +301,15 @@ pub async fn get_invoice(
         .ok_or_else(|| GatewayError::NotFound(format!("invoice {invoice_id} not found")))?;
 
     let transfers = state.repo.list_transfers_for_invoice(invoice_id).await?;
+    let sweep_attempts = state
+        .repo
+        .list_sweep_attempts_for_invoice(invoice_id)
+        .await?;
 
-    Ok(Json(InvoiceStatusResponse::from_invoice(
-        &invoice, &transfers,
+    Ok(Json(InvoiceStatusResponse::from_invoice_with_attempts(
+        &invoice,
+        &transfers,
+        &sweep_attempts,
     )))
 }
 
@@ -335,6 +342,48 @@ pub async fn sweep_invoice(
         sweep_fee_piconero: sweep_fee.as_u64(),
         sweep_fee_xmr_formatted: sweep_fee.to_xmr_string(),
         swept_at,
+    }))
+}
+
+/// Resolves a `SWEEP_REORG_DETECTED` (`REORGED`) sweep incident with immutable audit columns and
+/// fail-closed RPC verification (`POST /api/v1/invoices/{invoice_id}/sweep/resolve`) (`XMR-041`).
+///
+/// # Errors
+/// - `400 Bad Request` if `invoice_id` or `attempt_id` is invalid, `operator_note` is blank, or
+///   `replacement_tx_hash` is malformed.
+/// - `404 Not Found` if `invoice_id` or `attempt_id` does not exist.
+/// - `409 Conflict` if no `REORGED` sweep incident exists, or if `allow_resweep` is requested while
+///   a recorded sweep transaction hash still exists cleanly in `get_transfers(out, pending, pool)`.
+pub async fn resolve_sweep_incident(
+    State(state): State<AppState>,
+    Path(invoice_id_raw): Path<String>,
+    Json(req): Json<ResolveSweepIncidentRequest>,
+) -> GatewayResult<Json<ResolveSweepIncidentResponse>> {
+    let invoice_id = parse_invoice_uuid(&invoice_id_raw)?;
+    let attempt_id = req
+        .attempt_id
+        .as_deref()
+        .map(|raw| {
+            Uuid::parse_str(raw.trim())
+                .map_err(|_| GatewayError::Validation(format!("invalid attempt_id UUID '{raw}'")))
+        })
+        .transpose()?;
+
+    let (invoice, resolved_attempt) = state
+        .scanner
+        .resolve_sweep_incident(
+            invoice_id,
+            attempt_id,
+            req.action,
+            req.replacement_tx_hash.as_deref(),
+            &req.operator_note,
+        )
+        .await?;
+
+    Ok(Json(ResolveSweepIncidentResponse {
+        invoice_id: invoice.id,
+        status: invoice.status,
+        resolved_attempt: SweepAttemptDto::from(&resolved_attempt),
     }))
 }
 

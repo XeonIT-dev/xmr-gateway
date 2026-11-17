@@ -271,6 +271,36 @@ impl MoneroRpcClient {
         .await
     }
 
+    /// Queries outgoing mined (`out`), outgoing mempool (`pending`), and `pool` transfers for
+    /// `subaddr_indices` under `account_index` to fail-closed verify whether a `REORGED` sweep tx
+    /// is genuinely absent before allowing operator re-sweep unlock (`XMR-041`).
+    ///
+    /// # Errors
+    /// Returns [`GatewayError::RpcTransport`] or [`GatewayError::Rpc`] on failure.
+    pub async fn get_sweep_verification_transfers(
+        &self,
+        account_index: u32,
+        subaddr_indices: &[u32],
+    ) -> GatewayResult<GetTransfersResponse> {
+        if subaddr_indices.is_empty() {
+            return Ok(GetTransfersResponse::default());
+        }
+
+        self.call(
+            "get_transfers",
+            GetTransfersParams {
+                in_transfers: false,
+                pool: true,
+                out: true,
+                pending: true,
+                failed: false,
+                account_index,
+                subaddr_indices,
+            },
+        )
+        .await
+    }
+
     /// Sweeps 100% of unlocked funds on `subaddress_index` to `destination` via `sweep_all`.
     ///
     /// # Security & Consensus Invariant
