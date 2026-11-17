@@ -301,7 +301,7 @@ ThreadingHTTPServer(("127.0.0.1", 9000), WebhookHandler).serve_forever()
             -d "{\"order_id\":\"${order_id}\",\"amount_piconero\":5000000000,\"callback_url\":\"http://127.0.0.1:9000/webhooks/monero\"}")"
     fi
 
-    if [[ "$http_code" != "201" ]]; then
+    if [[ "$http_code" != "201" && "$http_code" != "200" ]]; then
         demo_err "Failed to create demo invoice (HTTP $http_code): $(cat "$tmp_body")"
         rm -f "$tmp_body"
         exit 1

@@ -22,12 +22,12 @@ Before deploying `xmr-gateway` on mainnet:
 - [ ] **RPC Hardening:** `monero-wallet-rpc` binds strictly to `127.0.0.1:18082` with `--rpc-login` enabled and `MONERO_TRUSTED_DAEMON=false` (`--untrusted-daemon`) for third-party remote nodes.
 - [ ] **Custody Minimization (`XMR-002`):** Use **View-Only Zero-Trust Mode** (`WALLET_MODE=view_only`, `ENABLE_AUTO_SWEEP=false`) with `MONERO_VIEW_ONLY_ADDRESS`/`MONERO_VIEW_ONLY_KEY` whenever possible; `start.sh` and `xmr-gateway` fail closed if a spend key is detected on `monero-wallet-rpc`.
 - [ ] **Webhook Egress SSRF Guard (`XMR-001`):** Keep `ALLOW_PRIVATE_WEBHOOKS=false` (and `REQUIRE_HTTPS_WEBHOOKS=true` in production) so loopback/RFC1918/metadata IPs, DNS rebinding, and HTTP 3xx redirects are blocked.
-- [ ] **Confirmations & Reorg Protection (`XMR-006`):** Keep `REQUIRED_CONFIRMATIONS=10` and `SETTLEMENT_CONFIRMATIONS=10` for 10-block finality on mainnet; handle `REORGED`, `LATE_PAYMENT`, and `OVERPAYMENT` webhook events in merchant backends.
-- [ ] **SQLite Crash Durability (`XMR-007` / `XMR-003`):** Gateway enforces `PRAGMA synchronous = FULL` in WAL mode and reconciles `PREPARED`/`SUBMITTED` `sweep_attempts` at startup and per scan tick via `get_transfers(out, pending)`.
+- [ ] **Confirmations & Reorg Protection (`XMR-006` / `XMR-018`):** Keep `REQUIRED_CONFIRMATIONS=10` and `SETTLEMENT_CONFIRMATIONS=10` for 10-block finality on mainnet. In View-Only mode, invoices stay non-terminal in `CONFIRMED` until `SETTLED` webhook 2xx (`COMPLETED`) so reorg detection remains active until settlement finality. Handle `REORGED`, `LATE_PAYMENT`, `OVERPAYMENT`, and `SWEPT` (including `"sweep_reason": "LATE_PAYMENT"` on `EXPIRED` invoices) webhook events cleanly.
+- [ ] **SQLite Crash Durability, Singleton Lock & Bounded Egress Reads (`XMR-007` / `XMR-003` / `XMR-009` / `P1-3`):** Gateway enforces `PRAGMA synchronous = FULL`, acquires an exclusive OS advisory process lockfile (`<db_path>.lock`, `0600`) on startup to enforce the single-instance invariant, reads at most 1024 bytes from non-2xx webhook responses, reconciles `PREPARED`/`SUBMITTED` `sweep_attempts` at startup and per scan tick, and monitors subaddresses continuously by default (`SUBADDRESS_MONITOR_DAYS=0`).
 - [ ] **Cold Wallet Validation:** If `ENABLE_AUTO_SWEEP=true` (`WALLET_MODE=hot_wallet`) is enabled, verify `COLD_WALLET_ADDRESS` belongs to your hardware/offline wallet and test a small sweep before production traffic.
 - [ ] **Restrictive CORS:** Leave `CORS_ALLOWED_ORIGINS` empty unless explicitly required by a trusted web origin.
 - [ ] **Network Privacy:** Set `MONERO_RPC_PROXY=127.0.0.1:9050` with a local Tor daemon when connecting `monero-wallet-rpc` to an untrusted or public remote node, or run your own `monerod` node.
-- [ ] **File Permissions:** Ensure `.env`, `./data/`, and `./data/wallet/` are readable only by the service user (`chmod 600` / `chmod 700`) and excluded from git commits.
+- [ ] **File Permissions:** `start.sh` sets `umask 077`, `chmod 600 .env`, and `chmod 700` on `./data/` and `./data/wallet/` on every launch; confirm none of these files or `*.lock` files are tracked in git.
 
 ---
 

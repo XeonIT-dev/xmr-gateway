@@ -102,13 +102,13 @@ Designed for sovereign merchants, Telegram commerce bots, and privacy-first infr
               +-------------------------+-------------------------+
               |                                                   |
  (ENABLE_AUTO_SWEEP=false,                            (ENABLE_AUTO_SWEEP=true,
-  after CONFIRMED/SETTLED 2xx)                         sweep_attempts PREPARED->SUBMITTED->CONFIRMED)
+  only after SETTLED webhook 2xx)                      sweep_attempts PREPARED->SUBMITTED->CONFIRMED)
               |                                                   |
               v                                                   v
       +-------+-------+                                   +-------+-------+
       |   COMPLETED   |                                   |     SWEPT     | ---> Webhook: SWEPT
       +---------------+                                   +-------+-------+
-      (monitored 90d for OVERPAYMENT)                     (monitored 90d; residual OVERPAYMENT sweepable)
+      (continuously monitored via SUBADDRESS_MONITOR_DAYS=0; residual OVERPAYMENT / EXPIRED LATE_PAYMENT sweepable)
 ```
 
 ---
@@ -120,8 +120,8 @@ Designed for sovereign merchants, Telegram commerce bots, and privacy-first infr
 | **Private Spend Key on Server** | **Forbidden** (`start.sh` and gateway verify `query_key(spend_key)` fails or returns zero) | **Yes** (hot transit wallet; explicit opt-in required) |
 | **First-Run Bootstrap** | Fail-closed unless `MONERO_VIEW_ONLY_ADDRESS` & `MONERO_VIEW_ONLY_KEY` are set | Generates hot transit wallet (`ENABLE_AUTO_SWEEP=true` or `ALLOW_HOT_WALLET_WITHOUT_SWEEP=true`) |
 | **Remote Daemon Policy** | `--untrusted-daemon` by default (`MONERO_TRUSTED_DAEMON=false`) | `--untrusted-daemon` unless `MONERO_TRUSTED_DAEMON=true` |
-| **Settlement Flow** | Funds remain directly in your offline/hardware wallet | Crash-safe `sweep_attempts` (`PREPARED`→`SUBMITTED`→`RECONCILED`) to `COLD_WALLET_ADDRESS` |
-| **Terminal State** | `COMPLETED` (monitored `SUBADDRESS_MONITOR_DAYS` days) | `SWEPT` (monitored `SUBADDRESS_MONITOR_DAYS` days; overpayments remain sweepable) |
+| **Settlement Flow** | Stays active in `CONFIRMED` for reorg checks until `SETTLED` webhook 2xx (`COMPLETED`) | Crash-safe `sweep_attempts` (`PREPARED`→`SUBMITTED`→`RECONCILED`) to `COLD_WALLET_ADDRESS` |
+| **Terminal State** | `COMPLETED` (continuously monitored when `SUBADDRESS_MONITOR_DAYS=0`) | `SWEPT` (`EXPIRED` preserves `EXPIRED` even after late-payment sweep) |
 
 ---
 
@@ -215,7 +215,7 @@ curl -s http://127.0.0.1:8080/health | jq .
 
 ### `POST /api/v1/invoices`
 
-Creates a dedicated subaddress invoice and Base64-encoded PNG QR code.
+Creates a dedicated subaddress invoice and Base64-encoded PNG QR code. Enforces atomic per-`order_id` serialization and parameter-verified idempotency (`XMR-019`): retrying with identical `(order_id, amount_piconero, effective callback_url)` returns `200 OK` with the existing invoice without allocating a second subaddress, whereas reusing an `order_id` with different parameters returns `409 Conflict`.
 
 ```bash
 curl -s -X POST http://127.0.0.1:8080/api/v1/invoices \
@@ -259,7 +259,7 @@ curl -s http://127.0.0.1:8080/api/v1/invoices/3c8e0f18-7d66-4c31-97a0-6e8df4e53c
 
 ### `POST /api/v1/invoices/{invoice_id}/sweep`
 
-Manually triggers `sweep_all` for a `CONFIRMED` and unlocked (`>= 10` confirmations) invoice when `ENABLE_AUTO_SWEEP=true`.
+Manually triggers `sweep_all` for a `CONFIRMED`/`SETTLED` and unlocked (`>= 10` confirmations) invoice, or for residual unswept `OVERPAYMENT`/`LATE_PAYMENT` inflows on `SWEPT` or `EXPIRED` invoices (preserving `EXPIRED` status on late-payment sweeps) when `ENABLE_AUTO_SWEEP=true`.
 
 ```bash
 curl -s -X POST http://127.0.0.1:8080/api/v1/invoices/3c8e0f18-7d66-4c31-97a0-6e8df4e53c12/sweep \
@@ -306,7 +306,7 @@ curl -s -X POST http://127.0.0.1:8080/api/v1/invoices/3c8e0f18-7d66-4c31-97a0-6e
 
 ### Retry & Replay Policy
 
-- **Exponential Backoff:** Failed or non-`2xx` deliveries are persisted in SQLite and retried with delay `5 * 2^(attempt - 1)` seconds, capped at `3600` seconds (1 hour), up to `10` attempts before transitioning to `FAILED`.
+- **Exponential Backoff & Bounded Response Reads:** Failed or non-`2xx` deliveries read at most `1024` bytes from the response body stream (truncating diagnostics to 256 chars) to prevent response-body memory exhaustion, and are persisted in SQLite WAL outbox for retry (`5 * 2^(attempt - 1)` seconds up to `3600` seconds, max `10` attempts before `FAILED`).
 - **Signature & Replay Verification:** Consumers MUST verify `X-Signature-256` over the **exact raw request bytes** in constant time, enforce a freshness window on `timestamp`, and deduplicate by `event_id` (or `order_id` + `event`).
 
 #### Python Verification Example
@@ -348,7 +348,8 @@ pub fn verify_webhook(secret: &str, raw_body: &[u8], signature_hex: &str) -> boo
 - **SSRF & DNS Rebinding Defense (`XMR-001`):** Leave `ALLOW_PRIVATE_WEBHOOKS=false` in production (and optionally set `REQUIRE_HTTPS_WEBHOOKS=true`) so webhook callbacks cannot target loopback, RFC1918 subnets, cloud metadata endpoints (`169.254.169.254`), or HTTP `3xx` redirects.
 - **Enforce Fail-Closed View-Only Mode (`XMR-002`):** Unless you require automated hot treasury sweeping, set `WALLET_MODE=view_only` and `ENABLE_AUTO_SWEEP=false`, providing `MONERO_VIEW_ONLY_ADDRESS` and `MONERO_VIEW_ONLY_KEY` in `.env`. Both `start.sh` and `xmr-gateway` abort startup if `monero-wallet-rpc` exposes a spend key in `view_only` mode.
 - **Untrusted Remote Nodes (`XMR-005`):** `MONERO_TRUSTED_DAEMON=false` passes `--untrusted-daemon` by default. Route traffic through Tor (`MONERO_RPC_PROXY=127.0.0.1:9050`) when connecting to third-party public nodes.
-- **SQLite Full Durability (`XMR-007`) & Crash-Safe Sweeps (`XMR-003`):** SQLite WAL runs with `synchronous = FULL`, and `sweep_attempts` (`PREPARED`→`SUBMITTED`→`RECONCILED`) recovers interrupted sweeps via `get_transfers(out, pending)` without duplicate `sweep_all` calls.
+- **SQLite Full Durability (`XMR-007`), Singleton Process Lock (`P1-3`), & Crash-Safe Sweeps (`XMR-003`):** SQLite WAL runs with `synchronous = FULL`; `acquire_database_lock` enforces an exclusive advisory lockfile (`<db_path>.lock`, mode `0600`) to prevent multiple instances from concurrently accessing the same wallet/DB; and `sweep_attempts` (`PREPARED`→`SUBMITTED`→`RECONCILED`) recovers interrupted sweeps via `get_transfers(out, pending)` without duplicate `sweep_all` calls.
+- **Directory & Env Hardening:** `start.sh` enforces `umask 077`, `chmod 600 .env`, and `chmod 700` on `data/` and `data/wallet/` on every run.
 - **Mainnet vs. Stagenet Checklist:**
   - Verify `MONERO_NETWORK=mainnet` and a mainnet `MONERO_REMOTE_NODE` before production launch.
   - Ensure `API_SECRET_KEY`, `WEBHOOK_SECRET`, and `MONERO_RPC_PASS` are freshly generated 32-byte random secrets (`openssl rand -hex 32`).

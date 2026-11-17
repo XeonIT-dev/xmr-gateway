@@ -98,16 +98,19 @@ pub async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
 
 /// Creates a new isolated Monero subaddress invoice (`POST /api/v1/invoices`).
 ///
-/// # Invariants
+/// # Invariants & Idempotency (`XMR-019`)
 /// - Rejects `amount_piconero == 0` or values exceeding SQLite signed 64-bit integer bounds.
-/// - Checks duplicate `order_id` BEFORE calling `monero-wallet-rpc` `create_address` so
-///   retried requests do not allocate orphaned subaddresses in the wallet.
-/// - Generates a dedicated subaddress under `account_index: 0` with label `inv_<order_id>`,
-///   renders the Monero URI and Base64 PNG QR code, and persists in SQLite (`PENDING`).
+/// - Serializes requests per `order_id` BEFORE checking the database or calling `create_address`
+///   so concurrent retries cannot allocate orphaned Monero subaddresses.
+/// - If an invoice with `order_id` already exists and has identical immutable parameters
+///   (`amount_piconero` and resolved `callback_url`), returns `200 OK` idempotently with the
+///   existing [`CreateInvoiceResponse`] without touching RPC.
+/// - If an invoice with `order_id` exists with different `amount_piconero` or `callback_url`,
+///   returns `409 Conflict`.
 ///
 /// # Errors
 /// - `400 Bad Request` on invalid `order_id`, zero/overflow amount, invalid TTL, or invalid URL.
-/// - `409 Conflict` if `order_id` already exists.
+/// - `409 Conflict` if `order_id` already exists with mismatched parameters.
 /// - `502 Bad Gateway` if `monero-wallet-rpc` fails.
 pub async fn create_invoice(
     State(state): State<AppState>,
@@ -150,31 +153,62 @@ pub async fn create_invoice(
             .await?;
             Some(validated.url.to_string())
         }
-        None => state.config.default_webhook_url.clone(),
+        None => match state.config.default_webhook_url.as_deref() {
+            Some(default_url) => {
+                let validated = resolve_and_validate_webhook_url(
+                    default_url,
+                    "DEFAULT_WEBHOOK_URL",
+                    state.config.webhook_url_policy(),
+                )
+                .await?;
+                Some(validated.url.to_string())
+            }
+            None => None,
+        },
     };
 
-    if state
+    let order_id_key = req.order_id.clone();
+    let order_lock = state.repo.acquire_order_lock(&order_id_key).await;
+    let order_guard = order_lock.lock().await;
+    let outcome = create_invoice_locked(&state, &order_id_key, amount, ttl_i64, callback_url).await;
+    drop(order_guard);
+    state
         .repo
-        .get_invoice_by_order_id(&req.order_id)
-        .await?
-        .is_some()
-    {
+        .release_order_lock(&order_id_key, order_lock)
+        .await;
+    outcome
+}
+
+async fn create_invoice_locked(
+    state: &AppState,
+    order_id: &str,
+    amount: Piconero,
+    ttl_i64: i64,
+    callback_url: Option<String>,
+) -> GatewayResult<(StatusCode, Json<CreateInvoiceResponse>)> {
+    if let Some(existing) = state.repo.get_invoice_by_order_id(order_id).await? {
+        if existing.amount_piconero == amount && existing.callback_url == callback_url {
+            return Ok((StatusCode::OK, Json(CreateInvoiceResponse::from(&existing))));
+        }
+
         return Err(GatewayError::Conflict(format!(
-            "invoice for order_id '{}' already exists",
-            req.order_id
+            "invoice for order_id '{}' already exists with different parameters (expected amount_piconero={}, callback_url={:?})",
+            order_id,
+            existing.amount_piconero.as_u64(),
+            existing.callback_url
         )));
     }
 
-    let label = format!("inv_{}", req.order_id);
+    let label = format!("inv_{order_id}");
     let rpc_addr = state.rpc.create_address(0, &label).await?;
 
-    let monero_uri = build_monero_uri(&rpc_addr.address, amount, &req.order_id);
+    let monero_uri = build_monero_uri(&rpc_addr.address, amount, order_id);
     let qr_code_base64 = generate_qr_png_base64(&monero_uri)?;
 
     let now = Utc::now();
     let invoice = Invoice {
         id: Uuid::new_v4(),
-        order_id: req.order_id,
+        order_id: order_id.to_string(),
         account_index: 0,
         address_index: rpc_addr.address_index,
         subaddress: rpc_addr.address,
@@ -240,13 +274,14 @@ pub async fn get_invoice(
     )))
 }
 
-/// Triggers an immediate sweep of a confirmed, unlocked subaddress (`POST /api/v1/invoices/{invoice_id}/sweep`).
+/// Triggers an immediate sweep of a confirmed, unlocked subaddress or unswept late/overpayment
+/// inflows (`POST /api/v1/invoices/{invoice_id}/sweep`).
 ///
 /// # Errors
 /// - `400 Bad Request` if `invoice_id` is not a valid UUID.
 /// - `404 Not Found` if invoice does not exist.
-/// - `409 Conflict` if auto-sweep is disabled, invoice is already swept/completed/expired,
-///   underpaid, or funds have not reached Monero's 10-block unlock threshold.
+/// - `409 Conflict` if auto-sweep is disabled, invoice is completed, already swept/expired with
+///   no unswept anomaly inflows, underpaid, or funds have not reached Monero's 10-block unlock threshold.
 pub async fn sweep_invoice(
     State(state): State<AppState>,
     Path(invoice_id_raw): Path<String>,

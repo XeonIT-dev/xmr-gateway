@@ -12,7 +12,15 @@
 
 pub mod repository;
 
-use std::{path::Path, str::FromStr, time::Duration};
+use std::{
+    fs::{File, OpenOptions, TryLockError},
+    path::{Path, PathBuf},
+    str::FromStr,
+    time::Duration,
+};
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use sqlx::{
     SqlitePool,
@@ -20,6 +28,72 @@ use sqlx::{
 };
 
 use crate::error::{GatewayError, GatewayResult};
+
+/// Exclusive OS advisory process lock preventing multiple `xmr-gateway` instances from
+/// concurrently sharing the same SQLite database and `monero-wallet-rpc` wallet (`P1-3`).
+///
+/// Holding this guard keeps the underlying file descriptor open; dropping it releases the
+/// advisory lock automatically upon process exit or clean shutdown.
+#[derive(Debug)]
+pub struct DatabaseProcessLock {
+    _file: Option<File>,
+    lock_path: Option<PathBuf>,
+}
+
+impl DatabaseProcessLock {
+    /// Returns the filesystem path of the active process lockfile (`None` for in-memory DBs).
+    #[must_use]
+    pub fn lock_path(&self) -> Option<&Path> {
+        self.lock_path.as_deref()
+    }
+}
+
+/// Acquires an exclusive non-blocking OS advisory lock (`<db_path>.lock`) enforcing the
+/// single-instance deployment invariant for file-backed SQLite databases (`P1-3`).
+///
+/// For in-memory SQLite URLs (`sqlite::memory:` / `mode=memory`), returns a no-op guard.
+///
+/// # Errors
+/// Returns [`GatewayError::Config`] if directory creation or lockfile I/O fails, or if
+/// another `xmr-gateway` process already holds the lock (`TryLockError::WouldBlock`).
+pub fn acquire_database_lock(database_url: &str) -> GatewayResult<DatabaseProcessLock> {
+    let Some(db_path) = sqlite_file_path(database_url) else {
+        return Ok(DatabaseProcessLock {
+            _file: None,
+            lock_path: None,
+        });
+    };
+
+    ensure_sqlite_parent_dir(database_url)?;
+
+    let lock_path = PathBuf::from(format!("{}.lock", db_path.display()));
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    opts.mode(0o600);
+
+    let file = opts.open(&lock_path).map_err(|err| {
+        GatewayError::Config(format!(
+            "failed to open singleton process lock '{}': {err}",
+            lock_path.display()
+        ))
+    })?;
+
+    match file.try_lock() {
+        Ok(()) => Ok(DatabaseProcessLock {
+            _file: Some(file),
+            lock_path: Some(lock_path),
+        }),
+        Err(TryLockError::WouldBlock) => Err(GatewayError::Config(format!(
+            "singleton process lock '{}' is already held by another running xmr-gateway instance",
+            lock_path.display()
+        ))),
+        Err(TryLockError::Error(err)) => Err(GatewayError::Config(format!(
+            "failed to acquire singleton process lock '{}': {err}",
+            lock_path.display()
+        ))),
+    }
+}
 
 /// Initializes a SQLite connection pool in WAL mode and runs embedded migrations.
 ///
@@ -55,10 +129,10 @@ pub async fn init_sqlite_pool(database_url: &str) -> GatewayResult<SqlitePool> {
     Ok(pool)
 }
 
-/// Ensures the parent directory of a file-backed SQLite URI exists before opening it.
-fn ensure_sqlite_parent_dir(database_url: &str) -> GatewayResult<()> {
+/// Extracts the filesystem path of a file-backed SQLite URI (`None` for in-memory DBs).
+fn sqlite_file_path(database_url: &str) -> Option<PathBuf> {
     if database_url == "sqlite::memory:" || database_url.contains("mode=memory") {
-        return Ok(());
+        return None;
     }
 
     let path_part = database_url
@@ -68,10 +142,18 @@ fn ensure_sqlite_parent_dir(database_url: &str) -> GatewayResult<()> {
 
     let file_path_str = path_part.split('?').next().unwrap_or(path_part);
     if file_path_str.is_empty() || file_path_str == ":memory:" {
-        return Ok(());
+        return None;
     }
 
-    let path = Path::new(file_path_str);
+    Some(PathBuf::from(file_path_str))
+}
+
+/// Ensures the parent directory of a file-backed SQLite URI exists before opening it.
+fn ensure_sqlite_parent_dir(database_url: &str) -> GatewayResult<()> {
+    let Some(path) = sqlite_file_path(database_url) else {
+        return Ok(());
+    };
+
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -115,5 +197,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+    }
+
+    #[test]
+    fn singleton_database_lock_rejects_second_concurrent_process_and_releases_on_drop() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let db_path = tmp_dir.path().join("singleton.db");
+        let db_url = format!("sqlite://{}", db_path.display());
+
+        let first_lock = acquire_database_lock(&db_url).unwrap();
+        assert_eq!(
+            first_lock.lock_path().unwrap(),
+            tmp_dir.path().join("singleton.db.lock")
+        );
+
+        let second_err = acquire_database_lock(&db_url).unwrap_err();
+        assert!(matches!(second_err, GatewayError::Config(_)));
+
+        drop(first_lock);
+
+        let reacquired = acquire_database_lock(&db_url);
+        assert!(reacquired.is_ok());
+
+        // In-memory URLs remain permitted as no-op locks
+        assert!(acquire_database_lock("sqlite::memory:").is_ok());
     }
 }

@@ -9,11 +9,13 @@
 *.env
 !.env.example
 
-# SQLite databases & WAL journals
+# SQLite databases, lockfiles & WAL journals
 *.db
 *.db-shm
 *.db-wal
 *.sqlite*
+*.lock
+!Cargo.lock
 /data/
 /data.*/
 

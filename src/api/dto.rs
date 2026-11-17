@@ -233,7 +233,7 @@ pub struct SweepInvoiceResponse {
     pub invoice_id: Uuid,
     /// Merchant order reference.
     pub order_id: String,
-    /// Updated status (`SWEPT`).
+    /// Updated status (`SWEPT`, or `EXPIRED` when sweeping late inflows on an expired invoice).
     pub status: InvoiceStatus,
     /// Transaction hashes created by `sweep_all`.
     pub sweep_tx_hashes: Vec<String>,

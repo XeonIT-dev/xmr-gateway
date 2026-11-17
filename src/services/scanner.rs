@@ -41,7 +41,10 @@ use crate::{
     },
     error::{GatewayError, GatewayResult},
     rpc::{client::MoneroRpcClient, types::GetTransfersResponse},
-    services::webhook::{build_transfer_anomaly_webhook_delivery, build_webhook_delivery},
+    services::webhook::{
+        build_sweep_webhook_delivery, build_transfer_anomaly_webhook_delivery,
+        build_webhook_delivery,
+    },
 };
 
 /// Summary counters returned by a single scanner pass (primarily for diagnostics and tests).
@@ -120,8 +123,12 @@ impl ScannerService {
     /// [`GatewayError::RpcTransport`]/[`GatewayError::Rpc`] if batch `get_transfers` fails.
     pub async fn scan_once(&self) -> GatewayResult<ScanReport> {
         let reconciled = self.reconcile_in_flight_sweeps().await?;
-        let monitor_days = i64::try_from(self.config.subaddress_monitor_days).unwrap_or(90);
-        let cutoff = Utc::now() - ChronoDuration::days(monitor_days);
+        let cutoff = if self.config.subaddress_monitor_days == 0 {
+            None
+        } else {
+            let monitor_days = i64::try_from(self.config.subaddress_monitor_days).unwrap_or(90);
+            Some(Utc::now() - ChronoDuration::days(monitor_days))
+        };
         let monitored_invoices = self.repo.list_monitored_invoices(cutoff).await?;
         let mut report = ScanReport {
             invoices_scanned: monitored_invoices.len(),
@@ -181,15 +188,24 @@ impl ScannerService {
             ) && updated.received_piconero >= updated.amount_piconero
             {
                 true
-            } else if updated.status == InvoiceStatus::Swept {
-                self.repo.has_unswept_overpayment(updated.id).await?
+            } else if matches!(
+                updated.status,
+                InvoiceStatus::Swept | InvoiceStatus::Expired
+            ) {
+                self.repo.has_unswept_inflows(updated.id).await?
             } else {
                 false
             };
 
             if should_auto_sweep {
-                let allow_swept = updated.status == InvoiceStatus::Swept;
-                match self.execute_sweep_internal(updated.id, allow_swept).await {
+                let allow_terminal_inflows = matches!(
+                    updated.status,
+                    InvoiceStatus::Swept | InvoiceStatus::Expired
+                );
+                match self
+                    .execute_sweep_internal(updated.id, allow_terminal_inflows)
+                    .await
+                {
                     Ok(_) => {
                         report.invoices_swept += 1;
                     }
@@ -214,11 +230,13 @@ impl ScannerService {
     ///
     /// Performs a live transfer refresh from `monero-wallet-rpc` before checking Monero's
     /// 10-block unlock rule and executing `sweep_all` under the per-invoice sweep lock.
-    /// Also permits sweeping residual unswept `OVERPAYMENT` funds on an already `SWEPT` invoice.
+    /// Also permits sweeping residual unswept `OVERPAYMENT` funds on an already `SWEPT` invoice,
+    /// as well as unswept `LATE_PAYMENT` funds on an `EXPIRED` invoice while preserving `EXPIRED`
+    /// status (`XMR-017`).
     ///
     /// # Errors
-    /// - [`GatewayError::Conflict`] if auto-sweep is disabled, invoice is in `COMPLETED`/`EXPIRED`,
-    ///   already swept with no residual overpayment, underpaid, or outputs are locked (`< 10` blocks).
+    /// - [`GatewayError::Conflict`] if auto-sweep is disabled, invoice is `COMPLETED`, already
+    ///   swept/expired with no unswept anomaly inflows, underpaid, or outputs are locked (`< 10` blocks).
     /// - [`GatewayError::NotFound`] if `invoice_id` does not exist.
     /// - [`GatewayError::Rpc`] / [`GatewayError::RpcTransport`] if RPC fails.
     pub async fn manual_sweep(&self, invoice_id: Uuid) -> GatewayResult<Invoice> {
@@ -234,10 +252,7 @@ impl ScannerService {
             .await?
             .ok_or_else(|| GatewayError::NotFound(format!("invoice {invoice_id} not found")))?;
 
-        if matches!(
-            invoice.status,
-            InvoiceStatus::Completed | InvoiceStatus::Expired
-        ) {
+        if invoice.status == InvoiceStatus::Completed {
             return Err(GatewayError::Conflict(format!(
                 "invoice {invoice_id} is in terminal status {}",
                 invoice.status
@@ -264,8 +279,23 @@ impl ScannerService {
             .reconcile_subaddress_transfer_ledger(&updated, &eval)
             .await?;
 
+        if updated.status == InvoiceStatus::Expired {
+            if !self.repo.has_unswept_inflows(updated.id).await? {
+                return Err(GatewayError::Conflict(format!(
+                    "invoice {invoice_id} is EXPIRED with no unswept late payment inflows"
+                )));
+            }
+            if !eval.all_unlocked {
+                return Err(GatewayError::Conflict(format!(
+                    "late payment funds on expired invoice {invoice_id} are still locked ({}/{} confirmations required by Monero consensus)",
+                    eval.effective_confirmations, MONERO_UNLOCK_CONFIRMATIONS
+                )));
+            }
+            return self.execute_sweep_internal(invoice_id, true).await;
+        }
+
         if updated.status == InvoiceStatus::Swept {
-            if !self.repo.has_unswept_overpayment(updated.id).await? {
+            if !self.repo.has_unswept_inflows(updated.id).await? {
                 return Err(GatewayError::Conflict(format!(
                     "invoice {invoice_id} has already been swept"
                 )));
@@ -514,11 +544,10 @@ impl ScannerService {
             invoice.expires_at,
         );
 
-        // In View-Only mode with no webhook destination, CONFIRMED/SETTLED immediately completes.
-        if matches!(
-            next_status,
-            InvoiceStatus::Confirmed | InvoiceStatus::Settled
-        ) && !self.config.enable_auto_sweep
+        // In View-Only mode with no webhook destination, only SETTLED immediately completes
+        // so CONFIRMED invoices remain actively monitored for reorgs until settlement finality.
+        if next_status == InvoiceStatus::Settled
+            && !self.config.enable_auto_sweep
             && invoice.callback_url.is_none()
         {
             next_status = InvoiceStatus::Completed;
@@ -618,12 +647,11 @@ impl ScannerService {
         let mut reconciled_count = 0_usize;
         for attempt in attempts {
             let lock = self.acquire_invoice_lock(attempt.invoice_id).await;
-            let _guard = lock.lock().await;
-            if self
-                .reconcile_single_attempt_locked(&attempt)
-                .await?
-                .is_some()
-            {
+            let guard = lock.lock().await;
+            let res = self.reconcile_single_attempt_locked(&attempt).await;
+            drop(guard);
+            self.release_invoice_lock(attempt.invoice_id, lock).await;
+            if res?.is_some() {
                 reconciled_count += 1;
             }
         }
@@ -681,9 +709,7 @@ impl ScannerService {
             ) {
                 continue;
             }
-            if invoice.status == InvoiceStatus::Swept
-                && invoice.sweep_tx_hashes.contains(&entry.txid)
-            {
+            if invoice.sweep_tx_hashes.contains(&entry.txid) {
                 continue;
             }
             if !matched_hashes.contains(&entry.txid) {
@@ -735,11 +761,23 @@ impl ScannerService {
     async fn execute_sweep_internal(
         &self,
         invoice_id: Uuid,
-        allow_if_swept: bool,
+        allow_terminal_inflows: bool,
     ) -> GatewayResult<Invoice> {
         let lock = self.acquire_invoice_lock(invoice_id).await;
-        let _guard = lock.lock().await;
+        let guard = lock.lock().await;
+        let res = self
+            .execute_sweep_under_lock(invoice_id, allow_terminal_inflows)
+            .await;
+        drop(guard);
+        self.release_invoice_lock(invoice_id, lock).await;
+        res
+    }
 
+    async fn execute_sweep_under_lock(
+        &self,
+        invoice_id: Uuid,
+        allow_terminal_inflows: bool,
+    ) -> GatewayResult<Invoice> {
         let in_flight = self
             .repo
             .list_in_flight_sweep_attempts_for_invoice(invoice_id)
@@ -758,12 +796,24 @@ impl ScannerService {
             .await?
             .ok_or_else(|| GatewayError::NotFound(format!("invoice {invoice_id} not found")))?;
 
-        if current.status == InvoiceStatus::Swept && !allow_if_swept {
-            return Ok(current);
+        if matches!(
+            current.status,
+            InvoiceStatus::Swept | InvoiceStatus::Expired
+        ) && !allow_terminal_inflows
+        {
+            if current.status == InvoiceStatus::Swept {
+                return Ok(current);
+            }
+            return Err(GatewayError::Conflict(format!(
+                "invoice {invoice_id} is EXPIRED without sweepable late-payment authorization"
+            )));
         }
         if !matches!(
             current.status,
-            InvoiceStatus::Confirmed | InvoiceStatus::Settled | InvoiceStatus::Swept
+            InvoiceStatus::Confirmed
+                | InvoiceStatus::Settled
+                | InvoiceStatus::Swept
+                | InvoiceStatus::Expired
         ) {
             return Err(GatewayError::Conflict(format!(
                 "invoice {invoice_id} status is {}, expected CONFIRMED or SETTLED",
@@ -849,19 +899,46 @@ impl ScannerService {
         total_fee: Piconero,
         now: DateTime<Utc>,
     ) -> GatewayResult<Invoice> {
+        let sweep_reason = match current.status {
+            InvoiceStatus::Expired => Some("LATE_PAYMENT"),
+            InvoiceStatus::Swept => Some("OVERPAYMENT"),
+            _ => None,
+        };
+
+        let mut merged_hashes = current.sweep_tx_hashes.clone();
+        for h in &tx_hashes {
+            if !merged_hashes.contains(h) {
+                merged_hashes.push(h.clone());
+            }
+        }
+
         let mut projected = current.clone();
-        projected.status = InvoiceStatus::Swept;
+        projected.status = if current.status == InvoiceStatus::Expired {
+            InvoiceStatus::Expired
+        } else {
+            InvoiceStatus::Swept
+        };
         projected.unlocked = true;
-        projected.sweep_tx_hashes = tx_hashes.clone();
-        projected.sweep_amount_piconero = Some(total_amount);
-        projected.sweep_fee_piconero = Some(total_fee);
+        projected.sweep_tx_hashes = merged_hashes;
+        projected.sweep_amount_piconero = Some(
+            current
+                .sweep_amount_piconero
+                .unwrap_or(Piconero::ZERO)
+                .saturating_add(total_amount),
+        );
+        projected.sweep_fee_piconero = Some(
+            current
+                .sweep_fee_piconero
+                .unwrap_or(Piconero::ZERO)
+                .saturating_add(total_fee),
+        );
         projected.swept_at = Some(current.swept_at.unwrap_or(now));
 
         let webhook = match current.callback_url.as_deref() {
-            Some(url) => Some(build_webhook_delivery(
+            Some(url) => Some(build_sweep_webhook_delivery(
                 &self.config.webhook_secret,
                 &projected,
-                WebhookEventType::Swept,
+                sweep_reason,
                 url,
                 now,
             )?),
@@ -899,6 +976,20 @@ impl ScannerService {
         map.entry(invoice_id)
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    /// Prunes completed per-invoice sweep mutexes when no other task holds or awaits them (`P1-3`).
+    async fn release_invoice_lock(&self, invoice_id: Uuid, lock: Arc<Mutex<()>>) {
+        let mut map = self.sweep_locks.lock().await;
+        if Arc::strong_count(&lock) <= 2 && lock.try_lock().is_ok() {
+            map.remove(&invoice_id);
+        }
+    }
+
+    /// Returns the number of currently retained per-invoice mutex entries (for leak regression tests).
+    #[cfg(test)]
+    pub async fn active_sweep_lock_count(&self) -> usize {
+        self.sweep_locks.lock().await.len()
     }
 }
 
@@ -1009,7 +1100,7 @@ mod tests {
             invoice_ttl_seconds: 3600,
             scan_interval_seconds: 10,
             webhook_poll_interval_seconds: 5,
-            subaddress_monitor_days: 90,
+            subaddress_monitor_days: 0,
             log_format: LogFormat::Json,
         })
     }
@@ -1667,6 +1758,437 @@ mod tests {
         let hooks = repo.list_webhooks_for_invoice(inv.id).await.unwrap();
         let events: Vec<WebhookEventType> = hooks.iter().map(|w| w.event_type).collect();
         assert!(events.contains(&WebhookEventType::Overpayment));
+    }
+
+    #[tokio::test]
+    async fn view_only_invoice_stays_confirmed_until_settlement_detects_reorg_and_completes_on_settled()
+     {
+        let pool = init_sqlite_pool("sqlite::memory:").await.unwrap();
+        let repo = InvoiceRepository::new(pool);
+        let mock_rpc = MockServer::start().await;
+        let mock_hook = MockServer::start().await;
+
+        let hook_url = format!("{}/vo-hook", mock_hook.uri());
+        let inv = insertable_invoice(41, 1_000_000_000_000, Some(hook_url));
+        repo.insert_invoice(&inv).await.unwrap();
+
+        let cfg = test_config(format!("{}/json_rpc", mock_rpc.uri()), false);
+        assert_eq!(cfg.required_confirmations, 2);
+        assert_eq!(cfg.settlement_confirmations, 10);
+
+        let rpc = MoneroRpcClient::new(&cfg.monero_rpc_url, None, None).unwrap();
+        let scanner = ScannerService::new(repo.clone(), rpc, cfg.clone());
+        let dispatcher = crate::services::webhook::WebhookDispatcher::new(
+            repo.clone(),
+            cfg.enable_auto_sweep,
+            Duration::from_secs(5),
+            cfg.webhook_url_policy(),
+        )
+        .unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/vo-hook"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_hook)
+            .await;
+
+        // 1) Reach 2 confirmations -> CONFIRMED; deliver CONFIRMED webhook -> MUST remain CONFIRMED!
+        Mock::given(method("POST"))
+            .and(path("/json_rpc"))
+            .and(body_string_contains("get_transfers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "1",
+                "result": {
+                    "in": [{
+                        "txid": "a".repeat(64),
+                        "amount": 1_000_000_000_000_u64,
+                        "confirmations": 2,
+                        "double_spend_seen": false,
+                        "locked": true,
+                        "subaddr_index": { "major": 0, "minor": 41 }
+                    }],
+                    "pool": []
+                }
+            })))
+            .mount(&mock_rpc)
+            .await;
+
+        scanner.scan_once().await.unwrap();
+        assert_eq!(
+            repo.get_invoice_by_id(inv.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            InvoiceStatus::Confirmed
+        );
+
+        dispatcher.process_due_deliveries().await.unwrap();
+        let after_conf_delivery = repo.get_invoice_by_id(inv.id).await.unwrap().unwrap();
+        assert_eq!(after_conf_delivery.status, InvoiceStatus::Confirmed);
+        assert!(after_conf_delivery.completed_at.is_none());
+
+        // 2) Reorg drops confirmations below 2 -> MUST transition to REORGED and emit REORGED webhook!
+        mock_rpc.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/json_rpc"))
+            .and(body_string_contains("get_transfers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "2",
+                "result": {
+                    "in": [{
+                        "txid": "a".repeat(64),
+                        "amount": 1_000_000_000_000_u64,
+                        "confirmations": 1,
+                        "double_spend_seen": false,
+                        "locked": true,
+                        "subaddr_index": { "major": 0, "minor": 41 }
+                    }],
+                    "pool": []
+                }
+            })))
+            .mount(&mock_rpc)
+            .await;
+
+        scanner.scan_once().await.unwrap();
+        assert_eq!(
+            repo.get_invoice_by_id(inv.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            InvoiceStatus::Reorged
+        );
+
+        // 3) Re-mines cleanly: 2 confs -> CONFIRMED, then 10 confs -> SETTLED -> COMPLETED on webhook!
+        mock_rpc.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/json_rpc"))
+            .and(body_string_contains("get_transfers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "3",
+                "result": {
+                    "in": [{
+                        "txid": "b".repeat(64),
+                        "amount": 1_000_000_000_000_u64,
+                        "confirmations": 10,
+                        "double_spend_seen": false,
+                        "locked": false,
+                        "subaddr_index": { "major": 0, "minor": 41 }
+                    }],
+                    "pool": []
+                }
+            })))
+            .mount(&mock_rpc)
+            .await;
+
+        scanner.scan_once().await.unwrap();
+        assert_eq!(
+            repo.get_invoice_by_id(inv.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            InvoiceStatus::Confirmed
+        );
+        scanner.scan_once().await.unwrap();
+        assert_eq!(
+            repo.get_invoice_by_id(inv.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            InvoiceStatus::Settled
+        );
+
+        dispatcher.process_due_deliveries().await.unwrap();
+        let completed = repo.get_invoice_by_id(inv.id).await.unwrap().unwrap();
+        assert_eq!(completed.status, InvoiceStatus::Completed);
+        assert!(completed.completed_at.is_some());
+
+        let hooks = repo.list_webhooks_for_invoice(inv.id).await.unwrap();
+        let events: Vec<WebhookEventType> = hooks.iter().map(|w| w.event_type).collect();
+        assert!(events.contains(&WebhookEventType::Confirmed));
+        assert!(events.contains(&WebhookEventType::Reorged));
+        assert!(events.contains(&WebhookEventType::Settled));
+    }
+
+    #[tokio::test]
+    async fn expired_invoice_late_payment_sweeps_and_preserves_expired_status() {
+        let pool = init_sqlite_pool("sqlite::memory:").await.unwrap();
+        let repo = InvoiceRepository::new(pool);
+        let mock_rpc = MockServer::start().await;
+
+        let mut inv = insertable_invoice(
+            42,
+            1_000_000_000_000,
+            Some("http://127.0.0.1:9999/late-sweep".to_string()),
+        );
+        inv.expires_at = Utc::now() - ChronoDuration::minutes(5);
+        repo.insert_invoice(&inv).await.unwrap();
+
+        let cfg = test_config(format!("{}/json_rpc", mock_rpc.uri()), true);
+        let rpc = MoneroRpcClient::new(&cfg.monero_rpc_url, None, None).unwrap();
+        let scanner = ScannerService::new(repo.clone(), rpc, cfg);
+
+        // 1) Expire invoice
+        Mock::given(method("POST"))
+            .and(path("/json_rpc"))
+            .and(body_string_contains("get_transfers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "1",
+                "result": { "in": [], "pool": [] }
+            })))
+            .mount(&mock_rpc)
+            .await;
+
+        scanner.scan_once().await.unwrap();
+        assert_eq!(
+            repo.get_invoice_by_id(inv.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            InvoiceStatus::Expired
+        );
+
+        // 2) Unlocked late payment arrives -> records LATE_PAYMENT, sweeps once, preserves EXPIRED!
+        mock_rpc.reset().await;
+        let late_txid = "d".repeat(64);
+        Mock::given(method("POST"))
+            .and(path("/json_rpc"))
+            .and(body_string_contains(r#""in":true"#))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "2",
+                "result": {
+                    "in": [{
+                        "txid": late_txid,
+                        "amount": 1_000_000_000_000_u64,
+                        "confirmations": 10,
+                        "double_spend_seen": false,
+                        "locked": false,
+                        "subaddr_index": { "major": 0, "minor": 42 }
+                    }],
+                    "pool": []
+                }
+            })))
+            .mount(&mock_rpc)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/json_rpc"))
+            .and(body_string_contains("sweep_all"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "3",
+                "result": {
+                    "tx_hash_list": ["e".repeat(64)],
+                    "amount_list": [999_900_000_000_u64],
+                    "fee_list": [100_000_000_u64]
+                }
+            })))
+            .expect(1)
+            .mount(&mock_rpc)
+            .await;
+
+        let report = scanner.scan_once().await.unwrap();
+        assert_eq!(report.invoices_swept, 1);
+
+        let after_sweep = repo.get_invoice_by_id(inv.id).await.unwrap().unwrap();
+        assert_eq!(after_sweep.status, InvoiceStatus::Expired);
+        assert_eq!(after_sweep.sweep_tx_hashes, vec!["e".repeat(64)]);
+
+        let ledger = repo
+            .list_subaddress_transfers_for_invoice(inv.id)
+            .await
+            .unwrap();
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(
+            ledger[0].classification,
+            TransferClassification::LatePayment
+        );
+        assert!(ledger[0].swept);
+
+        let attempts = repo.list_sweep_attempts_for_invoice(inv.id).await.unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].status, SweepAttemptStatus::Submitted);
+
+        let hooks = repo.list_webhooks_for_invoice(inv.id).await.unwrap();
+        let events: Vec<WebhookEventType> = hooks.iter().map(|w| w.event_type).collect();
+        assert_eq!(
+            events,
+            vec![
+                WebhookEventType::Expired,
+                WebhookEventType::LatePayment,
+                WebhookEventType::Swept,
+            ]
+        );
+        assert!(hooks[2].payload_json.contains(r#""status":"EXPIRED""#));
+        assert!(
+            hooks[2]
+                .payload_json
+                .contains(r#""sweep_reason":"LATE_PAYMENT""#)
+        );
+
+        // 3) Second scan must NOT re-sweep (sweep_all .expect(1) holds) and manual_sweep rejects empty
+        Mock::given(method("POST"))
+            .and(path("/json_rpc"))
+            .and(body_string_contains(r#""out":true"#))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "4",
+                "result": {
+                    "out": [{
+                        "txid": "e".repeat(64),
+                        "amount": 999_900_000_000_u64,
+                        "fee": 100_000_000_u64,
+                        "confirmations": 1,
+                        "subaddr_index": { "major": 0, "minor": 42 }
+                    }],
+                    "pending": []
+                }
+            })))
+            .mount(&mock_rpc)
+            .await;
+
+        let report2 = scanner.scan_once().await.unwrap();
+        assert_eq!(report2.invoices_swept, 0);
+
+        let manual_err = scanner.manual_sweep(inv.id).await.unwrap_err();
+        assert!(matches!(manual_err, GatewayError::Conflict(_)));
+
+        // 4) Second late payment arrives on same expired invoice -> manual_sweep sweeps & preserves EXPIRED
+        let late_txid_2 = "f".repeat(64);
+        mock_rpc.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/json_rpc"))
+            .and(body_string_contains("get_transfers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "5",
+                "result": {
+                    "in": [
+                        {
+                            "txid": late_txid,
+                            "amount": 1_000_000_000_000_u64,
+                            "confirmations": 22,
+                            "double_spend_seen": false,
+                            "locked": false,
+                            "subaddr_index": { "major": 0, "minor": 42 }
+                        },
+                        {
+                            "txid": late_txid_2,
+                            "amount": 250_000_000_000_u64,
+                            "confirmations": 10,
+                            "double_spend_seen": false,
+                            "locked": false,
+                            "subaddr_index": { "major": 0, "minor": 42 }
+                        }
+                    ],
+                    "pool": []
+                }
+            })))
+            .mount(&mock_rpc)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/json_rpc"))
+            .and(body_string_contains("sweep_all"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "6",
+                "result": {
+                    "tx_hash_list": ["1".repeat(64)],
+                    "amount_list": [249_900_000_000_u64],
+                    "fee_list": [100_000_000_u64]
+                }
+            })))
+            .expect(1)
+            .mount(&mock_rpc)
+            .await;
+
+        let manual_swept = scanner.manual_sweep(inv.id).await.unwrap();
+        assert_eq!(manual_swept.status, InvoiceStatus::Expired);
+        assert_eq!(
+            manual_swept.sweep_tx_hashes,
+            vec!["e".repeat(64), "1".repeat(64)]
+        );
+        assert_eq!(scanner.active_sweep_lock_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn sweep_locks_map_prunes_entries_and_scans_old_expired_invoices_with_zero_monitor_days()
+    {
+        let pool = init_sqlite_pool("sqlite::memory:").await.unwrap();
+        let repo = InvoiceRepository::new(pool);
+        let mock_rpc = MockServer::start().await;
+
+        let mut old_expired = insertable_invoice(
+            99,
+            1_000_000_000_000,
+            Some("http://127.0.0.1:9999/old".to_string()),
+        );
+        old_expired.status = InvoiceStatus::Expired;
+        // Simulate an invoice created 365 days ago (> old 90-day cutoff)
+        old_expired.created_at = Utc::now() - ChronoDuration::days(365);
+        old_expired.expires_at = old_expired.created_at + ChronoDuration::hours(1);
+        repo.insert_invoice(&old_expired).await.unwrap();
+
+        let cfg = test_config(format!("{}/json_rpc", mock_rpc.uri()), true);
+        assert_eq!(cfg.subaddress_monitor_days, 0);
+        let rpc = MoneroRpcClient::new(&cfg.monero_rpc_url, None, None).unwrap();
+        let scanner = ScannerService::new(repo.clone(), rpc, cfg);
+
+        Mock::given(method("POST"))
+            .and(path("/json_rpc"))
+            .and(body_string_contains("get_transfers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "1",
+                "result": {
+                    "in": [{
+                        "txid": "a".repeat(64),
+                        "amount": 1_000_000_000_000_u64,
+                        "confirmations": 12,
+                        "double_spend_seen": false,
+                        "locked": false,
+                        "subaddr_index": { "major": 0, "minor": 99 }
+                    }],
+                    "pool": []
+                }
+            })))
+            .mount(&mock_rpc)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/json_rpc"))
+            .and(body_string_contains("sweep_all"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "2",
+                "result": {
+                    "tx_hash_list": ["b".repeat(64)],
+                    "amount_list": [999_900_000_000_u64],
+                    "fee_list": [100_000_000_u64]
+                }
+            })))
+            .expect(1)
+            .mount(&mock_rpc)
+            .await;
+
+        let report = scanner.scan_once().await.unwrap();
+        assert_eq!(report.invoices_scanned, 1);
+        assert_eq!(report.invoices_swept, 1);
+        assert_eq!(
+            scanner.active_sweep_lock_count().await,
+            0,
+            "sweep_locks map must prune entry after sweep finishes"
+        );
     }
 
     #[test]

@@ -6,7 +6,8 @@
 //! - Retries transmit the exact persisted byte sequence without re-serialization, guaranteeing
 //!   consistent signatures across restarts and transient merchant downtime.
 //! - In View-Only Zero-Trust mode (`ENABLE_AUTO_SWEEP=false`), successful 2xx delivery of a
-//!   `CONFIRMED` webhook atomically transitions the invoice from `CONFIRMED` to `COMPLETED`.
+//!   `SETTLED` webhook atomically transitions the invoice from `SETTLED` to `COMPLETED`, while
+//!   `CONFIRMED` leaves the invoice active for reorg monitoring until `SETTLEMENT_CONFIRMATIONS`.
 
 use std::time::Duration;
 
@@ -33,6 +34,12 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Default maximum delivery attempts before marking a webhook delivery `FAILED`.
 pub const DEFAULT_WEBHOOK_MAX_ATTEMPTS: u32 = 10;
+
+/// Maximum bytes read from a non-2xx webhook response stream to prevent memory exhaustion (`XMR-009`).
+pub const MAX_WEBHOOK_ERROR_BODY_BYTES: usize = 1024;
+
+/// Maximum characters stored from a truncated non-2xx webhook error response body.
+const MAX_WEBHOOK_ERROR_SNIPPET_CHARS: usize = 256;
 
 /// Base backoff delay in seconds for attempt 1 (`5s, 10s, 20s, ...`).
 const BACKOFF_BASE_SECONDS: i64 = 5;
@@ -83,6 +90,9 @@ pub struct WebhookPayload {
     /// Triggering transfer or excess amount in piconero for `LATE_PAYMENT` / `OVERPAYMENT`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub trigger_amount_piconero: Option<u64>,
+    /// Reason metadata populated on anomaly-driven `SWEPT` webhooks (`"LATE_PAYMENT"` or `"OVERPAYMENT"`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub sweep_reason: Option<String>,
     /// Event creation UTC timestamp.
     pub timestamp: DateTime<Utc>,
 }
@@ -160,6 +170,7 @@ pub fn build_webhook_delivery(
         sweep_fee_piconero: invoice.sweep_fee_piconero.map(Piconero::as_u64),
         txid: None,
         trigger_amount_piconero: None,
+        sweep_reason: None,
         timestamp: now,
     };
 
@@ -237,6 +248,7 @@ pub fn build_transfer_anomaly_webhook_delivery(
         sweep_fee_piconero: invoice.sweep_fee_piconero.map(Piconero::as_u64),
         txid: Some(txid.to_string()),
         trigger_amount_piconero: Some(trigger_amount_piconero.as_u64()),
+        sweep_reason: None,
         timestamp: now,
     };
 
@@ -249,6 +261,73 @@ pub fn build_transfer_anomaly_webhook_delivery(
         id: delivery_id,
         invoice_id: invoice.id,
         event_type,
+        dedupe_key,
+        target_url: target_url.to_string(),
+        payload_json,
+        signature_hex,
+        max_attempts: DEFAULT_WEBHOOK_MAX_ATTEMPTS,
+        now,
+    })
+}
+
+/// Builds a signed `SWEPT` [`NewWebhookDelivery`], optionally tagging anomaly sweeps
+/// (`"LATE_PAYMENT"` or `"OVERPAYMENT"`) while keeping distinct deduplication keys (`XMR-017`).
+///
+/// # Errors
+/// Returns [`GatewayError::Webhook`] if JSON serialization or HMAC signing fails.
+pub fn build_sweep_webhook_delivery(
+    webhook_secret: &str,
+    invoice: &Invoice,
+    sweep_reason: Option<&str>,
+    target_url: &str,
+    now: DateTime<Utc>,
+) -> GatewayResult<NewWebhookDelivery> {
+    let delivery_id = Uuid::new_v4();
+    let payload = WebhookPayload {
+        event_id: delivery_id,
+        event: WebhookEventType::Swept,
+        invoice_id: invoice.id,
+        order_id: invoice.order_id.clone(),
+        status: invoice.status,
+        subaddress: invoice.subaddress.clone(),
+        address_index: invoice.address_index,
+        amount_piconero: invoice.amount_piconero.as_u64(),
+        amount_xmr_formatted: invoice.amount_piconero.to_xmr_string(),
+        received_piconero: invoice.received_piconero.as_u64(),
+        received_xmr_formatted: invoice.received_piconero.to_xmr_string(),
+        confirmations: invoice.confirmations,
+        unlocked: invoice.unlocked,
+        double_spend_seen: invoice.double_spend_seen,
+        sweep_tx_hashes: invoice.sweep_tx_hashes.clone(),
+        sweep_amount_piconero: invoice.sweep_amount_piconero.map(Piconero::as_u64),
+        sweep_fee_piconero: invoice.sweep_fee_piconero.map(Piconero::as_u64),
+        txid: None,
+        trigger_amount_piconero: None,
+        sweep_reason: sweep_reason.map(str::to_owned),
+        timestamp: now,
+    };
+
+    let payload_json = serde_json::to_string(&payload)
+        .map_err(|e| GatewayError::Webhook(format!("failed to serialize webhook payload: {e}")))?;
+    let signature_hex = sign_payload_hmac_sha256(webhook_secret, payload_json.as_bytes())?;
+
+    let dedupe_key = if invoice.sweep_tx_hashes.len() > 1 {
+        format!("{}:SWEPT:{}", invoice.id, invoice.sweep_tx_hashes.len())
+    } else if invoice.status == InvoiceStatus::Expired {
+        let hash_suffix = invoice
+            .sweep_tx_hashes
+            .first()
+            .map(String::as_str)
+            .unwrap_or("late");
+        format!("{}:SWEPT:LATE:{}", invoice.id, hash_suffix)
+    } else {
+        format!("{}:SWEPT", invoice.id)
+    };
+
+    Ok(NewWebhookDelivery {
+        id: delivery_id,
+        invoice_id: invoice.id,
+        event_type: WebhookEventType::Swept,
         dedupe_key,
         target_url: target_url.to_string(),
         payload_json,
@@ -279,34 +358,14 @@ pub struct WebhookDispatcher {
 }
 
 impl WebhookDispatcher {
-    /// Constructs a new [`WebhookDispatcher`] permitting loopback targets for local tests.
+    /// Constructs a new [`WebhookDispatcher`] enforcing an explicit [`WebhookUrlPolicy`].
+    ///
+    /// Configures `redirect::Policy::none()` so HTTP 3xx responses cannot pivot webhook traffic to
+    /// internal hosts, and validates + pins DNS answers on every dispatch attempt (`XMR-016`).
     ///
     /// # Errors
     /// Returns [`GatewayError::Config`] if the HTTP client fails TLS initialization.
     pub fn new(
-        repo: InvoiceRepository,
-        enable_auto_sweep: bool,
-        poll_interval: Duration,
-    ) -> GatewayResult<Self> {
-        Self::new_with_policy(
-            repo,
-            enable_auto_sweep,
-            poll_interval,
-            WebhookUrlPolicy {
-                allow_private_webhooks: true,
-                require_https_webhooks: false,
-            },
-        )
-    }
-
-    /// Constructs a new [`WebhookDispatcher`] enforcing an explicit [`WebhookUrlPolicy`].
-    ///
-    /// Configures `redirect::Policy::none()` so HTTP 3xx responses cannot pivot webhook traffic to
-    /// internal hosts, and validates + pins DNS answers on every dispatch attempt.
-    ///
-    /// # Errors
-    /// Returns [`GatewayError::Config`] if the HTTP client fails TLS initialization.
-    pub fn new_with_policy(
         repo: InvoiceRepository,
         enable_auto_sweep: bool,
         poll_interval: Duration,
@@ -326,6 +385,19 @@ impl WebhookDispatcher {
             poll_interval,
             url_policy,
         })
+    }
+
+    /// Backwards-compatible alias for [`WebhookDispatcher::new`] with explicit [`WebhookUrlPolicy`].
+    ///
+    /// # Errors
+    /// Returns [`GatewayError::Config`] if the HTTP client fails TLS initialization.
+    pub fn new_with_policy(
+        repo: InvoiceRepository,
+        enable_auto_sweep: bool,
+        poll_interval: Duration,
+        url_policy: WebhookUrlPolicy,
+    ) -> GatewayResult<Self> {
+        Self::new(repo, enable_auto_sweep, poll_interval, url_policy)
     }
 
     /// Runs the background retry loop until a shutdown signal arrives.
@@ -447,8 +519,12 @@ impl WebhookDispatcher {
             }
             Ok(resp) => {
                 let code = resp.status().as_u16();
-                let body_snippet = resp.text().await.unwrap_or_default();
-                let truncated: String = body_snippet.chars().take(256).collect();
+                let truncated = read_bounded_body_snippet(
+                    resp,
+                    MAX_WEBHOOK_ERROR_BODY_BYTES,
+                    MAX_WEBHOOK_ERROR_SNIPPET_CHARS,
+                )
+                .await;
                 let err_msg = format!("HTTP {code}: {truncated}");
                 self.schedule_retry_or_fail(delivery, Some(code), &err_msg, now)
                     .await?;
@@ -505,6 +581,31 @@ impl WebhookDispatcher {
             )
             .await
     }
+}
+
+async fn read_bounded_body_snippet(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+    max_chars: usize,
+) -> String {
+    let mut buf = Vec::with_capacity(max_bytes.min(MAX_WEBHOOK_ERROR_BODY_BYTES));
+    while buf.len() < max_bytes {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = max_bytes - buf.len();
+                let take = chunk.len().min(remaining);
+                buf.extend_from_slice(&chunk[..take]);
+                if buf.len() >= max_bytes {
+                    break;
+                }
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buf)
+        .chars()
+        .take(max_chars)
+        .collect()
 }
 
 #[cfg(test)]
@@ -623,19 +724,74 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let dispatcher =
-            WebhookDispatcher::new(repo.clone(), false, Duration::from_secs(5)).unwrap();
+        let dispatcher = WebhookDispatcher::new(
+            repo.clone(),
+            false,
+            Duration::from_secs(5),
+            WebhookUrlPolicy {
+                allow_private_webhooks: true,
+                require_https_webhooks: false,
+            },
+        )
+        .unwrap();
         let processed = dispatcher.process_due_deliveries().await.unwrap();
         assert_eq!(processed, 1);
+
+        // CONFIRMED webhook alone MUST NOT prematurely finalize View-Only invoices before SETTLED!
+        let after_conf_delivery = repo.get_invoice_by_id(inv.id).await.unwrap().unwrap();
+        assert_eq!(after_conf_delivery.status, InvoiceStatus::Confirmed);
+        assert!(after_conf_delivery.completed_at.is_none());
+
+        // Advance to SETTLED and deliver SETTLED webhook -> completes invoice atomically
+        let settled_delivery = build_webhook_delivery(
+            secret,
+            &after_conf_delivery,
+            WebhookEventType::Settled,
+            after_conf_delivery.callback_url.as_deref().unwrap(),
+            Utc::now(),
+        )
+        .unwrap();
+        let settled_sig = settled_delivery.signature_hex.clone();
+
+        repo.apply_scan_update(crate::db::repository::ApplyScanUpdateParams {
+            invoice_id: inv.id,
+            received_piconero: inv.received_piconero,
+            confirmations: 10,
+            unlocked: true,
+            double_spend_seen: false,
+            next_status: InvoiceStatus::Settled,
+            transfers: Vec::new(),
+            webhook: Some(settled_delivery),
+            now: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+        mock_server.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .and(header("X-Signature-256", settled_sig.as_str()))
+            .and(header("X-Webhook-Event", "SETTLED"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let processed_settled = dispatcher.process_due_deliveries().await.unwrap();
+        assert_eq!(processed_settled, 1);
 
         let updated = repo.get_invoice_by_id(inv.id).await.unwrap().unwrap();
         assert_eq!(updated.status, InvoiceStatus::Completed);
         assert!(updated.completed_at.is_some());
 
         let webhooks = repo.list_webhooks_for_invoice(inv.id).await.unwrap();
-        assert_eq!(webhooks.len(), 1);
+        assert_eq!(webhooks.len(), 2);
         assert_eq!(
             webhooks[0].status,
+            crate::db::repository::WebhookDeliveryStatus::Delivered
+        );
+        assert_eq!(
+            webhooks[1].status,
             crate::db::repository::WebhookDeliveryStatus::Delivered
         );
     }
@@ -683,8 +839,16 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let dispatcher =
-            WebhookDispatcher::new(repo.clone(), true, Duration::from_secs(5)).unwrap();
+        let dispatcher = WebhookDispatcher::new(
+            repo.clone(),
+            true,
+            Duration::from_secs(5),
+            WebhookUrlPolicy {
+                allow_private_webhooks: true,
+                require_https_webhooks: false,
+            },
+        )
+        .unwrap();
         dispatcher.process_due_deliveries().await.unwrap();
 
         let hooks = repo.list_webhooks_for_invoice(inv.id).await.unwrap();
@@ -820,5 +984,132 @@ mod tests {
             hooks2[0].status,
             crate::db::repository::WebhookDeliveryStatus::Pending
         );
+    }
+
+    #[tokio::test]
+    async fn production_dispatcher_with_config_policy_blocks_private_and_dns_rebound_targets() {
+        let pool = init_sqlite_pool("sqlite::memory:").await.unwrap();
+        let repo = InvoiceRepository::new(pool);
+
+        let strict_policy = WebhookUrlPolicy {
+            allow_private_webhooks: false,
+            require_https_webhooks: false,
+        };
+        let dispatcher =
+            WebhookDispatcher::new(repo.clone(), true, Duration::from_secs(5), strict_policy)
+                .unwrap();
+
+        let targets = [
+            "http://127.0.0.1:9000/hook",
+            "http://10.0.0.1:8080/hook",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://localhost:9000/hook",
+        ];
+
+        for (idx, target_url) in targets.into_iter().enumerate() {
+            let mut inv = sample_invoice(InvoiceStatus::Confirmed);
+            inv.order_id = format!("ord-ssrf-prod-{idx}");
+            inv.address_index = u32::try_from(idx + 50).unwrap();
+            inv.callback_url = Some(target_url.to_string());
+            repo.insert_invoice(&inv).await.unwrap();
+
+            let delivery = build_webhook_delivery(
+                "webhook-secret-key-0123456789abcdef",
+                &inv,
+                WebhookEventType::Confirmed,
+                target_url,
+                Utc::now(),
+            )
+            .unwrap();
+
+            repo.apply_scan_update(crate::db::repository::ApplyScanUpdateParams {
+                invoice_id: inv.id,
+                received_piconero: inv.received_piconero,
+                confirmations: 10,
+                unlocked: true,
+                double_spend_seen: false,
+                next_status: InvoiceStatus::Confirmed,
+                transfers: Vec::new(),
+                webhook: Some(delivery),
+                now: Utc::now(),
+            })
+            .await
+            .unwrap();
+        }
+
+        let processed = dispatcher.process_due_deliveries().await.unwrap();
+        assert_eq!(processed, 4);
+
+        let due_after = repo
+            .fetch_due_webhooks(Utc::now() + ChronoDuration::seconds(1), 20)
+            .await
+            .unwrap();
+        assert!(
+            due_after.is_empty(),
+            "blocked deliveries must be backed off"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_webhook_error_body_reads_at_most_1024_bytes_on_oversized_response() {
+        let pool = init_sqlite_pool("sqlite::memory:").await.unwrap();
+        let repo = InvoiceRepository::new(pool);
+        let mock_server = MockServer::start().await;
+
+        let mut inv = sample_invoice(InvoiceStatus::Confirmed);
+        inv.order_id = "ord-oversized-body".to_string();
+        let hook_url = format!("{}/huge500", mock_server.uri());
+        inv.callback_url = Some(hook_url.clone());
+        repo.insert_invoice(&inv).await.unwrap();
+
+        let mut delivery = build_webhook_delivery(
+            "webhook-secret-key-0123456789abcdef",
+            &inv,
+            WebhookEventType::Confirmed,
+            &hook_url,
+            Utc::now(),
+        )
+        .unwrap();
+        delivery.max_attempts = 1;
+
+        repo.apply_scan_update(crate::db::repository::ApplyScanUpdateParams {
+            invoice_id: inv.id,
+            received_piconero: inv.received_piconero,
+            confirmations: 10,
+            unlocked: true,
+            double_spend_seen: false,
+            next_status: InvoiceStatus::Confirmed,
+            transfers: Vec::new(),
+            webhook: Some(delivery),
+            now: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+        let oversized_body = "E".repeat(2 * 1024 * 1024);
+        Mock::given(method("POST"))
+            .and(path("/huge500"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(oversized_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let dispatcher = WebhookDispatcher::new(
+            repo.clone(),
+            true,
+            Duration::from_secs(5),
+            WebhookUrlPolicy {
+                allow_private_webhooks: true,
+                require_https_webhooks: false,
+            },
+        )
+        .unwrap();
+
+        dispatcher.process_due_deliveries().await.unwrap();
+
+        let hooks = repo.list_webhooks_for_invoice(inv.id).await.unwrap();
+        assert_eq!(hooks[0].last_status_code, Some(500));
+        let err_msg = hooks[0].last_error.as_deref().unwrap();
+        assert_eq!(err_msg, format!("HTTP 500: {}", "E".repeat(256)));
     }
 }

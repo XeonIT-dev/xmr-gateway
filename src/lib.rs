@@ -95,7 +95,7 @@ mod integration_tests {
             invoice_ttl_seconds: 3600,
             scan_interval_seconds: 10,
             webhook_poll_interval_seconds: 5,
-            subaddress_monitor_days: 90,
+            subaddress_monitor_days: 0,
             log_format: LogFormat::Json,
         })
     }
@@ -204,8 +204,8 @@ mod integration_tests {
         let png_bytes = STANDARD.decode(&created.qr_code_base64).unwrap();
         assert_eq!(&png_bytes[..4], &[0x89, b'P', b'N', b'G']);
 
-        // 4) Duplicate order_id rejected with 409 Conflict
-        let dup_resp = app
+        // 4) Duplicate order_id with identical params returns 200 idempotently; mismatched amount returns 409 Conflict
+        let dup_ok_resp = app
             .clone()
             .oneshot(
                 Request::post("/api/v1/invoices")
@@ -218,7 +218,27 @@ mod integration_tests {
             )
             .await
             .unwrap();
-        assert_eq!(dup_resp.status(), StatusCode::CONFLICT);
+        assert_eq!(dup_ok_resp.status(), StatusCode::OK);
+        let dup_ok: CreateInvoiceResponse =
+            serde_json::from_slice(&dup_ok_resp.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(dup_ok.invoice_id, created.invoice_id);
+        assert_eq!(dup_ok.subaddress, created.subaddress);
+
+        let dup_mismatch_resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/invoices")
+                    .header("content-type", "application/json")
+                    .header("X-API-Key", cfg.api_secret_key.as_str())
+                    .body(Body::from(
+                        r#"{"order_id":"tg-order-42","amount_piconero":2500000000001}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dup_mismatch_resp.status(), StatusCode::CONFLICT);
 
         // 5) Simulate 2 confirmations (CONFIRMED, still locked < 10 blocks)
         mock_rpc.reset().await;
@@ -627,5 +647,103 @@ mod integration_tests {
                 "expected 400 Bad Request for SSRF callback_url {bad_url}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn invoice_creation_idempotency_returns_same_invoice_on_exact_retry_and_409_on_mismatch()
+    {
+        let mock_rpc = MockServer::start().await;
+        let subaddress = format!("8{}", "F".repeat(94));
+
+        // RPC create_address MUST be called at most once despite concurrent & sequential retries!
+        Mock::given(method("POST"))
+            .and(path("/json_rpc"))
+            .and(body_string_contains("create_address"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(25))
+                    .set_body_json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": "1",
+                        "result": { "address": subaddress, "address_index": 77 }
+                    })),
+            )
+            .expect(1)
+            .mount(&mock_rpc)
+            .await;
+
+        let pool = init_sqlite_pool("sqlite::memory:").await.unwrap();
+        let repo = InvoiceRepository::new(pool);
+        let cfg = integration_config(
+            format!("{}/json_rpc", mock_rpc.uri()),
+            Some("http://127.0.0.1:9000/default-hook".to_string()),
+            false,
+        );
+        let rpc = MoneroRpcClient::new(&cfg.monero_rpc_url, None, None).unwrap();
+        let scanner = ScannerService::new(repo.clone(), rpc.clone(), cfg.clone());
+        let app = build_router(AppState {
+            config: cfg.clone(),
+            repo,
+            rpc,
+            scanner,
+        });
+
+        let payload = r#"{"order_id":"idem-ord-1","amount_piconero":123456789,"callback_url":"http://127.0.0.1:9000/custom"}"#;
+        let req1 = Request::post("/api/v1/invoices")
+            .header("content-type", "application/json")
+            .header("X-API-Key", cfg.api_secret_key.as_str())
+            .body(Body::from(payload))
+            .unwrap();
+        let req2 = Request::post("/api/v1/invoices")
+            .header("content-type", "application/json")
+            .header("X-API-Key", cfg.api_secret_key.as_str())
+            .body(Body::from(payload))
+            .unwrap();
+
+        // Fire two concurrent identical requests against the same order_id
+        let (r1, r2) = tokio::join!(app.clone().oneshot(req1), app.clone().oneshot(req2));
+        let r1 = r1.unwrap();
+        let r2 = r2.unwrap();
+        assert!(
+            (r1.status() == StatusCode::CREATED && r2.status() == StatusCode::OK)
+                || (r1.status() == StatusCode::OK && r2.status() == StatusCode::CREATED)
+        );
+        let inv1: CreateInvoiceResponse =
+            serde_json::from_slice(&r1.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let inv2: CreateInvoiceResponse =
+            serde_json::from_slice(&r2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(inv1.invoice_id, inv2.invoice_id);
+        assert_eq!(inv1.subaddress, inv2.subaddress);
+
+        // Retry with different amount -> 409 Conflict
+        let mismatch_amt = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/invoices")
+                    .header("content-type", "application/json")
+                    .header("X-API-Key", cfg.api_secret_key.as_str())
+                    .body(Body::from(
+                        r#"{"order_id":"idem-ord-1","amount_piconero":999999999,"callback_url":"http://127.0.0.1:9000/custom"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mismatch_amt.status(), StatusCode::CONFLICT);
+
+        // Retry with different callback_url -> 409 Conflict
+        let mismatch_cb = app
+            .oneshot(
+                Request::post("/api/v1/invoices")
+                    .header("content-type", "application/json")
+                    .header("X-API-Key", cfg.api_secret_key.as_str())
+                    .body(Body::from(
+                        r#"{"order_id":"idem-ord-1","amount_piconero":123456789,"callback_url":"http://127.0.0.1:9000/other"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mismatch_cb.status(), StatusCode::CONFLICT);
     }
 }

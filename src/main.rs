@@ -14,9 +14,10 @@ use tracing_subscriber::{EnvFilter, fmt};
 use xmr_gateway::{
     api::{AppState, build_router},
     config::{Config, LogFormat},
-    db::{init_sqlite_pool, repository::InvoiceRepository},
+    db::{acquire_database_lock, init_sqlite_pool, repository::InvoiceRepository},
     error::{GatewayError, GatewayResult},
     rpc::client::MoneroRpcClient,
+    security::url_policy::resolve_and_validate_webhook_url,
     services::{scanner::ScannerService, webhook::WebhookDispatcher},
 };
 
@@ -35,6 +36,15 @@ async fn run_gateway() -> GatewayResult<()> {
     let config = Arc::new(Config::from_env()?);
     init_tracing(config.log_format);
 
+    if let Some(ref default_url) = config.default_webhook_url {
+        resolve_and_validate_webhook_url(
+            default_url,
+            "DEFAULT_WEBHOOK_URL",
+            config.webhook_url_policy(),
+        )
+        .await?;
+    }
+
     tracing::info!(
         bind_addr = %config.bind_addr(),
         wallet_mode = config.wallet_mode.as_str(),
@@ -45,6 +55,7 @@ async fn run_gateway() -> GatewayResult<()> {
         "starting xmr-gateway"
     );
 
+    let _db_lock = acquire_database_lock(&config.database_url)?;
     let pool = init_sqlite_pool(&config.database_url).await?;
     let repo = InvoiceRepository::new(pool.clone());
     let rpc = MoneroRpcClient::new(
@@ -67,7 +78,7 @@ async fn run_gateway() -> GatewayResult<()> {
         ),
     }
 
-    let webhook_dispatcher = WebhookDispatcher::new_with_policy(
+    let webhook_dispatcher = WebhookDispatcher::new(
         repo.clone(),
         config.enable_auto_sweep,
         Duration::from_secs(config.webhook_poll_interval_seconds),

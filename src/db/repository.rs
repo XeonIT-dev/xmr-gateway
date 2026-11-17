@@ -4,10 +4,11 @@
 //! explicit SQLite transaction (`BEGIN ... COMMIT`), preserving consistency across process
 //! crashes and preventing duplicate webhook emissions via database `UNIQUE` constraints.
 
-use std::str::FromStr;
+use std::{collections::HashMap, str::FromStr, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
@@ -277,6 +278,7 @@ pub struct MarkSweptParams {
 #[derive(Debug, Clone)]
 pub struct InvoiceRepository {
     pool: SqlitePool,
+    order_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 #[derive(Debug, FromRow)]
@@ -368,8 +370,28 @@ struct SubaddressTransferRow {
 impl InvoiceRepository {
     /// Creates a new repository backed by the given `SqlitePool`.
     #[must_use]
-    pub const fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    pub fn new(pool: SqlitePool) -> Self {
+        Self {
+            pool,
+            order_locks: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Acquires a per-`order_id` async mutex to serialize concurrent invoice creation requests
+    /// so retried or racing requests never allocate orphaned Monero subaddresses (`XMR-019`).
+    pub async fn acquire_order_lock(&self, order_id: &str) -> Arc<Mutex<()>> {
+        let mut map = self.order_locks.lock().await;
+        map.entry(order_id.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Prunes the per-`order_id` mutex once no other task holds or awaits it.
+    pub async fn release_order_lock(&self, order_id: &str, lock: Arc<Mutex<()>>) {
+        let mut map = self.order_locks.lock().await;
+        if Arc::strong_count(&lock) <= 2 && lock.try_lock().is_ok() {
+            map.remove(order_id);
+        }
     }
 
     /// Executes a lightweight connectivity check against SQLite.
@@ -524,32 +546,53 @@ impl InvoiceRepository {
         rows.into_iter().map(ObservedTransfer::try_from).collect()
     }
 
-    /// Fetches all non-terminal invoices PLUS terminal invoices created on or after `cutoff`
-    /// so post-expiry late payments and post-sweep overpayments continue to be monitored (`XMR-004`).
+    /// Fetches all non-terminal invoices PLUS terminal invoices created on or after `cutoff`, or
+    /// all invoices continuously when `cutoff` is `None` (`SUBADDRESS_MONITOR_DAYS=0`) so late
+    /// payments and post-sweep overpayments never stop being detected (`XMR-004` / `P1-3`).
     ///
     /// # Errors
     /// Returns [`GatewayError::Database`] on SQL failure.
     pub async fn list_monitored_invoices(
         &self,
-        cutoff: DateTime<Utc>,
+        cutoff: Option<DateTime<Utc>>,
     ) -> GatewayResult<Vec<Invoice>> {
-        let rows: Vec<InvoiceRow> = sqlx::query_as(
-            r#"
-            SELECT
-                id, order_id, account_index, address_index, subaddress,
-                amount_piconero, received_piconero, confirmations, unlocked, double_spend_seen,
-                status, callback_url, monero_uri, qr_code_base64,
-                sweep_tx_hashes, sweep_amount_piconero, sweep_fee_piconero, last_sweep_error,
-                created_at, updated_at, expires_at, confirmed_at, settled_at, swept_at, completed_at
-            FROM invoices
-            WHERE status IN ('PENDING', 'UNDERPAID', 'MEMPOOL', 'CONFIRMING', 'CONFIRMED', 'SETTLED', 'REORGED')
-               OR created_at >= ?
-            ORDER BY created_at ASC
-            "#,
-        )
-        .bind(cutoff.to_rfc3339())
-        .fetch_all(&self.pool)
-        .await?;
+        let rows: Vec<InvoiceRow> = match cutoff {
+            Some(cutoff_ts) => {
+                sqlx::query_as(
+                    r#"
+                    SELECT
+                        id, order_id, account_index, address_index, subaddress,
+                        amount_piconero, received_piconero, confirmations, unlocked, double_spend_seen,
+                        status, callback_url, monero_uri, qr_code_base64,
+                        sweep_tx_hashes, sweep_amount_piconero, sweep_fee_piconero, last_sweep_error,
+                        created_at, updated_at, expires_at, confirmed_at, settled_at, swept_at, completed_at
+                    FROM invoices
+                    WHERE status IN ('PENDING', 'UNDERPAID', 'MEMPOOL', 'CONFIRMING', 'CONFIRMED', 'SETTLED', 'REORGED')
+                       OR created_at >= ?
+                    ORDER BY created_at ASC
+                    "#,
+                )
+                .bind(cutoff_ts.to_rfc3339())
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_as(
+                    r#"
+                    SELECT
+                        id, order_id, account_index, address_index, subaddress,
+                        amount_piconero, received_piconero, confirmations, unlocked, double_spend_seen,
+                        status, callback_url, monero_uri, qr_code_base64,
+                        sweep_tx_hashes, sweep_amount_piconero, sweep_fee_piconero, last_sweep_error,
+                        created_at, updated_at, expires_at, confirmed_at, settled_at, swept_at, completed_at
+                    FROM invoices
+                    ORDER BY created_at ASC
+                    "#,
+                )
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
 
         rows.into_iter().map(Invoice::try_from).collect()
     }
@@ -861,8 +904,11 @@ impl InvoiceRepository {
         rows.into_iter().map(WebhookDelivery::try_from).collect()
     }
 
-    /// Marks a webhook delivery as `DELIVERED` and, in View-Only mode, transitions `CONFIRMED`
-    /// invoices to `COMPLETED` inside the same atomic SQLite transaction.
+    /// Marks a webhook delivery as `DELIVERED` and, in View-Only mode, transitions `SETTLED`
+    /// invoices to `COMPLETED` inside the same atomic SQLite transaction (`XMR-018`).
+    ///
+    /// Delivering an early `CONFIRMED` webhook keeps the invoice non-terminal so chain reorg
+    /// monitoring remains active until `SETTLEMENT_CONFIRMATIONS` (`SETTLED`) is reached.
     ///
     /// # Errors
     /// Returns [`GatewayError::Database`] on SQL failure.
@@ -898,12 +944,7 @@ impl InvoiceRepository {
         .execute(&mut *tx)
         .await?;
 
-        if complete_on_view_only
-            && matches!(
-                event_type,
-                WebhookEventType::Confirmed | WebhookEventType::Settled
-            )
-        {
+        if complete_on_view_only && event_type == WebhookEventType::Settled {
             sqlx::query(
                 r#"
                 UPDATE invoices
@@ -911,7 +952,7 @@ impl InvoiceRepository {
                     status = 'COMPLETED',
                     completed_at = COALESCE(completed_at, ?),
                     updated_at = ?
-                WHERE id = ? AND status IN ('CONFIRMED', 'SETTLED')
+                WHERE id = ? AND status = 'SETTLED'
                 "#,
             )
             .bind(&now_str)
@@ -1227,7 +1268,10 @@ impl InvoiceRepository {
         let existing = Invoice::try_from(existing_row)?;
         if !matches!(
             existing.status,
-            InvoiceStatus::Confirmed | InvoiceStatus::Settled | InvoiceStatus::Swept
+            InvoiceStatus::Confirmed
+                | InvoiceStatus::Settled
+                | InvoiceStatus::Swept
+                | InvoiceStatus::Expired
         ) {
             return Err(GatewayError::Conflict(format!(
                 "cannot complete sweep for invoice {} from status {}",
@@ -1264,7 +1308,7 @@ impl InvoiceRepository {
         .execute(&mut *tx)
         .await?;
 
-        let (merged_hashes, total_amount, total_fee) = if existing.status == InvoiceStatus::Swept {
+        let (merged_hashes, total_amount, total_fee) = if !existing.sweep_tx_hashes.is_empty() {
             let mut hashes = existing.sweep_tx_hashes.clone();
             let mut has_new_tx = false;
             for h in &params.sweep_tx_hashes {
@@ -1306,13 +1350,26 @@ impl InvoiceRepository {
         let merged_amt_i64 = total_amount.to_i64()?;
         let merged_fee_i64 = total_fee.to_i64()?;
 
+        // Critical financial invariant (XMR-017): sweeping late funds on an EXPIRED invoice MUST
+        // preserve EXPIRED status rather than resurrecting the order to SWEPT.
+        let next_status = if existing.status == InvoiceStatus::Expired {
+            InvoiceStatus::Expired
+        } else {
+            InvoiceStatus::Swept
+        };
+        let next_settled_at = if existing.status == InvoiceStatus::Expired {
+            existing.settled_at.map(|ts| ts.to_rfc3339())
+        } else {
+            Some(existing.settled_at.unwrap_or(params.now).to_rfc3339())
+        };
+
         sqlx::query(
             r#"
             UPDATE invoices
             SET
-                status = 'SWEPT',
+                status = ?,
                 unlocked = 1,
-                settled_at = COALESCE(settled_at, ?),
+                settled_at = ?,
                 sweep_tx_hashes = ?,
                 sweep_amount_piconero = ?,
                 sweep_fee_piconero = ?,
@@ -1322,7 +1379,8 @@ impl InvoiceRepository {
             WHERE id = ?
             "#,
         )
-        .bind(&now_str)
+        .bind(next_status.as_str())
+        .bind(next_settled_at)
         .bind(merged_hashes_json)
         .bind(merged_amt_i64)
         .bind(merged_fee_i64)
@@ -1394,11 +1452,12 @@ impl InvoiceRepository {
             .collect()
     }
 
-    /// Returns `true` if `invoice_id` has any unswept `OVERPAYMENT` or `LATE_PAYMENT` transfers.
+    /// Returns `true` if `invoice_id` has any unswept `OVERPAYMENT` or `LATE_PAYMENT` inflows
+    /// recorded in `subaddress_transfers` (`XMR-017`).
     ///
     /// # Errors
     /// Returns [`GatewayError::Database`] on SQL failure.
-    pub async fn has_unswept_overpayment(&self, invoice_id: Uuid) -> GatewayResult<bool> {
+    pub async fn has_unswept_inflows(&self, invoice_id: Uuid) -> GatewayResult<bool> {
         let count: i64 = sqlx::query_scalar(
             r#"
             SELECT COUNT(*)
@@ -1413,6 +1472,14 @@ impl InvoiceRepository {
         .await?;
 
         Ok(count > 0)
+    }
+
+    /// Backwards-compatible alias for [`InvoiceRepository::has_unswept_inflows`].
+    ///
+    /// # Errors
+    /// Returns [`GatewayError::Database`] on SQL failure.
+    pub async fn has_unswept_overpayment(&self, invoice_id: Uuid) -> GatewayResult<bool> {
+        self.has_unswept_inflows(invoice_id).await
     }
 
     /// Atomically persists a classified `subaddress_transfers` entry, refreshes invoice totals/

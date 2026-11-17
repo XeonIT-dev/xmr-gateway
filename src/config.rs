@@ -135,7 +135,7 @@ pub struct Config {
     /// Interval in seconds between background webhook retry polls.
     pub webhook_poll_interval_seconds: u64,
     /// Retention window in days for scanning terminal (`COMPLETED`/`SWEPT`/`EXPIRED`) subaddresses
-    /// to detect late payments and post-settlement overpayments (`SUBADDRESS_MONITOR_DAYS`, default `90`).
+    /// (`SUBADDRESS_MONITOR_DAYS`, default `0` = continuous/unbounded monitoring of all subaddresses).
     pub subaddress_monitor_days: u64,
     /// Tracing log output format.
     pub log_format: LogFormat,
@@ -234,7 +234,7 @@ impl Config {
         let invoice_ttl_seconds = parse_env_u64("INVOICE_TTL_SECONDS", 3600)?;
         let scan_interval_seconds = parse_env_u64("SCAN_INTERVAL_SECONDS", 10)?;
         let webhook_poll_interval_seconds = parse_env_u64("WEBHOOK_POLL_INTERVAL_SECONDS", 5)?;
-        let subaddress_monitor_days = parse_env_u64("SUBADDRESS_MONITOR_DAYS", 90)?;
+        let subaddress_monitor_days = parse_env_u64("SUBADDRESS_MONITOR_DAYS", 0)?;
         let log_format = LogFormat::parse(&env_or_default("LOG_FORMAT", "json"))?;
 
         let config = Self {
@@ -327,12 +327,6 @@ impl Config {
         if self.webhook_poll_interval_seconds == 0 {
             return Err(GatewayError::Config(
                 "WEBHOOK_POLL_INTERVAL_SECONDS must be >= 1".to_string(),
-            ));
-        }
-
-        if self.subaddress_monitor_days == 0 {
-            return Err(GatewayError::Config(
-                "SUBADDRESS_MONITOR_DAYS must be >= 1".to_string(),
             ));
         }
 
@@ -575,7 +569,7 @@ mod tests {
             invoice_ttl_seconds: 3600,
             scan_interval_seconds: 10,
             webhook_poll_interval_seconds: 5,
-            subaddress_monitor_days: 90,
+            subaddress_monitor_days: 0,
             log_format: LogFormat::Json,
         }
     }

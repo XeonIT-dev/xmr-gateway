@@ -9,6 +9,7 @@
 # ==============================================================================
 
 set -euo pipefail
+umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -114,6 +115,9 @@ is_placeholder_secret() {
 }
 
 ensure_env_file() {
+    mkdir -p "$DATA_DIR" "$WALLET_DIR"
+    chmod 700 "$DATA_DIR" "$WALLET_DIR"
+
     if [[ ! -f "$ENV_FILE" ]]; then
         if [[ ! -f "$ENV_EXAMPLE" ]]; then
             log_err "Neither .env nor .env.example exists in $SCRIPT_DIR."
@@ -121,8 +125,8 @@ ensure_env_file() {
         fi
         log_info "Creating .env from .env.example..."
         cp "$ENV_EXAMPLE" "$ENV_FILE"
-        chmod 600 "$ENV_FILE"
     fi
+    chmod 600 "$ENV_FILE"
 
     set -a
     # shellcheck source=/dev/null
@@ -146,6 +150,8 @@ ensure_env_file() {
         set_env_kv "MONERO_RPC_PASS" "$(openssl rand -hex 24)"
         log_info "Generated fresh MONERO_RPC_PASS in .env"
     fi
+
+    chmod 600 "$ENV_FILE"
 
     set -a
     # shellcheck source=/dev/null
@@ -395,7 +401,8 @@ extract_rpc_port() {
 }
 
 start_monero_wallet_rpc() {
-    mkdir -p "$DATA_DIR"
+    mkdir -p "$DATA_DIR" "$WALLET_DIR"
+    chmod 700 "$DATA_DIR" "$WALLET_DIR"
     local rpc_bin rpc_port
     rpc_bin="$(find_monero_bin monero-wallet-rpc)"
     rpc_port="$(extract_rpc_port "$MONERO_RPC_URL")"
