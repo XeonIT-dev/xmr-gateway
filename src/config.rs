@@ -736,11 +736,11 @@ pub fn keccak256(input: &[u8]) -> [u8; 32] {
         *last |= 0x80;
     }
 
-    for block in padded.chunks_exact(RATE_BYTES) {
-        for (word_idx, lane) in block.chunks_exact(8).enumerate() {
-            let mut bytes = [0_u8; 8];
-            bytes.copy_from_slice(lane);
-            state[word_idx] ^= u64::from_le_bytes(bytes);
+    let (blocks, _) = padded.as_chunks::<RATE_BYTES>();
+    for block in blocks {
+        let (lanes, _) = block.as_chunks::<8>();
+        for (word_idx, lane) in lanes.iter().enumerate() {
+            state[word_idx] ^= u64::from_le_bytes(*lane);
         }
         keccak_f1600(&mut state);
     }
