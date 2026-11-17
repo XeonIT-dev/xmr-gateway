@@ -20,21 +20,30 @@ pub struct RpcHealthStatus {
     pub error: Option<String>,
 }
 
-/// Public healthcheck response returned by `GET /health`.
+/// Public / authenticated healthcheck response returned by `GET /health` (`XMR-033`).
+///
+/// Unauthenticated callers receive only `status` (`"ok" | "degraded" | "unhealthy"`).
+/// Detailed telemetry fields (`service`, `version`, `database`, `monero_rpc`, `auto_sweep_enabled`)
+/// are populated exclusively when the caller authenticates with a valid `X-API-Key`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
     /// Overall gateway status (`"ok"` when DB and RPC are healthy, `"degraded"` if RPC is down).
     pub status: String,
-    /// Service name.
-    pub service: String,
-    /// Crate version from `Cargo.toml`.
-    pub version: String,
-    /// SQLite database status (`"connected"` or `"disconnected"`).
-    pub database: String,
-    /// Live `monero-wallet-rpc` reachability snapshot.
-    pub monero_rpc: RpcHealthStatus,
-    /// Whether Hot Auto-Sweep mode (`ENABLE_AUTO_SWEEP=true`) is active.
-    pub auto_sweep_enabled: bool,
+    /// Service name (authenticated diagnostics only).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub service: Option<String>,
+    /// Crate version from `Cargo.toml` (authenticated diagnostics only).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub version: Option<String>,
+    /// SQLite database status (`"connected"` or `"disconnected"`; authenticated diagnostics only).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub database: Option<String>,
+    /// Live `monero-wallet-rpc` reachability snapshot (authenticated diagnostics only).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub monero_rpc: Option<RpcHealthStatus>,
+    /// Whether Hot Auto-Sweep mode (`ENABLE_AUTO_SWEEP=true`) is active (authenticated diagnostics only).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub auto_sweep_enabled: Option<bool>,
 }
 
 /// Request payload for `POST /api/v1/invoices`.
@@ -115,6 +124,9 @@ pub struct InvoiceTransferDto {
     pub double_spend_seen: bool,
     /// `true` if currently unconfirmed in the mempool.
     pub in_pool: bool,
+    /// `true` if this transfer vanished during a chain reorganization or was tainted (`XMR-026`).
+    #[serde(default)]
+    pub orphaned: bool,
 }
 
 impl From<&ObservedTransfer> for InvoiceTransferDto {
@@ -127,6 +139,7 @@ impl From<&ObservedTransfer> for InvoiceTransferDto {
             unlocked: tr.unlocked,
             double_spend_seen: tr.double_spend_seen,
             in_pool: tr.in_pool,
+            orphaned: tr.orphaned,
         }
     }
 }
@@ -247,4 +260,15 @@ pub struct SweepInvoiceResponse {
     pub sweep_fee_xmr_formatted: String,
     /// Timestamp when the sweep finished (UTC).
     pub swept_at: DateTime<Utc>,
+}
+
+/// Response payload returned by manual webhook recovery endpoints (`XMR-028`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryWebhookResponse {
+    /// Number of webhook outbox deliveries reset to `PENDING` for immediate retry.
+    pub retried_count: usize,
+    /// UUIDs of the queued webhook deliveries.
+    pub webhook_ids: Vec<Uuid>,
+    /// UTC timestamp when the deliveries became due.
+    pub scheduled_at: DateTime<Utc>,
 }

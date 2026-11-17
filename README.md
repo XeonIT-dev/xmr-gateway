@@ -15,8 +15,8 @@ Designed for sovereign merchants, Telegram commerce bots, and privacy-first infr
 
 - **Non-Custodial Architecture:** Funds settle directly to subaddresses derived from your own `monero-wallet-rpc` wallet. Enforces fail-closed **View-Only Zero-Trust Mode** (`WALLET_MODE=view_only`, verified against `query_key(spend_key)`) and explicit **Hot Auto-Sweep Mode** (`WALLET_MODE=hot_wallet`).
 - **Subaddress-Per-Invoice Isolation:** Each invoice allocates a unique Monero subaddress (`account_index: 0`, unique `address_index`) enforced at the SQLite schema level (`UNIQUE(account_index, address_index)`), preventing address reuse and cross-customer correlation.
-- **Strict Piconero Integer Accounting:** Floating-point arithmetic (`f32`/`f64`) is strictly banned across the entire codebase. Every amount, transfer, fee, and SQLite column uses atomic integer `Piconero(u64)` ($1\text{ XMR} = 10^{12}\text{ piconero}$) in SQLite WAL mode with `synchronous = FULL`.
-- **Reorg-Safe Payment State Machine & Continuous Subaddress Accounting:** Tracks `PENDING`, `UNDERPAID`, `MEMPOOL` (`0-conf`), `CONFIRMING` (`1..REQUIRED_CONFIRMATIONS`), `CONFIRMED` (`>= REQUIRED_CONFIRMATIONS`, default `10`), `SETTLED` (`>= SETTLEMENT_CONFIRMATIONS`, default `10`), `REORGED`, `COMPLETED`, `SWEPT`, and `EXPIRED`, plus `LATE_PAYMENT` and `OVERPAYMENT` ledger tracking for `SUBADDRESS_MONITOR_DAYS` (`90` days default).
+- **Strict Piconero Integer Accounting:** Floating-point arithmetic (`f32`/`f64`) is strictly banned across the entire codebase. Every amount, transfer, fee, and SQLite column uses atomic integer `Piconero(u64)` ($1\text{ XMR} = 10^{12}\text{ piconero}$) in SQLite WAL mode with `synchronous = FULL`, `0700`/`0600` filesystem hardening, and multi-output batched transaction accuracy (`UNIQUE(invoice_id, txid)`).
+- **Reorg-Safe Payment State Machine & Continuous Subaddress Accounting:** Tracks `PENDING`, `UNDERPAID`, `MEMPOOL` (`0-conf`), `CONFIRMING` (`1..REQUIRED_CONFIRMATIONS`), `CONFIRMED` (`>= REQUIRED_CONFIRMATIONS`, default `10`), `SETTLED` (`>= SETTLEMENT_CONFIRMATIONS`, default `10`), `REORGED`, `COMPLETED`, `SWEPT`, and `EXPIRED`, plus `LATE_PAYMENT` and `OVERPAYMENT` ledger tracking across all subaddresses (`SUBADDRESS_MONITOR_DAYS=0` continuous monitoring by default), epoch-scoped webhook recovery after reorgs, and `ACTIVE` / `ORPHANED` / `SWEPT` audit states.
 - **Double-Spend Protection & Crash-Safe Sweeps:** Outputs flagged `double_spend_seen == true` are excluded from paid totals. Isolated `sweep_all` operations record durable `sweep_attempts` (`PREPARED` → `SUBMITTED` → `CONFIRMED` / `RECONCILED` | `FAILED`) so crashed sweeps recover via `get_transfers(out, pending)` without double-sweeping.
 - **SSRF-Hardened Durable HMAC-SHA256 Webhooks:** Outbound `callback_url` targets undergo IP/DNS SSRF filtering (`ALLOW_PRIVATE_WEBHOOKS=false`, `REQUIRE_HTTPS_WEBHOOKS`), connection-time socket pinning against DNS rebinding, zero redirect following, and SQLite WAL outbox retries (`5s` up to `3600s`, 10 attempts).
 - **Constant-Time API Authentication:** `/api/v1/*` routes verify `X-API-Key` by hashing both presented and expected secrets with SHA-256 before `subtle::ConstantTimeEq` comparison, preventing length timing side-channels.
@@ -190,12 +190,15 @@ To test end-to-end payments with free Stagenet faucet coins in one terminal (wit
 
 All `/api/v1/*` endpoints require header `X-API-Key: <API_SECRET_KEY>`.
 
-### `GET /health` (Public)
+### `GET /health` (Public Minified / Authenticated Detailed)
 
-Checks SQLite database readiness and probes `monero-wallet-rpc` (`get_version`) with a 3-second timeout.
+Unauthenticated requests return ONLY `{"status": "ok" | "degraded" | "unhealthy"}` without leaking version, database, or RPC details (`XMR-033`). Passing a valid `X-API-Key` header returns full service, database, RPC, and auto-sweep diagnostics:
 
 ```bash
 curl -s http://127.0.0.1:8080/health | jq .
+# -> {"status": "ok"}
+
+curl -s -H "X-API-Key: ${API_SECRET_KEY}" http://127.0.0.1:8080/health | jq .
 ```
 
 ```json
@@ -215,7 +218,7 @@ curl -s http://127.0.0.1:8080/health | jq .
 
 ### `POST /api/v1/invoices`
 
-Creates a dedicated subaddress invoice and Base64-encoded PNG QR code. Enforces atomic per-`order_id` serialization and parameter-verified idempotency (`XMR-019`): retrying with identical `(order_id, amount_piconero, effective callback_url)` returns `200 OK` with the existing invoice without allocating a second subaddress, whereas reusing an `order_id` with different parameters returns `409 Conflict`.
+Creates a dedicated subaddress invoice and Base64-encoded PNG QR code. Enforces atomic per-`order_id` serialization and parameter-verified idempotency (`XMR-019` / `XMR-029`): retrying with identical `(order_id, amount_piconero, ttl_seconds, effective callback_url)` returns `200 OK` with the existing invoice without allocating a second subaddress, whereas reusing an `order_id` with different parameters (including changed `ttl_seconds`) returns `409 Conflict`. Note: first-request parameters remain bound even after `EXPIRED`.
 
 ```bash
 curl -s -X POST http://127.0.0.1:8080/api/v1/invoices \
@@ -259,11 +262,40 @@ curl -s http://127.0.0.1:8080/api/v1/invoices/3c8e0f18-7d66-4c31-97a0-6e8df4e53c
 
 ### `POST /api/v1/invoices/{invoice_id}/sweep`
 
-Manually triggers `sweep_all` for a `CONFIRMED`/`SETTLED` and unlocked (`>= 10` confirmations) invoice, or for residual unswept `OVERPAYMENT`/`LATE_PAYMENT` inflows on `SWEPT` or `EXPIRED` invoices (preserving `EXPIRED` status on late-payment sweeps) when `ENABLE_AUTO_SWEEP=true`.
+Manually triggers `sweep_all` for a `SETTLED` and unlocked (`>= SETTLEMENT_CONFIRMATIONS` / `10+` blocks) invoice, or for residual unswept `OVERPAYMENT`/`LATE_PAYMENT` inflows on `SWEPT` or `EXPIRED` invoices (preserving `EXPIRED` status on late-payment sweeps) when `ENABLE_AUTO_SWEEP=true`.
 
 ```bash
 curl -s -X POST http://127.0.0.1:8080/api/v1/invoices/3c8e0f18-7d66-4c31-97a0-6e8df4e53c12/sweep \
   -H "X-API-Key: ${API_SECRET_KEY}" | jq .
+```
+
+### `POST /api/v1/webhooks/{webhook_id}/retry` & `POST /api/v1/invoices/{invoice_id}/webhooks/retry`
+
+Resets permanently `FAILED` (or backed-off `PENDING`) webhook outbox deliveries back to `PENDING` with `attempts = 0` for immediate asynchronous retry (`XMR-028`):
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/api/v1/invoices/3c8e0f18-7d66-4c31-97a0-6e8df4e53c12/webhooks/retry \
+  -H "X-API-Key: ${API_SECRET_KEY}" | jq .
+```
+
+---
+
+## Hardened Production Systemd Deployment (`XMR-037`)
+
+Production service profiles are provided under `deploy/systemd/`:
+
+- `deploy/systemd/monero-wallet-rpc.service`
+- `deploy/systemd/xmr-gateway.service`
+
+```bash
+sudo useradd --system --home-dir /var/lib/xmr-gateway --shell /usr/sbin/nologin xmr-gateway
+sudo install -d -o xmr-gateway -g xmr-gateway -m 0700 /var/lib/xmr-gateway /var/lib/xmr-gateway/wallet
+sudo install -d -m 0750 -o root -g xmr-gateway /etc/xmr-gateway
+sudo install -m 0640 -o root -g xmr-gateway .env /etc/xmr-gateway/xmr-gateway.env
+sudo install -m 0755 target/release/xmr-gateway /usr/local/bin/xmr-gateway
+sudo cp deploy/systemd/*.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now monero-wallet-rpc xmr-gateway
 ```
 
 ---

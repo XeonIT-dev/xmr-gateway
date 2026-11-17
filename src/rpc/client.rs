@@ -27,9 +27,13 @@ use crate::{
     rpc::types::{
         CreateAddressParams, CreateAddressResponse, EmptyParams, GetTransfersParams,
         GetTransfersResponse, GetVersionResponse, JsonRpcRequest, JsonRpcResponse, QueryKeyParams,
-        QueryKeyResponse, SweepAllParams, SweepAllResponse,
+        QueryKeyResponse, SweepAllParams, SweepAllResponse, ValidateAddressParams,
+        ValidateAddressResult,
     },
 };
+
+/// Maximum permitted HTTP response body size from `monero-wallet-rpc` (16 MiB) (`XMR-032`).
+pub const MAX_RPC_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Credentials for `monero-wallet-rpc` HTTP authentication.
 #[derive(Clone)]
@@ -56,6 +60,7 @@ pub struct MoneroRpcClient {
     credentials: Option<RpcCredentials>,
     digest_cache: Arc<Mutex<Option<WwwAuthenticateHeader>>>,
     next_id: Arc<AtomicU64>,
+    max_response_bytes: usize,
 }
 
 impl MoneroRpcClient {
@@ -98,7 +103,32 @@ impl MoneroRpcClient {
             credentials,
             digest_cache: Arc::new(Mutex::new(None)),
             next_id: Arc::new(AtomicU64::new(1)),
+            max_response_bytes: MAX_RPC_RESPONSE_BYTES,
         })
+    }
+
+    /// Overrides the maximum allowed RPC HTTP response payload size (primarily for tests) (`XMR-032`).
+    #[must_use]
+    pub const fn with_max_response_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_response_bytes = max_bytes;
+        self
+    }
+
+    /// Validates an address via `monero-wallet-rpc` (`validate_address`) checking checksum and
+    /// active wallet network type (`XMR-030`).
+    ///
+    /// # Errors
+    /// Returns [`GatewayError::RpcTransport`] or [`GatewayError::Rpc`] if the RPC call fails.
+    pub async fn validate_address(&self, address: &str) -> GatewayResult<ValidateAddressResult> {
+        self.call(
+            "validate_address",
+            ValidateAddressParams {
+                address,
+                any_net_type: false,
+                allow_openalias: false,
+            },
+        )
+        .await
     }
 
     /// Queries `monero-wallet-rpc` `get_version` as a lightweight connectivity healthcheck.
@@ -291,9 +321,7 @@ impl MoneroRpcClient {
 
         let response = self.send_authenticated(&body_bytes).await?;
         let status = response.status();
-        let resp_bytes = response.bytes().await.map_err(|e| {
-            GatewayError::RpcTransport(format!("failed reading RPC response for '{method}': {e}"))
-        })?;
+        let resp_bytes = read_bounded_rpc_bytes(response, self.max_response_bytes, method).await?;
 
         if !status.is_success() {
             return Err(GatewayError::RpcTransport(format!(
@@ -429,6 +457,42 @@ impl MoneroRpcClient {
             ))
         })
     }
+}
+
+/// Reads an HTTP RPC response body up to `max_bytes`, failing fast if `Content-Length` or the
+/// streamed byte count exceeds the safety cap (`XMR-032`).
+async fn read_bounded_rpc_bytes(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+    method: &str,
+) -> GatewayResult<Vec<u8>> {
+    if let Some(len) = response.content_length()
+        && usize::try_from(len).is_ok_and(|n| n > max_bytes)
+    {
+        return Err(GatewayError::RpcTransport(format!(
+            "monero-wallet-rpc response Content-Length ({len} bytes) for '{method}' exceeds maximum allowed {max_bytes} bytes"
+        )));
+    }
+
+    let initial_cap = response
+        .content_length()
+        .and_then(|n| usize::try_from(n).ok())
+        .map_or(4096, |n| n.min(max_bytes).min(1024 * 1024));
+    let mut buf = Vec::with_capacity(initial_cap);
+
+    while let Some(chunk) = response.chunk().await.map_err(|e| {
+        GatewayError::RpcTransport(format!("failed reading RPC response for '{method}': {e}"))
+    })? {
+        let next_len = buf.len().saturating_add(chunk.len());
+        if next_len > max_bytes {
+            return Err(GatewayError::RpcTransport(format!(
+                "monero-wallet-rpc response body for '{method}' exceeded maximum allowed {max_bytes} bytes"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+
+    Ok(buf)
 }
 
 #[cfg(test)]
@@ -609,5 +673,57 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_rpc_response_body_xmr_032() {
+        let server = MockServer::start().await;
+        let large_payload = "x".repeat(4096);
+        Mock::given(method("POST"))
+            .and(path("/json_rpc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "1",
+                "result": { "key": large_payload }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = MoneroRpcClient::new(&format!("{}/json_rpc", server.uri()), None, None)
+            .unwrap()
+            .with_max_response_bytes(512);
+
+        let err = client.is_view_only_wallet().await.unwrap_err();
+        assert!(matches!(err, GatewayError::RpcTransport(_)));
+        assert!(err.to_string().contains("maximum allowed 512 bytes"));
+    }
+
+    #[tokio::test]
+    async fn validate_address_calls_monero_rpc_xmr_030() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/json_rpc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "1",
+                "result": {
+                    "valid": true,
+                    "integrated": false,
+                    "subaddress": true,
+                    "nettype": "mainnet"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client =
+            MoneroRpcClient::new(&format!("{}/json_rpc", server.uri()), None, None).unwrap();
+        let res = client
+            .validate_address("888tNkZrPN6JsEgekjMnABU4TBzc2Dt29EPAvkRxbANsAnjyPbb3iQ1YBRk1UXcdRsiKc9dhwMVgN5S9cQUiyoogDavup3H")
+            .await
+            .unwrap();
+        assert!(res.valid);
+        assert!(res.subaddress);
+        assert_eq!(res.nettype, "mainnet");
     }
 }

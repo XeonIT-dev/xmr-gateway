@@ -78,6 +78,33 @@ impl std::fmt::Debug for QueryKeyResponse {
     }
 }
 
+/// Request parameters for `validate_address` (`XMR-030`).
+#[derive(Debug, Clone, Serialize)]
+pub struct ValidateAddressParams<'a> {
+    /// Monero address string to validate.
+    pub address: &'a str,
+    /// If `true`, allow addresses from any network type (we enforce wallet nettype so keep `false`).
+    pub any_net_type: bool,
+    /// Disable OpenAlias DNS resolution on the wallet RPC server.
+    pub allow_openalias: bool,
+}
+
+/// Response from `monero-wallet-rpc` method `validate_address` (`XMR-030`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ValidateAddressResult {
+    /// `true` iff the address passes Monero Base58 checksum and network validation.
+    pub valid: bool,
+    /// `true` if this is an integrated address.
+    #[serde(default)]
+    pub integrated: bool,
+    /// `true` if this is a subaddress.
+    #[serde(default)]
+    pub subaddress: bool,
+    /// Wallet network type (`"mainnet"`, `"stagenet"`, `"testnet"`).
+    #[serde(default)]
+    pub nettype: String,
+}
+
 /// Request parameters for `create_address`.
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateAddressParams<'a> {
@@ -241,17 +268,21 @@ impl TransferEntry {
 
     /// Resolves `(subaddress_index, amount_piconero)` pairs belonging to `account_index`.
     ///
-    /// Handles both single-output transfers (`subaddr_index` + `amount`) and batched multi-output
-    /// payouts (`subaddr_indices` + `amounts`) in a single Monero transaction.
+    /// Handles single-output transfers (`subaddr_index` + `amount`), batched multi-subaddress
+    /// payouts (`subaddr_indices` + `amounts`), and multiple outputs targeting the **same**
+    /// subaddress within one transaction (`XMR-039`), summing per-subaddress amounts cleanly.
     #[must_use]
     pub fn subaddress_amounts(&self, account_index: u32) -> Vec<(u32, u64)> {
         if !self.amounts.is_empty() && self.amounts.len() == self.subaddr_indices.len() {
-            self.subaddr_indices
-                .iter()
-                .zip(self.amounts.iter())
-                .filter(|(idx, _)| idx.major == account_index)
-                .map(|(idx, &amt)| (idx.minor, amt))
-                .collect()
+            let mut summed: std::collections::BTreeMap<u32, u64> =
+                std::collections::BTreeMap::new();
+            for (idx, &amt) in self.subaddr_indices.iter().zip(self.amounts.iter()) {
+                if idx.major == account_index {
+                    let entry = summed.entry(idx.minor).or_insert(0);
+                    *entry = entry.saturating_add(amt);
+                }
+            }
+            summed.into_iter().collect()
         } else if self.subaddr_index.major == account_index {
             vec![(self.subaddr_index.minor, self.amount)]
         } else {

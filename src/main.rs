@@ -65,6 +65,16 @@ async fn run_gateway() -> GatewayResult<()> {
     )?;
     rpc.verify_wallet_mode(config.wallet_mode).await?;
 
+    if let Some(ref cold_addr) = config.cold_wallet_address {
+        let addr_check = rpc.validate_address(cold_addr).await?;
+        if !addr_check.valid {
+            return Err(GatewayError::Config(format!(
+                "COLD_WALLET_ADDRESS failed monero-wallet-rpc validate_address check for active network (nettype='{}')",
+                addr_check.nettype
+            )));
+        }
+    }
+
     let scanner = ScannerService::new(repo.clone(), rpc.clone(), config.clone());
     match scanner.reconcile_in_flight_sweeps().await {
         Ok(0) => {}

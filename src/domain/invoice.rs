@@ -266,6 +266,8 @@ pub struct Invoice {
     pub unlocked: bool,
     /// `true` if `monero-wallet-rpc` ever flagged a double-spend attempt targeting this subaddress.
     pub double_spend_seen: bool,
+    /// Monotonically incremented counter bumped each time the invoice enters `REORGED` (`XMR-025`).
+    pub reorg_epoch: u32,
     /// Current invoice lifecycle state.
     pub status: InvoiceStatus,
     /// Webhook target URL resolved at creation time (`request.callback_url` or `DEFAULT_WEBHOOK_URL`).
@@ -296,6 +298,59 @@ pub struct Invoice {
     pub swept_at: Option<DateTime<Utc>>,
     /// UTC timestamp when `COMPLETED` (View-Only mode terminal state) completed.
     pub completed_at: Option<DateTime<Utc>>,
+}
+
+impl Invoice {
+    /// Returns the original invoice time-to-live window in whole seconds (`expires_at - created_at`).
+    #[must_use]
+    pub fn ttl_seconds(&self) -> i64 {
+        (self.expires_at - self.created_at).num_seconds()
+    }
+}
+
+/// Lifecycle status of a classified ledger row in `subaddress_transfers` (`XMR-022` / `XMR-026`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SubaddressTransferStatus {
+    /// Transfer is present on the canonical chain and not yet swept to cold storage.
+    Active,
+    /// Transfer disappeared during a chain reorganization or was flagged as a double-spend.
+    Orphaned,
+    /// Transfer outputs were included in a completed cold-storage sweep.
+    Swept,
+}
+
+impl SubaddressTransferStatus {
+    /// Returns canonical uppercase database/wire representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "ACTIVE",
+            Self::Orphaned => "ORPHANED",
+            Self::Swept => "SWEPT",
+        }
+    }
+}
+
+impl fmt::Display for SubaddressTransferStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SubaddressTransferStatus {
+    type Err = DomainError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "ACTIVE" => Ok(Self::Active),
+            "ORPHANED" => Ok(Self::Orphaned),
+            "SWEPT" => Ok(Self::Swept),
+            other => Err(DomainError::Validation(format!(
+                "unknown subaddress transfer status '{other}'"
+            ))),
+        }
+    }
 }
 
 /// Classification of a confirmed incoming transfer persisted in `subaddress_transfers` (`XMR-004`).
@@ -346,7 +401,9 @@ impl FromStr for TransferClassification {
 /// Ledger entry recording a classified confirmed incoming transfer on a monitored subaddress.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubaddressTransferRecord {
-    /// Monero transaction hash (primary key in `subaddress_transfers`).
+    /// Surrogate SQLite primary key (`0` prior to database persistence).
+    pub id: i64,
+    /// Monero transaction hash (unique per `invoice_id`).
     pub txid: String,
     /// Associated invoice UUID.
     pub invoice_id: Uuid,
@@ -358,8 +415,12 @@ pub struct SubaddressTransferRecord {
     pub confirmations: u64,
     /// Accounting classification (`EXPECTED`, `LATE_PAYMENT`, `OVERPAYMENT`).
     pub classification: TransferClassification,
+    /// Lifecycle status (`ACTIVE`, `ORPHANED`, `SWEPT`).
+    pub status: SubaddressTransferStatus,
     /// Whether the funds represented by this transfer have been swept to cold storage.
     pub swept: bool,
+    /// Optional sweep attempt UUID that swept this transfer (`XMR-023`).
+    pub sweep_attempt_id: Option<Uuid>,
     /// UTC creation timestamp.
     pub created_at: DateTime<Utc>,
 }
@@ -379,6 +440,9 @@ pub struct ObservedTransfer {
     pub double_spend_seen: bool,
     /// `true` if currently unconfirmed in the mempool (`pool` list); `false` if mined (`in` list).
     pub in_pool: bool,
+    /// `true` if this transfer vanished from RPC history or was orphaned during a chain reorg (`XMR-026`).
+    #[serde(default)]
+    pub orphaned: bool,
 }
 
 /// Aggregated evaluation of all transfers observed on a single subaddress during a scan cycle.
@@ -419,8 +483,10 @@ pub fn evaluate_subaddress_transfers(
     let mut total_received = Piconero::ZERO;
 
     for transfer in transfers {
-        if transfer.double_spend_seen {
-            double_spend_seen = true;
+        if transfer.double_spend_seen || transfer.orphaned {
+            if transfer.double_spend_seen {
+                double_spend_seen = true;
+            }
             continue;
         }
         total_received = total_received.saturating_add(transfer.amount_piconero);
@@ -677,6 +743,7 @@ mod tests {
             unlocked,
             double_spend_seen: false,
             in_pool,
+            orphaned: false,
         }
     }
 

@@ -1,0 +1,46 @@
+[Unit]
+Description=xmr-gateway Non-Custodial Monero Payment Gateway
+Documentation=https://github.com/XeonIT-dev/xmr-gateway
+After=network-online.target monero-wallet-rpc.service
+Wants=network-online.target
+Requires=monero-wallet-rpc.service
+
+[Service]
+Type=simple
+User=xmr-gateway
+Group=xmr-gateway
+WorkingDirectory=/var/lib/xmr-gateway
+EnvironmentFile=/etc/xmr-gateway/xmr-gateway.env
+UMask=0077
+
+ExecStart=/usr/local/bin/xmr-gateway
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+# Systemd Sandboxing & Least-Privilege Hardening (XMR-037)
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/xmr-gateway
+
+[Install]
+WantedBy=multi-user.target

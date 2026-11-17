@@ -1,0 +1,58 @@
+[Unit]
+Description=Monero Wallet JSON-RPC Daemon for xmr-gateway
+Documentation=https://github.com/XeonIT-dev/xmr-gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xmr-gateway
+Group=xmr-gateway
+WorkingDirectory=/var/lib/xmr-gateway
+EnvironmentFile=/etc/xmr-gateway/xmr-gateway.env
+UMask=0077
+
+# Start monero-wallet-rpc bound strictly to loopback with --rpc-login enabled.
+# Operators: adjust --daemon-address / --stagenet / --proxy flags or supply via wrapper.
+ExecStart=/usr/local/bin/monero-wallet-rpc \
+  --non-interactive \
+  --no-initial-sync \
+  --untrusted-daemon \
+  --wallet-file /var/lib/xmr-gateway/wallet/gateway_wallet \
+  --password-file /var/lib/xmr-gateway/wallet/gateway_wallet.password \
+  --daemon-address ${MONERO_REMOTE_NODE} \
+  --rpc-bind-ip 127.0.0.1 \
+  --rpc-bind-port 18082 \
+  --rpc-login ${MONERO_RPC_USER}:${MONERO_RPC_PASS} \
+  --log-file /var/lib/xmr-gateway/monero-wallet-rpc.log \
+  --log-level 1
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+# Systemd Sandboxing & Least-Privilege Hardening (XMR-037)
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/xmr-gateway
+
+[Install]
+WantedBy=multi-user.target

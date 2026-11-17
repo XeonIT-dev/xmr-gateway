@@ -48,7 +48,7 @@ mod integration_tests {
                 CreateInvoiceResponse, HealthResponse, InvoiceStatusResponse, SweepInvoiceResponse,
             },
         },
-        config::{Config, LogFormat, WalletMode},
+        config::{Config, LogFormat, WalletMode, encode_monero_base58_address},
         db::{init_sqlite_pool, repository::InvoiceRepository},
         domain::invoice::InvoiceStatus,
         rpc::client::MoneroRpcClient,
@@ -76,8 +76,15 @@ mod integration_tests {
             monero_rpc_url: rpc_url,
             monero_rpc_user: None,
             monero_rpc_pass: None,
+            allow_unauthenticated_rpc: true,
+            allow_insecure_remote_rpc: false,
             cold_wallet_address: if enable_auto_sweep {
-                Some(format!("4{}", "A".repeat(94)))
+                Some(encode_monero_base58_address(
+                    18,
+                    &[0x11; 32],
+                    &[0x22; 32],
+                    None,
+                ))
             } else {
                 None
             },
@@ -129,7 +136,7 @@ mod integration_tests {
         };
         let app = build_router(state);
 
-        // 1) Public /health probe checks DB + RPC get_version
+        // 1) Public /health probe returns ONLY {"status":"ok"}; authenticated /health returns full diagnostics (XMR-033)
         Mock::given(method("POST"))
             .and(path("/json_rpc"))
             .and(body_string_contains("get_version"))
@@ -150,7 +157,32 @@ mod integration_tests {
         let health_bytes = health_resp.into_body().collect().await.unwrap().to_bytes();
         let health: HealthResponse = serde_json::from_slice(&health_bytes).unwrap();
         assert_eq!(health.status, "ok");
-        assert!(health.monero_rpc.connected);
+        assert!(health.service.is_none());
+        assert!(health.monero_rpc.is_none());
+        assert!(health.auto_sweep_enabled.is_none());
+
+        let auth_health_resp = app
+            .clone()
+            .oneshot(
+                Request::get("/health")
+                    .header("X-API-Key", cfg.api_secret_key.as_str())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(auth_health_resp.status(), StatusCode::OK);
+        let auth_health: HealthResponse = serde_json::from_slice(
+            &auth_health_resp
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(auth_health.status, "ok");
+        assert!(auth_health.monero_rpc.unwrap().connected);
 
         // 2) Missing or wrong X-API-Key rejected with 401
         let unauth_resp = app

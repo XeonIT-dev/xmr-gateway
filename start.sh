@@ -25,8 +25,12 @@ RPC_LOG_FILE="$DATA_DIR/monero-wallet-rpc.log"
 CLI_LOG_FILE="$DATA_DIR/monero-wallet-cli.log"
 GATEWAY_BIN="$SCRIPT_DIR/target/release/xmr-gateway"
 
-MONERO_CLI_URL="https://downloads.getmonero.org/cli/linux64"
+MONERO_CLI_VERSION="${MONERO_CLI_VERSION:-v0.18.5.4}"
+MONERO_CLI_SHA256="${MONERO_CLI_SHA256:-ba2928962c101b609434bf8c1b43ad59ebe96c5525977284ca599d8bf0f02d10}"
+MONERO_CLI_BASE_URL="https://downloads.getmonero.org/cli"
 MONERO_HASHES_URL="https://www.getmonero.org/downloads/hashes.txt"
+MONERO_SIGNING_KEY_FPR="81AC591FE9C4B65C5806AFC3F0AF4D462A0BDF92"
+MONERO_SIGNING_KEY_URL="https://raw.githubusercontent.com/monero-project/monero/master/utils/gpg_keys/binaryfate.asc"
 
 RPC_PID=""
 GATEWAY_PID=""
@@ -259,26 +263,51 @@ download_and_verify_monero_cli() {
     tmp_dir="$(mktemp -d)"
     trap "rm -rf '$tmp_dir'" RETURN
 
-    log_info "Resolving latest official Monero CLI Linux x64 release..."
-    local effective_url tarball_name expected_sha256
-    effective_url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$MONERO_CLI_URL")"
-    tarball_name="$(basename "$effective_url")"
+    local tarball_name download_url expected_sha256
+    tarball_name="monero-linux-x64-${MONERO_CLI_VERSION}.tar.bz2"
+    download_url="${MONERO_CLI_BASE_URL}/${tarball_name}"
 
-    log_info "Fetching official SHA256 checksums from getmonero.org..."
-    curl -fsSL "$MONERO_HASHES_URL" -o "$tmp_dir/hashes.txt"
-    expected_sha256="$(awk -v file="$tarball_name" '$2 == file { print $1; exit }' "$tmp_dir/hashes.txt")"
+    if [[ "$MONERO_CLI_VERSION" == "v0.18.5.4" && -n "${MONERO_CLI_SHA256:-}" ]]; then
+        expected_sha256="$MONERO_CLI_SHA256"
+        log_info "Using pinned Monero CLI release ${MONERO_CLI_VERSION} (SHA256: ${expected_sha256})."
+    elif [[ -n "${MONERO_CLI_SHA256:-}" ]]; then
+        expected_sha256="$MONERO_CLI_SHA256"
+        log_info "Using operator-pinned Monero CLI ${MONERO_CLI_VERSION} (SHA256: ${expected_sha256})."
+    else
+        require_cmd gpg
+        local gnupghome="$tmp_dir/gnupg"
+        mkdir -p "$gnupghome"
+        chmod 700 "$gnupghome"
+
+        log_info "Fetching Monero release signing key (${MONERO_SIGNING_KEY_FPR})..."
+        curl -fsSL "$MONERO_SIGNING_KEY_URL" -o "$tmp_dir/binaryfate.asc"
+        if ! gpg --homedir "$gnupghome" --show-keys --with-colons "$tmp_dir/binaryfate.asc" | grep -q "fpr:::::::::${MONERO_SIGNING_KEY_FPR}:"; then
+            log_err "GPG key fingerprint mismatch for binaryfate.asc! Expected ${MONERO_SIGNING_KEY_FPR}."
+            exit 1
+        fi
+        gpg --homedir "$gnupghome" --batch --import "$tmp_dir/binaryfate.asc" >/dev/null 2>&1
+
+        log_info "Fetching and GPG-verifying official hashes.txt from getmonero.org..."
+        curl -fsSL "$MONERO_HASHES_URL" -o "$tmp_dir/hashes.txt"
+        if ! gpg --homedir "$gnupghome" --batch --status-fd=1 --verify "$tmp_dir/hashes.txt" 2>/dev/null | grep -q "VALIDSIG .* ${MONERO_SIGNING_KEY_FPR}"; then
+            log_err "GPG signature verification failed for hashes.txt! Refusing unauthenticated download."
+            exit 1
+        fi
+        expected_sha256="$(awk -v file="$tarball_name" '$2 == file { print $1; exit }' "$tmp_dir/hashes.txt")"
+    fi
 
     if [[ ! "$expected_sha256" =~ ^[0-9a-fA-F]{64}$ ]]; then
-        log_err "Failed to locate valid SHA256 digest for '$tarball_name' in hashes.txt."
+        log_err "Invalid or missing SHA256 digest for '$tarball_name'."
         exit 1
     fi
 
-    log_info "Downloading $tarball_name..."
-    curl -fSL --progress-bar "$effective_url" -o "$tmp_dir/$tarball_name"
+    log_info "Downloading $tarball_name from $download_url..."
+    curl -fSL --progress-bar "$download_url" -o "$tmp_dir/$tarball_name"
 
     log_info "Verifying SHA256 checksum ($expected_sha256)..."
     if ! (cd "$tmp_dir" && printf '%s  %s\n' "$expected_sha256" "$tarball_name" | sha256sum -c -); then
-        log_err "SHA256 verification failed for $tarball_name! Aborting."
+        log_err "SHA256 verification failed for $tarball_name! Removing corrupted archive and aborting."
+        rm -f "$tmp_dir/$tarball_name"
         exit 1
     fi
 
@@ -318,7 +347,7 @@ ensure_monero_binaries() {
     cat >&2 <<EOF
 Please install monero-wallet-rpc and monero-wallet-cli manually, or run:
   ./start.sh --setup-rpc
-Official download: $MONERO_CLI_URL
+Pinned release:    ${MONERO_CLI_BASE_URL}/monero-linux-x64-${MONERO_CLI_VERSION}.tar.bz2
 SHA256 checksums:  $MONERO_HASHES_URL
 EOF
     exit 1
@@ -436,11 +465,11 @@ start_monero_wallet_rpc() {
         rpc_args+=(--stagenet)
     fi
 
-    if [[ -n "${MONERO_RPC_USER:-}" ]]; then
-        rpc_args+=(--rpc-login "${MONERO_RPC_USER}:${MONERO_RPC_PASS}")
-    else
-        rpc_args+=(--disable-rpc-login)
+    if [[ -z "${MONERO_RPC_USER:-}" || -z "${MONERO_RPC_PASS:-}" ]]; then
+        log_err "MONERO_RPC_USER and MONERO_RPC_PASS must both be set (unauthenticated monero-wallet-rpc is forbidden)."
+        exit 1
     fi
+    rpc_args+=(--rpc-login "${MONERO_RPC_USER}:${MONERO_RPC_PASS}")
 
     if [[ -n "${MONERO_RPC_PROXY:-}" ]]; then
         log_info "Routing monero-wallet-rpc daemon traffic via SOCKS5 proxy: $MONERO_RPC_PROXY"

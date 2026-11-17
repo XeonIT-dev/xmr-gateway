@@ -112,6 +112,10 @@ pub struct Config {
     pub monero_rpc_user: Option<String>,
     /// Optional RPC password for `--rpc-login` Digest/Basic authentication.
     pub monero_rpc_pass: Option<String>,
+    /// Explicit override allowing unauthenticated `monero-wallet-rpc` connections (`false` in production).
+    pub allow_unauthenticated_rpc: bool,
+    /// Explicit override allowing cleartext `http://` to non-loopback `MONERO_RPC_URL` hosts (`false` in production).
+    pub allow_insecure_remote_rpc: bool,
     /// Destination Monero address for automated and manual sweeps.
     pub cold_wallet_address: Option<String>,
     /// Custody mode enforced against `monero-wallet-rpc` at startup (`view_only` | `hot_wallet`).
@@ -159,6 +163,8 @@ impl fmt::Debug for Config {
                 "monero_rpc_pass",
                 &self.monero_rpc_pass.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("allow_unauthenticated_rpc", &self.allow_unauthenticated_rpc)
+            .field("allow_insecure_remote_rpc", &self.allow_insecure_remote_rpc)
             .field("cold_wallet_address", &self.cold_wallet_address)
             .field("wallet_mode", &self.wallet_mode)
             .field("monero_trusted_daemon", &self.monero_trusted_daemon)
@@ -208,6 +214,8 @@ impl Config {
         let monero_rpc_url = env_or_default("MONERO_RPC_URL", "http://127.0.0.1:18082/json_rpc");
         let monero_rpc_user = optional_non_empty_env("MONERO_RPC_USER");
         let monero_rpc_pass = optional_non_empty_env("MONERO_RPC_PASS");
+        let allow_unauthenticated_rpc = parse_env_bool("ALLOW_UNAUTHENTICATED_RPC", false)?;
+        let allow_insecure_remote_rpc = parse_env_bool("ALLOW_INSECURE_REMOTE_RPC", false)?;
         let cold_wallet_address = optional_non_empty_env("COLD_WALLET_ADDRESS");
         let enable_auto_sweep = parse_env_bool("ENABLE_AUTO_SWEEP", false)?;
         let wallet_mode = match optional_non_empty_env("WALLET_MODE") {
@@ -250,6 +258,8 @@ impl Config {
             monero_rpc_url,
             monero_rpc_user,
             monero_rpc_pass,
+            allow_unauthenticated_rpc,
+            allow_insecure_remote_rpc,
             cold_wallet_address,
             wallet_mode,
             monero_trusted_daemon,
@@ -289,7 +299,14 @@ impl Config {
         validate_secret("API_SECRET_KEY", &self.api_secret_key)?;
         validate_secret("WEBHOOK_SECRET", &self.webhook_secret)?;
 
-        validate_http_url(&self.monero_rpc_url, "MONERO_RPC_URL")?;
+        let rpc_url = validate_http_url(&self.monero_rpc_url, "MONERO_RPC_URL")?;
+        validate_rpc_security(
+            &rpc_url,
+            self.monero_rpc_user.as_deref(),
+            self.monero_rpc_pass.as_deref(),
+            self.allow_unauthenticated_rpc,
+            self.allow_insecure_remote_rpc,
+        )?;
 
         if let Some(ref webhook_url) = self.default_webhook_url {
             validate_webhook_url_static(
@@ -410,18 +427,85 @@ pub fn validate_http_url(raw: &str, field_name: &str) -> GatewayResult<Url> {
     Ok(parsed)
 }
 
-/// Validates structural properties of a Monero address (mainnet, stagenet, or testnet).
+/// Validates RPC authentication and transport security policies (`XMR-031`).
+fn validate_rpc_security(
+    rpc_url: &Url,
+    rpc_user: Option<&str>,
+    rpc_pass: Option<&str>,
+    allow_unauthenticated_rpc: bool,
+    allow_insecure_remote_rpc: bool,
+) -> GatewayResult<()> {
+    if !allow_unauthenticated_rpc {
+        let user = rpc_user
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                GatewayError::Config(
+                    "MONERO_RPC_USER is required when ALLOW_UNAUTHENTICATED_RPC=false".to_string(),
+                )
+            })?;
+        let pass = rpc_pass
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                GatewayError::Config(
+                    "MONERO_RPC_PASS is required when ALLOW_UNAUTHENTICATED_RPC=false".to_string(),
+                )
+            })?;
+        if user == pass {
+            return Err(GatewayError::Config(
+                "MONERO_RPC_PASS must differ from MONERO_RPC_USER".to_string(),
+            ));
+        }
+        let lower = pass.to_ascii_lowercase();
+        if lower.starts_with("replace-with-")
+            || lower.starts_with("changeme")
+            || lower.starts_with("example-")
+            || matches!(lower.as_str(), "password" | "admin" | "123456" | "monero")
+        {
+            return Err(GatewayError::Config(
+                "MONERO_RPC_PASS contains a placeholder or weak password; generate a random secret"
+                    .to_string(),
+            ));
+        }
+        if pass.len() < 16 {
+            return Err(GatewayError::Config(format!(
+                "MONERO_RPC_PASS must be at least 16 characters long (got {})",
+                pass.len()
+            )));
+        }
+    }
+
+    if !allow_insecure_remote_rpc && rpc_url.scheme() == "http" {
+        let host = rpc_url.host_str().unwrap_or_default();
+        let host_unbracketed = host.trim_start_matches('[').trim_end_matches(']');
+        let is_loopback = host_unbracketed.eq_ignore_ascii_case("localhost")
+            || host_unbracketed
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback());
+        if !is_loopback {
+            return Err(GatewayError::Config(format!(
+                "cleartext HTTP MONERO_RPC_URL targeting non-loopback host '{host}' is forbidden unless ALLOW_INSECURE_REMOTE_RPC=true (use https:// or an SSH/WireGuard loopback tunnel)"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Validates structural and cryptographic properties of a Monero address (`XMR-030`).
 ///
 /// Checks:
-/// - Length is `95` (standard primary address or subaddress) or `106` (integrated address).
-/// - Leading character matches Monero network prefix bytes:
-///   - Mainnet: `4` (primary/integrated), `8` (subaddress)
-///   - Stagenet: `5` (primary/integrated), `7` (subaddress)
-///   - Testnet: `9` / `A` (primary/integrated), `B` (subaddress)
-/// - Every character belongs to the Monero Base58 alphabet.
+/// - No leading/trailing whitespace and exact length `95` (standard/subaddress) or `106` (integrated).
+/// - Strictly valid Monero Base58 block decoding into `69` or `77` bytes.
+/// - Valid Monero network prefix byte:
+///   - Mainnet: `18` (primary), `42` (subaddress), `19` (integrated)
+///   - Stagenet: `24` (primary), `36` (subaddress), `25` (integrated)
+///   - Testnet: `53` (primary), `63` (subaddress), `54` (integrated)
+/// - Cryptographic 4-byte Keccak-256 checksum matches the payload prefix.
 ///
 /// # Errors
-/// Returns a descriptive error string if any structural rule fails.
+/// Returns a descriptive error string if any structural or cryptographic checksum check fails.
 pub fn validate_monero_address(address: &str) -> Result<(), String> {
     let trimmed = address.trim();
     if trimmed != address || trimmed.is_empty() {
@@ -435,22 +519,237 @@ pub fn validate_monero_address(address: &str) -> Result<(), String> {
         ));
     }
 
-    let valid_prefix = matches!(
-        trimmed.chars().next(),
-        Some('4' | '8' | '5' | '7' | '9' | 'A' | 'B')
-    );
-    if !valid_prefix {
-        return Err(
-            "invalid Monero address prefix: expected mainnet (4/8), stagenet (5/7), or testnet (9/A/B)"
-                .to_string(),
-        );
+    let decoded = decode_monero_base58(trimmed)?;
+    let expected_byte_len = if len == 95 { 69 } else { 77 };
+    if decoded.len() != expected_byte_len {
+        return Err(format!(
+            "invalid decoded Monero address byte length {}: expected {expected_byte_len}",
+            decoded.len()
+        ));
     }
 
-    if !trimmed.chars().all(|c| MONERO_BASE58_ALPHABET.contains(c)) {
-        return Err("Monero address contains invalid non-Base58 characters".to_string());
+    let net_byte = decoded[0];
+    let valid_network = match len {
+        95 => matches!(net_byte, 18 | 42 | 24 | 36 | 53 | 63),
+        106 => matches!(net_byte, 19 | 25 | 54),
+        _ => false,
+    };
+    if !valid_network {
+        return Err(format!(
+            "invalid Monero network prefix byte {net_byte} for {len}-char address"
+        ));
+    }
+
+    let (payload, checksum) = decoded.split_at(decoded.len() - 4);
+    let expected_hash = keccak256(payload);
+    if checksum != &expected_hash[..4] {
+        return Err("Monero address failed Keccak-256 4-byte checksum verification".to_string());
     }
 
     Ok(())
+}
+
+/// Encodes a deterministic checksum-valid Monero Base58 address from network tag and public keys.
+///
+/// Intended for test fixtures across mainnet (`18`/`42`/`19`), stagenet (`24`/`36`/`25`), and testnet.
+#[must_use]
+pub fn encode_monero_base58_address(
+    network_byte: u8,
+    spend_key: &[u8; 32],
+    view_key: &[u8; 32],
+    payment_id: Option<&[u8; 8]>,
+) -> String {
+    let mut payload = Vec::with_capacity(if payment_id.is_some() { 77 } else { 69 });
+    payload.push(network_byte);
+    payload.extend_from_slice(spend_key);
+    payload.extend_from_slice(view_key);
+    if let Some(pid) = payment_id {
+        payload.extend_from_slice(pid);
+    }
+    let checksum = keccak256(&payload);
+    payload.extend_from_slice(&checksum[..4]);
+    encode_monero_base58(&payload)
+}
+
+fn monero_encoded_block_len(byte_len: usize) -> Option<usize> {
+    match byte_len {
+        0 => Some(0),
+        1 => Some(2),
+        2 => Some(3),
+        3 => Some(5),
+        4 => Some(6),
+        5 => Some(7),
+        6 => Some(9),
+        7 => Some(10),
+        8 => Some(11),
+        _ => None,
+    }
+}
+
+fn monero_decoded_block_len(char_len: usize) -> Option<usize> {
+    match char_len {
+        0 => Some(0),
+        2 => Some(1),
+        3 => Some(2),
+        5 => Some(3),
+        6 => Some(4),
+        7 => Some(5),
+        9 => Some(6),
+        10 => Some(7),
+        11 => Some(8),
+        _ => None,
+    }
+}
+
+fn decode_monero_base58(input: &str) -> Result<Vec<u8>, String> {
+    let bytes = input.as_bytes();
+    let alphabet = MONERO_BASE58_ALPHABET.as_bytes();
+    let mut out = Vec::with_capacity((bytes.len() / 11 + 1) * 8);
+
+    for chunk in bytes.chunks(11) {
+        let out_bytes = monero_decoded_block_len(chunk.len()).ok_or_else(|| {
+            format!(
+                "invalid Monero Base58 block character length {}",
+                chunk.len()
+            )
+        })?;
+        let mut acc: u64 = 0;
+        for &ch in chunk {
+            let digit = alphabet.iter().position(|&a| a == ch).ok_or_else(|| {
+                "Monero address contains invalid non-Base58 characters".to_string()
+            })? as u64;
+            acc = acc
+                .checked_mul(58)
+                .and_then(|v| v.checked_add(digit))
+                .ok_or_else(|| "Monero Base58 block overflow".to_string())?;
+        }
+        if out_bytes < 8 && (acc >> (out_bytes * 8)) != 0 {
+            return Err("non-canonical Monero Base58 tail block".to_string());
+        }
+        let be = acc.to_be_bytes();
+        out.extend_from_slice(&be[8 - out_bytes..]);
+    }
+
+    Ok(out)
+}
+
+fn encode_monero_base58(data: &[u8]) -> String {
+    let alphabet = MONERO_BASE58_ALPHABET.as_bytes();
+    let mut out = String::with_capacity((data.len() / 8 + 1) * 11);
+
+    for chunk in data.chunks(8) {
+        let char_len = monero_encoded_block_len(chunk.len()).unwrap_or(11);
+        let mut be = [0_u8; 8];
+        be[8 - chunk.len()..].copy_from_slice(chunk);
+        let mut acc = u64::from_be_bytes(be);
+        let mut block = vec![b'1'; char_len];
+        for idx in (0..char_len).rev() {
+            let rem = usize::try_from(acc % 58).unwrap_or(0);
+            block[idx] = alphabet[rem];
+            acc /= 58;
+        }
+        out.push_str(&String::from_utf8_lossy(&block));
+    }
+
+    out
+}
+
+/// Computes original Keccak-256 (`0x01` domain padding, NOT FIPS-202 SHA3-256) used by Monero.
+#[must_use]
+pub fn keccak256(input: &[u8]) -> [u8; 32] {
+    const RATE_BYTES: usize = 136;
+    const KECCAK_RC: [u64; 24] = [
+        0x0000_0000_0000_0001,
+        0x0000_0000_0000_8082,
+        0x8000_0000_0000_808a,
+        0x8000_0000_8000_8000,
+        0x0000_0000_0000_808b,
+        0x0000_0000_8000_0001,
+        0x8000_0000_8000_8081,
+        0x8000_0000_0000_8009,
+        0x0000_0000_0000_008a,
+        0x0000_0000_0000_0088,
+        0x0000_0000_8000_8009,
+        0x0000_0000_8000_000a,
+        0x0000_0000_8000_808b,
+        0x8000_0000_0000_008b,
+        0x8000_0000_0000_8089,
+        0x8000_0000_0000_8003,
+        0x8000_0000_0000_8002,
+        0x8000_0000_0000_0080,
+        0x0000_0000_0000_800a,
+        0x8000_0000_8000_000a,
+        0x8000_0000_8000_8081,
+        0x8000_0000_0000_8080,
+        0x0000_0000_8000_0001,
+        0x8000_0000_8000_8008,
+    ];
+    const RHO: [u32; 25] = [
+        0, 1, 62, 28, 27, // y = 0
+        36, 44, 6, 55, 20, // y = 1
+        3, 10, 43, 25, 39, // y = 2
+        41, 45, 15, 21, 8, // y = 3
+        18, 2, 61, 56, 14, // y = 4
+    ];
+
+    fn keccak_f1600(state: &mut [u64; 25]) {
+        for &rc in &KECCAK_RC {
+            let mut c = [0_u64; 5];
+            for x in 0..5 {
+                c[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
+            }
+            for x in 0..5 {
+                let d = c[(x + 4) % 5] ^ c[(x + 1) % 5].rotate_left(1);
+                for y in 0..5 {
+                    state[x + 5 * y] ^= d;
+                }
+            }
+
+            let mut b = [0_u64; 25];
+            for y in 0..5 {
+                for x in 0..5 {
+                    let idx = x + 5 * y;
+                    b[y + 5 * ((2 * x + 3 * y) % 5)] = state[idx].rotate_left(RHO[idx]);
+                }
+            }
+
+            for y in 0..5 {
+                for x in 0..5 {
+                    state[x + 5 * y] =
+                        b[x + 5 * y] ^ ((!b[((x + 1) % 5) + 5 * y]) & b[((x + 2) % 5) + 5 * y]);
+                }
+            }
+
+            state[0] ^= rc;
+        }
+    }
+
+    let mut state = [0_u64; 25];
+    let mut padded = Vec::with_capacity(input.len() + RATE_BYTES);
+    padded.extend_from_slice(input);
+    padded.push(0x01);
+    let rem = padded.len() % RATE_BYTES;
+    if rem != 0 {
+        padded.resize(padded.len() + (RATE_BYTES - rem), 0);
+    }
+    if let Some(last) = padded.last_mut() {
+        *last |= 0x80;
+    }
+
+    for block in padded.chunks_exact(RATE_BYTES) {
+        for (word_idx, lane) in block.chunks_exact(8).enumerate() {
+            let mut bytes = [0_u8; 8];
+            bytes.copy_from_slice(lane);
+            state[word_idx] ^= u64::from_le_bytes(bytes);
+        }
+        keccak_f1600(&mut state);
+    }
+
+    let mut out = [0_u8; 32];
+    for (i, &word) in state.iter().take(4).enumerate() {
+        out[i * 8..(i + 1) * 8].copy_from_slice(&word.to_le_bytes());
+    }
+    out
 }
 
 /// Validates that a cryptographic secret is non-empty, at least 32 bytes, and not an
@@ -558,6 +857,8 @@ mod tests {
             monero_rpc_url: "http://127.0.0.1:18082/json_rpc".to_string(),
             monero_rpc_user: Some("rpcuser".to_string()),
             monero_rpc_pass: Some("super-secret-rpc-pass".to_string()),
+            allow_unauthenticated_rpc: false,
+            allow_insecure_remote_rpc: false,
             cold_wallet_address: None,
             wallet_mode: WalletMode::ViewOnly,
             monero_trusted_daemon: false,
@@ -575,7 +876,7 @@ mod tests {
     }
 
     fn valid_mainnet_address() -> String {
-        format!("4{}", "A".repeat(94))
+        encode_monero_base58_address(18, &[0x11; 32], &[0x22; 32], None)
     }
 
     #[test]
@@ -636,15 +937,64 @@ mod tests {
     }
 
     #[test]
-    fn monero_address_validation_checks_prefixes_and_base58() {
-        assert!(validate_monero_address(&format!("4{}", "2".repeat(94))).is_ok());
-        assert!(validate_monero_address(&format!("8{}", "3".repeat(94))).is_ok());
-        assert!(validate_monero_address(&format!("5{}", "4".repeat(94))).is_ok());
-        assert!(validate_monero_address(&format!("7{}", "5".repeat(94))).is_ok());
-        assert!(validate_monero_address(&format!("4{}", "3".repeat(105))).is_ok());
-        // '0', 'O', 'I', 'l' are invalid in Base58
+    fn monero_address_validation_checks_keccak_checksum_and_networks() {
+        // Known empty Keccak-256 test vector (distinct from FIPS-202 SHA3-256)
+        assert_eq!(
+            hex::encode(keccak256(b"")),
+            "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+        );
+
+        // Real Monero mainnet subaddress from protocol test vector
+        assert!(validate_monero_address(
+            "888tNkZrPN6JsEgekjMnABU4TBzc2Dt29EPAvkRxbANsAnjyPbb3iQ1YBRk1UXcdRsiKc9dhwMVgN5S9cQUiyoogDavup3H"
+        ).is_ok());
+
+        // Generated checksum-valid mainnet, subaddress, stagenet, testnet, and integrated addresses
+        let mainnet = encode_monero_base58_address(18, &[0x11; 32], &[0x22; 32], None);
+        let subaddr = encode_monero_base58_address(42, &[0x33; 32], &[0x44; 32], None);
+        let stagenet = encode_monero_base58_address(24, &[0x55; 32], &[0x66; 32], None);
+        let stage_sub = encode_monero_base58_address(36, &[0x77; 32], &[0x88; 32], None);
+        let integrated =
+            encode_monero_base58_address(19, &[0x11; 32], &[0x22; 32], Some(&[0xaa; 8]));
+
+        assert!(validate_monero_address(&mainnet).is_ok());
+        assert!(validate_monero_address(&subaddr).is_ok());
+        assert!(validate_monero_address(&stagenet).is_ok());
+        assert!(validate_monero_address(&stage_sub).is_ok());
+        assert!(validate_monero_address(&integrated).is_ok());
+
+        // Single-character mutation in valid address MUST fail Keccak-256 checksum check (XMR-030)
+        let mut mutated = mainnet.clone();
+        let last = mutated.pop().unwrap();
+        mutated.push(if last == 'A' { 'B' } else { 'A' });
+        assert!(validate_monero_address(&mutated).is_err());
+
+        // Repeated dummy Base58 strings with fake prefixes MUST fail checksum validation
+        assert!(validate_monero_address(&format!("4{}", "2".repeat(94))).is_err());
         assert!(validate_monero_address(&format!("40{}", "A".repeat(93))).is_err());
         assert!(validate_monero_address("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh").is_err());
+    }
+
+    #[test]
+    fn rpc_auth_and_cleartext_remote_policy_enforced() {
+        // XMR-031: Missing RPC credentials fails closed when ALLOW_UNAUTHENTICATED_RPC=false
+        let mut no_auth = sample_valid_config();
+        no_auth.monero_rpc_user = None;
+        no_auth.monero_rpc_pass = None;
+        assert!(no_auth.validate().is_err());
+
+        // Explicit opt-in permits unauthenticated loopback RPC (e.g. local isolated tests)
+        no_auth.allow_unauthenticated_rpc = true;
+        assert!(no_auth.validate().is_ok());
+
+        // XMR-031: Non-loopback cleartext HTTP RPC rejected unless explicitly overridden
+        let mut remote_http = sample_valid_config();
+        remote_http.monero_rpc_url = "http://192.168.1.50:18082/json_rpc".to_string();
+        assert!(remote_http.validate().is_err());
+
+        // TLS remote RPC is allowed
+        remote_http.monero_rpc_url = "https://rpc.internal.example:18082/json_rpc".to_string();
+        assert!(remote_http.validate().is_ok());
     }
 
     #[test]

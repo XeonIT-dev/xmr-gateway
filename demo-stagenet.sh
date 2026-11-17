@@ -164,11 +164,11 @@ main() {
     else
         rpc_args+=(--untrusted-daemon)
     fi
-    if [[ -n "$MONERO_RPC_USER" ]]; then
-        rpc_args+=(--rpc-login "${MONERO_RPC_USER}:${MONERO_RPC_PASS}")
-    else
-        rpc_args+=(--disable-rpc-login)
+    if [[ -z "${MONERO_RPC_USER:-}" || -z "${MONERO_RPC_PASS:-}" ]]; then
+        demo_err "MONERO_RPC_USER and MONERO_RPC_PASS must both be set in .env (unauthenticated monero-wallet-rpc is forbidden)."
+        exit 1
     fi
+    rpc_args+=(--rpc-login "${MONERO_RPC_USER}:${MONERO_RPC_PASS}")
     if [[ -n "${MONERO_RPC_PROXY:-}" ]]; then
         rpc_args+=(--proxy "$MONERO_RPC_PROXY")
     fi

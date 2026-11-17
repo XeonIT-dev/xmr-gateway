@@ -8,6 +8,7 @@ use std::{sync::Arc, time::Duration};
 
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     http::{HeaderName, HeaderValue, Method, StatusCode, header},
     middleware as axum_mw,
     routing::{get, post},
@@ -38,8 +39,11 @@ pub struct AppState {
     pub scanner: ScannerService,
 }
 
+/// Maximum permitted HTTP JSON request body size (64 KiB) (`XMR-038`).
+pub const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
+
 /// Constructs the complete Axum [`Router`] with public healthcheck, authenticated `/api/v1/*`
-/// endpoints, sensitive header redaction, request timeouts, CORS, and structured HTTP tracing.
+/// endpoints, sensitive header redaction, request body bounds, timeouts, CORS, and tracing.
 pub fn build_router(state: AppState) -> Router {
     let protected_v1 = Router::new()
         .route("/invoices", post(handlers::create_invoice))
@@ -47,6 +51,14 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/invoices/{invoice_id}/sweep",
             post(handlers::sweep_invoice),
+        )
+        .route(
+            "/invoices/{invoice_id}/webhooks/retry",
+            post(handlers::retry_invoice_webhooks),
+        )
+        .route(
+            "/webhooks/{webhook_id}/retry",
+            post(handlers::retry_webhook),
         )
         .route_layer(axum_mw::from_fn_with_state(
             state.clone(),
@@ -61,6 +73,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(handlers::health_check))
         .nest("/api/v1", protected_v1)
         .with_state(state)
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(30),

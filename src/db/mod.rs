@@ -20,7 +20,7 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use sqlx::{
     SqlitePool,
@@ -125,6 +125,7 @@ pub async fn init_sqlite_pool(database_url: &str) -> GatewayResult<SqlitePool> {
         .await?;
 
     sqlx::migrate!("./migrations").run(&pool).await?;
+    enforce_sqlite_file_permissions(database_url)?;
 
     Ok(pool)
 }
@@ -163,7 +164,49 @@ fn ensure_sqlite_parent_dir(database_url: &str) -> GatewayResult<()> {
                 parent.display()
             ))
         })?;
+        #[cfg(unix)]
+        if parent != Path::new("/")
+            && parent != Path::new("/tmp")
+            && parent != Path::new("/var/tmp")
+        {
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                |err| {
+                    GatewayError::Config(format!(
+                        "failed to enforce 0700 permissions on SQLite directory '{}': {err}",
+                        parent.display()
+                    ))
+                },
+            )?;
+        }
     }
+
+    Ok(())
+}
+
+/// Enforces restrictive `0600` owner-only permissions on `.db`, `-wal`, and `-shm` files (`XMR-040`).
+fn enforce_sqlite_file_permissions(database_url: &str) -> GatewayResult<()> {
+    #[cfg(unix)]
+    if let Some(db_path) = sqlite_file_path(database_url) {
+        let candidates = [
+            db_path.clone(),
+            PathBuf::from(format!("{}-wal", db_path.display())),
+            PathBuf::from(format!("{}-shm", db_path.display())),
+        ];
+        for file_path in candidates {
+            if file_path.exists() {
+                std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|err| {
+                        GatewayError::Config(format!(
+                            "failed to enforce 0600 permissions on SQLite file '{}': {err}",
+                            file_path.display()
+                        ))
+                    })?;
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    let _ = database_url;
 
     Ok(())
 }
@@ -197,6 +240,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+
+        let bundled_sqlite_ver: String = sqlx::query_scalar("SELECT sqlite_version();")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        eprintln!("bundled_sqlite_version={bundled_sqlite_ver}");
+        assert!(
+            !bundled_sqlite_ver.trim().is_empty(),
+            "bundled SQLite runtime version must be non-empty"
+        );
+
+        #[cfg(unix)]
+        {
+            let mode = std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "SQLite DB file must enforce 0600 permissions");
+            let dir_mode = std::fs::metadata(tmp_dir.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                dir_mode, 0o700,
+                "SQLite directory must enforce 0700 permissions"
+            );
+        }
     }
 
     #[test]

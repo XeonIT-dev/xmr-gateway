@@ -6,7 +6,7 @@ use std::time::Duration;
 use axum::{
     Json,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 use chrono::{Duration as ChronoDuration, Utc};
@@ -17,8 +17,9 @@ use crate::{
         AppState,
         dto::{
             CreateInvoiceRequest, CreateInvoiceResponse, HealthResponse, InvoiceStatusResponse,
-            RpcHealthStatus, SweepInvoiceResponse,
+            RetryWebhookResponse, RpcHealthStatus, SweepInvoiceResponse,
         },
+        middleware::{API_KEY_HEADER, constant_time_key_match},
     },
     domain::{
         amount::Piconero,
@@ -32,25 +33,41 @@ use crate::{
 /// Maximum permitted invoice TTL in seconds (30 days).
 const MAX_INVOICE_TTL_SECONDS: u64 = 2_592_000;
 
-/// Public healthcheck handler (`GET /health`).
+/// Public / authenticated healthcheck handler (`GET /health`) (`XMR-033`).
 ///
-/// Verifies SQLite readiness via `SELECT 1` and probes `monero-wallet-rpc` `get_version`
-/// with a bounded 3-second timeout. Returns `503 Service Unavailable` if SQLite fails, or
-/// `200 OK` with `"status": "ok" | "degraded"` depending on RPC reachability.
-pub async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
+/// Unauthenticated requests receive ONLY `{"status": "ok" | "degraded" | "unhealthy"}` without
+/// leaking service version, internal error details, RPC metadata, or custody mode. Requests
+/// carrying a valid `X-API-Key` header receive full diagnostic telemetry.
+pub async fn health_check(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let authorized = headers
+        .get(API_KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|presented| constant_time_key_match(presented, &state.config.api_secret_key));
+
     if let Err(err) = state.repo.health_check().await {
         tracing::error!(error = %err, "healthcheck SQLite failure");
-        let body = HealthResponse {
-            status: "unhealthy".to_string(),
-            service: env!("CARGO_PKG_NAME").to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            database: "disconnected".to_string(),
-            monero_rpc: RpcHealthStatus {
-                connected: false,
+        let body = if authorized {
+            HealthResponse {
+                status: "unhealthy".to_string(),
+                service: Some(env!("CARGO_PKG_NAME").to_string()),
+                version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                database: Some("disconnected".to_string()),
+                monero_rpc: Some(RpcHealthStatus {
+                    connected: false,
+                    version: None,
+                    error: Some("database unavailable".to_string()),
+                }),
+                auto_sweep_enabled: Some(state.config.enable_auto_sweep),
+            }
+        } else {
+            HealthResponse {
+                status: "unhealthy".to_string(),
+                service: None,
                 version: None,
-                error: Some("database unavailable".to_string()),
-            },
-            auto_sweep_enabled: state.config.enable_auto_sweep,
+                database: None,
+                monero_rpc: None,
+                auto_sweep_enabled: None,
+            }
         };
         return (StatusCode::SERVICE_UNAVAILABLE, Json(body));
     }
@@ -83,17 +100,27 @@ pub async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
         "degraded".to_string()
     };
 
-    (
-        StatusCode::OK,
-        Json(HealthResponse {
+    let body = if authorized {
+        HealthResponse {
             status: overall,
-            service: env!("CARGO_PKG_NAME").to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            database: "connected".to_string(),
-            monero_rpc: rpc_status,
-            auto_sweep_enabled: state.config.enable_auto_sweep,
-        }),
-    )
+            service: Some(env!("CARGO_PKG_NAME").to_string()),
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            database: Some("connected".to_string()),
+            monero_rpc: Some(rpc_status),
+            auto_sweep_enabled: Some(state.config.enable_auto_sweep),
+        }
+    } else {
+        HealthResponse {
+            status: overall,
+            service: None,
+            version: None,
+            database: None,
+            monero_rpc: None,
+            auto_sweep_enabled: None,
+        }
+    };
+
+    (StatusCode::OK, Json(body))
 }
 
 /// Creates a new isolated Monero subaddress invoice (`POST /api/v1/invoices`).
@@ -187,14 +214,18 @@ async fn create_invoice_locked(
     callback_url: Option<String>,
 ) -> GatewayResult<(StatusCode, Json<CreateInvoiceResponse>)> {
     if let Some(existing) = state.repo.get_invoice_by_order_id(order_id).await? {
-        if existing.amount_piconero == amount && existing.callback_url == callback_url {
+        if existing.amount_piconero == amount
+            && existing.callback_url == callback_url
+            && existing.ttl_seconds() == ttl_i64
+        {
             return Ok((StatusCode::OK, Json(CreateInvoiceResponse::from(&existing))));
         }
 
         return Err(GatewayError::Conflict(format!(
-            "invoice for order_id '{}' already exists with different parameters (expected amount_piconero={}, callback_url={:?})",
+            "invoice for order_id '{}' already exists with different parameters (expected amount_piconero={}, ttl_seconds={}, callback_url={:?})",
             order_id,
             existing.amount_piconero.as_u64(),
+            existing.ttl_seconds(),
             existing.callback_url
         )));
     }
@@ -217,6 +248,7 @@ async fn create_invoice_locked(
         confirmations: 0,
         unlocked: false,
         double_spend_seen: false,
+        reorg_epoch: 0,
         status: InvoiceStatus::Pending,
         callback_url,
         monero_uri,
@@ -303,6 +335,75 @@ pub async fn sweep_invoice(
         sweep_fee_piconero: sweep_fee.as_u64(),
         sweep_fee_xmr_formatted: sweep_fee.to_xmr_string(),
         swept_at,
+    }))
+}
+
+/// Resets a permanently `FAILED` or backed-off `PENDING` webhook outbox delivery for immediate retry
+/// (`POST /api/v1/webhooks/{webhook_id}/retry`) (`XMR-028`).
+///
+/// # Errors
+/// - `400 Bad Request` if `webhook_id` is not a valid UUID.
+/// - `404 Not Found` if `webhook_id` does not exist.
+/// - `409 Conflict` if the webhook delivery is already `DELIVERED`.
+pub async fn retry_webhook(
+    State(state): State<AppState>,
+    Path(webhook_id_raw): Path<String>,
+) -> GatewayResult<Json<RetryWebhookResponse>> {
+    let webhook_id = Uuid::parse_str(webhook_id_raw.trim()).map_err(|_| {
+        GatewayError::Validation(format!("invalid webhook_id UUID '{webhook_id_raw}'"))
+    })?;
+    let now = Utc::now();
+
+    let delivery = state
+        .repo
+        .reset_webhook_delivery_for_retry(webhook_id, now)
+        .await?
+        .ok_or_else(|| {
+            GatewayError::NotFound(format!("webhook delivery {webhook_id} not found"))
+        })?;
+
+    tracing::info!(
+        webhook_id = %delivery.id,
+        invoice_id = %delivery.invoice_id,
+        event_type = delivery.event_type.as_str(),
+        "scheduled manual webhook delivery retry"
+    );
+
+    Ok(Json(RetryWebhookResponse {
+        retried_count: 1,
+        webhook_ids: vec![delivery.id],
+        scheduled_at: now,
+    }))
+}
+
+/// Resets all `FAILED` or backed-off `PENDING` webhook outbox deliveries for an invoice
+/// (`POST /api/v1/invoices/{invoice_id}/webhooks/retry`) (`XMR-028`).
+///
+/// # Errors
+/// - `400 Bad Request` if `invoice_id` is not a valid UUID.
+/// - `404 Not Found` if `invoice_id` does not exist.
+pub async fn retry_invoice_webhooks(
+    State(state): State<AppState>,
+    Path(invoice_id_raw): Path<String>,
+) -> GatewayResult<Json<RetryWebhookResponse>> {
+    let invoice_id = parse_invoice_uuid(&invoice_id_raw)?;
+    let now = Utc::now();
+    let deliveries = state
+        .repo
+        .reset_failed_webhooks_for_invoice(invoice_id, now)
+        .await?;
+    let webhook_ids: Vec<Uuid> = deliveries.iter().map(|d| d.id).collect();
+
+    tracing::info!(
+        invoice_id = %invoice_id,
+        retried_count = webhook_ids.len(),
+        "scheduled manual retry for invoice webhook deliveries"
+    );
+
+    Ok(Json(RetryWebhookResponse {
+        retried_count: webhook_ids.len(),
+        webhook_ids,
+        scheduled_at: now,
     }))
 }
 

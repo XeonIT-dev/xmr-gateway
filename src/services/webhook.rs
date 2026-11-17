@@ -9,7 +9,11 @@
 //!   `SETTLED` webhook atomically transitions the invoice from `SETTLED` to `COMPLETED`, while
 //!   `CONFIRMED` leaves the invoice active for reorg monitoring until `SETTLEMENT_CONFIRMATIONS`.
 
-use std::time::Duration;
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use hmac::{Hmac, Mac};
@@ -17,8 +21,14 @@ use reqwest::header;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
-use tokio::sync::watch;
+use tokio::{
+    sync::{Mutex, Semaphore, watch},
+    task::JoinSet,
+};
 use uuid::Uuid;
+
+/// Maximum concurrent webhook deliveries across distinct invoices (`XMR-027`).
+pub const MAX_CONCURRENT_WEBHOOK_DELIVERIES: usize = 8;
 
 use crate::{
     db::repository::{InvoiceRepository, NewWebhookDelivery, WebhookDelivery},
@@ -181,23 +191,35 @@ pub fn build_webhook_delivery(
     let dedupe_key = match event_type {
         WebhookEventType::Underpaid => {
             format!(
-                "{}:UNDERPAID:{}",
+                "{}:UNDERPAID:epoch:{}:{}",
                 invoice.id,
+                invoice.reorg_epoch,
                 invoice.received_piconero.as_u64()
             )
         }
         WebhookEventType::Reorged => {
             format!(
-                "{}:REORGED:{}:{}",
+                "{}:REORGED:epoch:{}:{}:{}",
                 invoice.id,
+                invoice.reorg_epoch,
                 invoice.received_piconero.as_u64(),
                 invoice.confirmations
             )
         }
         WebhookEventType::Swept if invoice.sweep_tx_hashes.len() > 1 => {
-            format!("{}:SWEPT:{}", invoice.id, invoice.sweep_tx_hashes.len())
+            format!(
+                "{}:SWEPT:epoch:{}:{}",
+                invoice.id,
+                invoice.reorg_epoch,
+                invoice.sweep_tx_hashes.len()
+            )
         }
-        _ => format!("{}:{}", invoice.id, event_type.as_str()),
+        _ => format!(
+            "{}:{}:epoch:{}",
+            invoice.id,
+            event_type.as_str(),
+            invoice.reorg_epoch
+        ),
     };
 
     Ok(NewWebhookDelivery {
@@ -347,7 +369,7 @@ pub fn compute_backoff_seconds(failed_attempts: u32) -> i64 {
         .min(BACKOFF_MAX_SECONDS)
 }
 
-/// Asynchronous outbox worker dispatching signed webhooks with exponential backoff.
+/// Asynchronous outbox worker dispatching signed webhooks with bounded per-invoice concurrency.
 #[derive(Debug, Clone)]
 pub struct WebhookDispatcher {
     repo: InvoiceRepository,
@@ -355,6 +377,7 @@ pub struct WebhookDispatcher {
     enable_auto_sweep: bool,
     poll_interval: Duration,
     url_policy: WebhookUrlPolicy,
+    in_flight_ids: Arc<Mutex<HashSet<Uuid>>>,
 }
 
 impl WebhookDispatcher {
@@ -384,6 +407,7 @@ impl WebhookDispatcher {
             enable_auto_sweep,
             poll_interval,
             url_policy,
+            in_flight_ids: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -426,7 +450,9 @@ impl WebhookDispatcher {
         }
     }
 
-    /// Processes all currently due webhook deliveries in FIFO order.
+    /// Processes due webhook deliveries concurrently across distinct invoices (up to
+    /// [`MAX_CONCURRENT_WEBHOOK_DELIVERIES`]) while preserving chronological order within each
+    /// invoice (`XMR-027`).
     ///
     /// Returns the number of deliveries attempted during this cycle.
     ///
@@ -435,13 +461,88 @@ impl WebhookDispatcher {
     pub async fn process_due_deliveries(&self) -> GatewayResult<usize> {
         let now = Utc::now();
         let due = self.repo.fetch_due_webhooks(now, 50).await?;
-        let count = due.len();
-
-        for delivery in due {
-            self.deliver_one(&delivery).await?;
+        if due.is_empty() {
+            return Ok(0);
         }
 
-        Ok(count)
+        let mut per_invoice: BTreeMap<Uuid, Vec<WebhookDelivery>> = BTreeMap::new();
+        let mut claimed_count = 0_usize;
+        {
+            let mut in_flight = self.in_flight_ids.lock().await;
+            for delivery in due {
+                if in_flight.insert(delivery.id) {
+                    per_invoice
+                        .entry(delivery.invoice_id)
+                        .or_default()
+                        .push(delivery);
+                    claimed_count += 1;
+                }
+            }
+        }
+
+        if claimed_count == 0 {
+            return Ok(0);
+        }
+
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_WEBHOOK_DELIVERIES));
+        let mut join_set: JoinSet<GatewayResult<()>> = JoinSet::new();
+
+        for (_invoice_id, mut queue) in per_invoice {
+            queue.sort_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            let dispatcher = self.clone();
+            let sem = semaphore.clone();
+
+            join_set.spawn(async move {
+                let _permit = sem.acquire_owned().await.map_err(|_| {
+                    GatewayError::Internal("webhook concurrency semaphore closed".to_string())
+                })?;
+
+                let mut result = Ok(());
+                for delivery in &queue {
+                    if result.is_ok()
+                        && let Err(err) = dispatcher.deliver_one(delivery).await
+                    {
+                        result = Err(err);
+                    }
+                }
+
+                let mut in_flight = dispatcher.in_flight_ids.lock().await;
+                for delivery in &queue {
+                    in_flight.remove(&delivery.id);
+                }
+
+                result
+            });
+        }
+
+        let mut first_err: Option<GatewayError> = None;
+        while let Some(joined) = join_set.join_next().await {
+            match joined {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
+                }
+                Err(join_err) => {
+                    if first_err.is_none() {
+                        first_err = Some(GatewayError::Internal(format!(
+                            "webhook delivery worker task panicked: {join_err}"
+                        )));
+                    }
+                }
+            }
+        }
+
+        if let Some(err) = first_err {
+            return Err(err);
+        }
+
+        Ok(claimed_count)
     }
 
     async fn deliver_one(&self, delivery: &WebhookDelivery) -> GatewayResult<()> {
@@ -633,6 +734,7 @@ mod tests {
             confirmations: 2,
             unlocked: false,
             double_spend_seen: false,
+            reorg_epoch: 0,
             status,
             callback_url: None,
             monero_uri: build_monero_uri(&subaddr, amount, "ord-webhook-1"),
