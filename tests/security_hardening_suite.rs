@@ -46,6 +46,7 @@ use xmr_gateway::{
             evaluate_subaddress_transfers,
         },
     },
+    error::GatewayError,
     rpc::{client::MoneroRpcClient, types::TransferEntry},
     security::url_policy::WebhookUrlPolicy,
     services::{
@@ -1673,7 +1674,17 @@ async fn regression_deep_reorg_after_settled_and_confirmation_buffer_policy() {
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "jsonrpc": "2.0",
             "id": "5",
-            "result": { "out": [], "pending": [] }
+            "result": {
+                "out": [{
+                    "txid": "d".repeat(64),
+                    "amount": 999_900_000_000_u64,
+                    "fee": 100_000_000_u64,
+                    "confirmations": 15,
+                    "double_spend_seen": false,
+                    "subaddr_index": { "major": 0, "minor": 105 }
+                }],
+                "pending": []
+            }
         })))
         .mount(&mock_hot_rpc)
         .await;
@@ -1700,4 +1711,718 @@ async fn regression_deep_reorg_after_settled_and_confirmation_buffer_policy() {
     assert_eq!(report.invoices_swept, 0);
     let post = repo.get_invoice_by_id(inv_swept.id).await.unwrap().unwrap();
     assert_eq!(post.status, InvoiceStatus::Swept);
+}
+
+#[tokio::test]
+async fn regression_reorg_after_completed_emits_reorged_webhook_and_recovers() {
+    let pool = init_sqlite_pool("sqlite::memory:").await.unwrap();
+    let repo = InvoiceRepository::new(pool);
+    let mock_rpc = MockServer::start().await;
+    let mock_webhook = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/merchant-hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock_webhook)
+        .await;
+
+    let hook_url = format!("{}/merchant-hook", mock_webhook.uri());
+    let inv = make_invoice(106, 1_000_000_000_000, Some(hook_url));
+    repo.insert_invoice(&inv).await.unwrap();
+
+    let cfg = test_config(format!("{}/json_rpc", mock_rpc.uri()), None, false, 10, 15);
+    let rpc = MoneroRpcClient::new(&cfg.monero_rpc_url, None, None).unwrap();
+    let scanner = ScannerService::new(repo.clone(), rpc, cfg.clone());
+    let dispatcher = WebhookDispatcher::new(
+        repo.clone(),
+        false,
+        Duration::from_secs(5),
+        WebhookUrlPolicy {
+            allow_private_webhooks: true,
+            require_https_webhooks: false,
+        },
+    )
+    .unwrap();
+
+    let tx_vo = "1".repeat(64);
+
+    // 1) Reach CONFIRMED (10 confs) -> SETTLED (15 confs) -> deliver SETTLED webhook -> COMPLETED
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_transfers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": {
+                "in": [{
+                    "txid": tx_vo,
+                    "amount": 1_000_000_000_000_u64,
+                    "confirmations": 10,
+                    "double_spend_seen": false,
+                    "locked": false,
+                    "subaddr_index": { "major": 0, "minor": 106 }
+                }],
+                "pool": []
+            }
+        })))
+        .mount(&mock_rpc)
+        .await;
+    scanner.scan_once().await.unwrap();
+    assert_eq!(
+        repo.get_invoice_by_id(inv.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        InvoiceStatus::Confirmed
+    );
+
+    mock_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_transfers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "2",
+            "result": {
+                "in": [{
+                    "txid": tx_vo,
+                    "amount": 1_000_000_000_000_u64,
+                    "confirmations": 15,
+                    "double_spend_seen": false,
+                    "locked": false,
+                    "subaddr_index": { "major": 0, "minor": 106 }
+                }],
+                "pool": []
+            }
+        })))
+        .mount(&mock_rpc)
+        .await;
+    scanner.scan_once().await.unwrap();
+    assert_eq!(
+        repo.get_invoice_by_id(inv.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        InvoiceStatus::Settled
+    );
+
+    dispatcher.process_due_deliveries().await.unwrap();
+    dispatcher.process_due_deliveries().await.unwrap();
+    let completed = repo.get_invoice_by_id(inv.id).await.unwrap().unwrap();
+    assert_eq!(completed.status, InvoiceStatus::Completed);
+    assert_eq!(completed.reorg_epoch, 0);
+
+    // 2) Deep reorg AFTER COMPLETED: chain forks and confirmations fall back to 0 / disappeared
+    mock_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_transfers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "3",
+            "result": { "in": [], "pool": [] }
+        })))
+        .mount(&mock_rpc)
+        .await;
+    scanner.scan_once().await.unwrap();
+
+    let reorged = repo.get_invoice_by_id(inv.id).await.unwrap().unwrap();
+    assert_eq!(reorged.status, InvoiceStatus::Reorged);
+    assert_eq!(reorged.reorg_epoch, 1);
+
+    dispatcher.process_due_deliveries().await.unwrap();
+
+    // 3) Canonical chain recovers cleanly: REORGED -> CONFIRMED (10 confs) -> SETTLED (15 confs) -> COMPLETED
+    mock_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_transfers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "4",
+            "result": {
+                "in": [{
+                    "txid": tx_vo,
+                    "amount": 1_000_000_000_000_u64,
+                    "confirmations": 15,
+                    "double_spend_seen": false,
+                    "locked": false,
+                    "subaddr_index": { "major": 0, "minor": 106 }
+                }],
+                "pool": []
+            }
+        })))
+        .mount(&mock_rpc)
+        .await;
+
+    scanner.scan_once().await.unwrap();
+    assert_eq!(
+        repo.get_invoice_by_id(inv.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        InvoiceStatus::Confirmed
+    );
+
+    scanner.scan_once().await.unwrap();
+    assert_eq!(
+        repo.get_invoice_by_id(inv.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        InvoiceStatus::Settled
+    );
+
+    dispatcher.process_due_deliveries().await.unwrap();
+    dispatcher.process_due_deliveries().await.unwrap();
+    let recovered = repo.get_invoice_by_id(inv.id).await.unwrap().unwrap();
+    assert_eq!(recovered.status, InvoiceStatus::Completed);
+    assert_eq!(recovered.reorg_epoch, 1);
+
+    let hooks = repo.list_webhooks_for_invoice(inv.id).await.unwrap();
+    let events: Vec<WebhookEventType> = hooks.iter().map(|w| w.event_type).collect();
+    assert_eq!(
+        events,
+        vec![
+            WebhookEventType::Confirmed,
+            WebhookEventType::Settled,
+            WebhookEventType::Reorged,
+            WebhookEventType::Confirmed,
+            WebhookEventType::Settled,
+        ]
+    );
+    assert!(
+        hooks
+            .iter()
+            .all(|w| w.status == WebhookDeliveryStatus::Delivered),
+        "all epoch-0 and epoch-1 recovery webhooks must deliver cleanly"
+    );
+}
+
+#[tokio::test]
+async fn regression_confirmed_sweep_reorg_detected_escalates_and_blocks_auto_resweep() {
+    let pool = init_sqlite_pool("sqlite::memory:").await.unwrap();
+    let repo = InvoiceRepository::new(pool);
+    let mock_rpc = MockServer::start().await;
+
+    let inv = make_invoice(
+        107,
+        1_000_000_000_000,
+        Some("http://127.0.0.1:9999/sweep-reorg-hook".to_string()),
+    );
+    repo.insert_invoice(&inv).await.unwrap();
+
+    let cfg = test_config(format!("{}/json_rpc", mock_rpc.uri()), None, true, 10, 15);
+    let rpc = MoneroRpcClient::new(&cfg.monero_rpc_url, None, None).unwrap();
+    let scanner = ScannerService::new(repo.clone(), rpc, cfg.clone());
+
+    let in_txid = "2".repeat(64);
+    let sweep_txid = "3".repeat(64);
+
+    // 1) Incoming payment matures to CONFIRMED (15) -> SETTLED (15) -> sweep_all executes once
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains(r#""in":true"#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": {
+                "in": [{
+                    "txid": in_txid,
+                    "amount": 1_000_000_000_000_u64,
+                    "confirmations": 15,
+                    "double_spend_seen": false,
+                    "locked": false,
+                    "subaddr_index": { "major": 0, "minor": 107 }
+                }],
+                "pool": []
+            }
+        })))
+        .mount(&mock_rpc)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("sweep_all"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "2",
+            "result": {
+                "tx_hash_list": [sweep_txid],
+                "amount_list": [999_900_000_000_u64],
+                "fee_list": [100_000_000_u64]
+            }
+        })))
+        .expect(1)
+        .mount(&mock_rpc)
+        .await;
+
+    // Tick 1: CONFIRMED -> Tick 2: SETTLED + sweep_all
+    scanner.scan_once().await.unwrap();
+    assert_eq!(
+        repo.get_invoice_by_id(inv.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        InvoiceStatus::Confirmed
+    );
+    let r2 = scanner.scan_once().await.unwrap();
+    assert_eq!(r2.invoices_swept, 1);
+    assert_eq!(
+        repo.get_invoice_by_id(inv.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        InvoiceStatus::Swept
+    );
+
+    // Attempt begins as SUBMITTED
+    let a1 = repo.list_sweep_attempts_for_invoice(inv.id).await.unwrap();
+    assert_eq!(a1.len(), 1);
+    assert_eq!(a1[0].status, SweepAttemptStatus::Submitted);
+
+    // 2) Outgoing sweep at 5 confs (< settlement_confirmations=15) MUST stay SUBMITTED (non-final)
+    mock_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains(r#""in":true"#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "3",
+            "result": {
+                "in": [{
+                    "txid": in_txid,
+                    "amount": 1_000_000_000_000_u64,
+                    "confirmations": 15,
+                    "double_spend_seen": false,
+                    "locked": false,
+                    "subaddr_index": { "major": 0, "minor": 107 }
+                }],
+                "pool": []
+            }
+        })))
+        .mount(&mock_rpc)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains(r#""out":true"#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "4",
+            "result": {
+                "out": [{
+                    "txid": sweep_txid,
+                    "amount": 999_900_000_000_u64,
+                    "fee": 100_000_000_u64,
+                    "confirmations": 5,
+                    "double_spend_seen": false,
+                    "subaddr_index": { "major": 0, "minor": 107 }
+                }],
+                "pending": []
+            }
+        })))
+        .mount(&mock_rpc)
+        .await;
+    scanner.scan_once().await.unwrap();
+    let a2 = repo.list_sweep_attempts_for_invoice(inv.id).await.unwrap();
+    assert_eq!(a2[0].status, SweepAttemptStatus::Submitted);
+
+    // 3) Outgoing sweep reaches 15 confs (>= settlement_confirmations) -> CONFIRMED
+    mock_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains(r#""in":true"#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "5",
+            "result": {
+                "in": [{
+                    "txid": in_txid,
+                    "amount": 1_000_000_000_000_u64,
+                    "confirmations": 20,
+                    "double_spend_seen": false,
+                    "locked": false,
+                    "subaddr_index": { "major": 0, "minor": 107 }
+                }],
+                "pool": []
+            }
+        })))
+        .mount(&mock_rpc)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains(r#""out":true"#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "6",
+            "result": {
+                "out": [{
+                    "txid": sweep_txid,
+                    "amount": 999_900_000_000_u64,
+                    "fee": 100_000_000_u64,
+                    "confirmations": 15,
+                    "double_spend_seen": false,
+                    "subaddr_index": { "major": 0, "minor": 107 }
+                }],
+                "pending": []
+            }
+        })))
+        .mount(&mock_rpc)
+        .await;
+    scanner.scan_once().await.unwrap();
+    let a3 = repo.list_sweep_attempts_for_invoice(inv.id).await.unwrap();
+    assert_eq!(a3[0].status, SweepAttemptStatus::Confirmed);
+
+    // 4) Deep reorg invalidates previously CONFIRMED sweep: disappears from out/pending!
+    mock_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains(r#""in":true"#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "7",
+            "result": {
+                "in": [{
+                    "txid": in_txid,
+                    "amount": 1_000_000_000_000_u64,
+                    "confirmations": 20,
+                    "double_spend_seen": false,
+                    "locked": false,
+                    "subaddr_index": { "major": 0, "minor": 107 }
+                }],
+                "pool": []
+            }
+        })))
+        .mount(&mock_rpc)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains(r#""out":true"#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "8",
+            "result": { "out": [], "pending": [] }
+        })))
+        .mount(&mock_rpc)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("sweep_all"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock_rpc)
+        .await;
+
+    let reorg_report = scanner.scan_once().await.unwrap();
+    assert_eq!(reorg_report.invoices_swept, 0);
+
+    let escalated_inv = repo.get_invoice_by_id(inv.id).await.unwrap().unwrap();
+    assert_eq!(escalated_inv.status, InvoiceStatus::Reorged);
+    assert_eq!(escalated_inv.reorg_epoch, 1);
+    assert!(
+        escalated_inv
+            .last_sweep_error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("SWEEP_REORG_DETECTED:"))
+    );
+
+    let a4 = repo.list_sweep_attempts_for_invoice(inv.id).await.unwrap();
+    assert_eq!(a4[0].status, SweepAttemptStatus::Reorged);
+    assert!(
+        a4[0]
+            .error_message
+            .as_deref()
+            .is_some_and(|e| e.starts_with("SWEEP_REORG_DETECTED:"))
+    );
+
+    let hooks = repo.list_webhooks_for_invoice(inv.id).await.unwrap();
+    assert!(
+        hooks
+            .iter()
+            .any(|w| w.event_type == WebhookEventType::Reorged)
+    );
+
+    // 5) Subsequent scan cycles and manual_sweep MUST keep auto re-sweep blocked!
+    let next_report = scanner.scan_once().await.unwrap();
+    assert_eq!(next_report.invoices_swept, 0);
+    assert_eq!(
+        repo.get_invoice_by_id(inv.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        InvoiceStatus::Reorged
+    );
+
+    let manual_err = scanner.manual_sweep(inv.id).await.unwrap_err();
+    assert!(matches!(manual_err, GatewayError::Conflict(_)));
+
+    // 6) Verify double_spend_seen = true on a RECONCILED sweep attempt also triggers escalation
+    let inv2 = make_invoice(108, 1_000_000_000_000, None);
+    let mut inv2_settled = inv2.clone();
+    inv2_settled.status = InvoiceStatus::Settled;
+    inv2_settled.received_piconero = Piconero(1_000_000_000_000);
+    inv2_settled.confirmations = 15;
+    inv2_settled.unlocked = true;
+    repo.insert_invoice(&inv2_settled).await.unwrap();
+
+    let cold_addr = cfg.cold_wallet_address.as_deref().unwrap();
+    let att2 = repo
+        .create_prepared_sweep_attempt(
+            inv2_settled.id,
+            inv2_settled.address_index,
+            cold_addr,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    let sweep2_txid = "4".repeat(64);
+    repo.complete_sweep_attempt(CompleteSweepAttemptParams {
+        attempt_id: att2.id,
+        invoice_id: inv2_settled.id,
+        attempt_status: SweepAttemptStatus::Reconciled,
+        sweep_tx_hashes: vec![sweep2_txid.clone()],
+        sweep_amount_piconero: Piconero(999_900_000_000),
+        sweep_fee_piconero: Piconero(100_000_000),
+        webhook: None,
+        now: Utc::now(),
+    })
+    .await
+    .unwrap();
+
+    mock_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains(r#""out":true"#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "9",
+            "result": {
+                "out": [{
+                    "txid": sweep2_txid,
+                    "amount": 999_900_000_000_u64,
+                    "fee": 100_000_000_u64,
+                    "confirmations": 1,
+                    "double_spend_seen": true,
+                    "subaddr_index": { "major": 0, "minor": 108 }
+                }],
+                "pending": []
+            }
+        })))
+        .mount(&mock_rpc)
+        .await;
+
+    scanner.reconcile_in_flight_sweeps().await.unwrap();
+    let inv2_after = repo
+        .get_invoice_by_id(inv2_settled.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(inv2_after.status, InvoiceStatus::Reorged);
+    let att2_after = repo
+        .list_sweep_attempts_for_invoice(inv2_settled.id)
+        .await
+        .unwrap();
+    assert_eq!(att2_after[0].status, SweepAttemptStatus::Reorged);
+    assert!(
+        att2_after[0]
+            .error_message
+            .as_deref()
+            .is_some_and(|e| e.contains("double_spend_seen=true"))
+    );
+}
+
+#[tokio::test]
+async fn regression_double_spend_seen_in_mempool_recovers_when_canonically_mined() {
+    let pool = init_sqlite_pool("sqlite::memory:").await.unwrap();
+    let repo = InvoiceRepository::new(pool);
+    let mock_rpc = MockServer::start().await;
+
+    let inv = make_invoice(109, 1_000_000_000_000, None);
+    repo.insert_invoice(&inv).await.unwrap();
+
+    let cfg = test_config(format!("{}/json_rpc", mock_rpc.uri()), None, false, 10, 10);
+    let rpc = MoneroRpcClient::new(&cfg.monero_rpc_url, None, None).unwrap();
+    let scanner = ScannerService::new(repo.clone(), rpc, cfg);
+
+    let tx_ds = "5".repeat(64);
+
+    // 1) Mempool false-positive / race flags double_spend_seen = true at 0 confs
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_transfers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": {
+                "in": [],
+                "pool": [{
+                    "txid": tx_ds,
+                    "amount": 1_000_000_000_000_u64,
+                    "confirmations": 0,
+                    "double_spend_seen": true,
+                    "subaddr_index": { "major": 0, "minor": 109 }
+                }]
+            }
+        })))
+        .mount(&mock_rpc)
+        .await;
+    scanner.scan_once().await.unwrap();
+
+    let inv_mempool_ds = repo.get_invoice_by_id(inv.id).await.unwrap().unwrap();
+    assert!(inv_mempool_ds.double_spend_seen);
+    assert_eq!(inv_mempool_ds.received_piconero, Piconero::ZERO);
+    let tr1 = repo.list_transfers_for_invoice(inv.id).await.unwrap();
+    assert_eq!(tr1.len(), 1);
+    assert!(tr1[0].double_spend_seen);
+    assert!(tr1[0].orphaned);
+
+    // 2) Subsequent 0-conf mempool poll omitting double_spend_seen MUST remain conservative!
+    mock_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_transfers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "2",
+            "result": {
+                "in": [],
+                "pool": [{
+                    "txid": tx_ds,
+                    "amount": 1_000_000_000_000_u64,
+                    "confirmations": 0,
+                    "double_spend_seen": false,
+                    "subaddr_index": { "major": 0, "minor": 109 }
+                }]
+            }
+        })))
+        .mount(&mock_rpc)
+        .await;
+    scanner.scan_once().await.unwrap();
+    let tr2 = repo.list_transfers_for_invoice(inv.id).await.unwrap();
+    assert!(
+        tr2[0].double_spend_seen,
+        "0-conf mempool update must preserve double_spend_seen=true until canonical mining"
+    );
+    assert!(tr2[0].orphaned);
+
+    // 3) Canonically mined (confirmations=10, double_spend_seen=false) clears flag and confirms invoice
+    mock_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_transfers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "3",
+            "result": {
+                "in": [{
+                    "txid": tx_ds,
+                    "amount": 1_000_000_000_000_u64,
+                    "confirmations": 10,
+                    "double_spend_seen": false,
+                    "locked": false,
+                    "subaddr_index": { "major": 0, "minor": 109 }
+                }],
+                "pool": []
+            }
+        })))
+        .mount(&mock_rpc)
+        .await;
+    scanner.scan_once().await.unwrap();
+
+    let inv_recovered = repo.get_invoice_by_id(inv.id).await.unwrap().unwrap();
+    assert!(!inv_recovered.double_spend_seen);
+    assert_eq!(inv_recovered.received_piconero, Piconero(1_000_000_000_000));
+    assert_eq!(inv_recovered.status, InvoiceStatus::Confirmed);
+
+    let tr3 = repo.list_transfers_for_invoice(inv.id).await.unwrap();
+    assert!(!tr3[0].double_spend_seen);
+    assert!(!tr3[0].orphaned);
+
+    let sub3 = repo
+        .list_subaddress_transfers_for_invoice(inv.id)
+        .await
+        .unwrap();
+    assert_eq!(sub3.len(), 1);
+    assert_eq!(sub3[0].status, SubaddressTransferStatus::Active);
+
+    // 4) Also verify ORPHANED -> ACTIVE restoration when previously confirmed tx had temporary
+    // double_spend_seen in mempool during shallow reorg, then canonically re-mines.
+    mock_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_transfers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "4",
+            "result": {
+                "in": [],
+                "pool": [{
+                    "txid": tx_ds,
+                    "amount": 1_000_000_000_000_u64,
+                    "confirmations": 0,
+                    "double_spend_seen": true,
+                    "subaddr_index": { "major": 0, "minor": 109 }
+                }]
+            }
+        })))
+        .mount(&mock_rpc)
+        .await;
+    scanner.scan_once().await.unwrap();
+    assert_eq!(
+        repo.get_invoice_by_id(inv.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        InvoiceStatus::Reorged
+    );
+    assert_eq!(
+        repo.list_subaddress_transfers_for_invoice(inv.id)
+            .await
+            .unwrap()[0]
+            .status,
+        SubaddressTransferStatus::Orphaned
+    );
+
+    mock_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_transfers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "5",
+            "result": {
+                "in": [{
+                    "txid": tx_ds,
+                    "amount": 1_000_000_000_000_u64,
+                    "confirmations": 10,
+                    "double_spend_seen": false,
+                    "locked": false,
+                    "subaddr_index": { "major": 0, "minor": 109 }
+                }],
+                "pool": []
+            }
+        })))
+        .mount(&mock_rpc)
+        .await;
+    scanner.scan_once().await.unwrap();
+
+    let inv_reconfirmed = repo.get_invoice_by_id(inv.id).await.unwrap().unwrap();
+    assert_eq!(inv_reconfirmed.status, InvoiceStatus::Confirmed);
+    assert!(!inv_reconfirmed.double_spend_seen);
+    let sub_final = repo
+        .list_subaddress_transfers_for_invoice(inv.id)
+        .await
+        .unwrap();
+    assert_eq!(sub_final[0].status, SubaddressTransferStatus::Active);
+    let tr_final = repo.list_transfers_for_invoice(inv.id).await.unwrap();
+    assert!(!tr_final[0].double_spend_seen);
+    assert!(!tr_final[0].orphaned);
 }

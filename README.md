@@ -17,7 +17,7 @@ Designed for sovereign merchants, Telegram commerce bots, and privacy-first infr
 - **Subaddress-Per-Invoice Isolation:** Each invoice allocates a unique Monero subaddress (`account_index: 0`, unique `address_index`) enforced at the SQLite schema level (`UNIQUE(account_index, address_index)`), preventing address reuse and cross-customer correlation.
 - **Strict Piconero Integer Accounting:** Floating-point arithmetic (`f32`/`f64`) is strictly banned across the entire codebase. Every amount, transfer, fee, and SQLite column uses atomic integer `Piconero(u64)` ($1\text{ XMR} = 10^{12}\text{ piconero}$) in SQLite WAL mode with `synchronous = FULL`, `0700`/`0600` filesystem hardening, and multi-output batched transaction accuracy (`UNIQUE(invoice_id, txid)`).
 - **Reorg-Safe Payment State Machine & Continuous Subaddress Accounting:** Tracks `PENDING`, `UNDERPAID`, `MEMPOOL` (`0-conf`), `CONFIRMING` (`1..REQUIRED_CONFIRMATIONS`), `CONFIRMED` (`>= REQUIRED_CONFIRMATIONS`, default `10`), `SETTLED` (`>= SETTLEMENT_CONFIRMATIONS`, default `10`), `REORGED`, `COMPLETED`, `SWEPT`, and `EXPIRED`, plus `LATE_PAYMENT` and `OVERPAYMENT` ledger tracking across all subaddresses (`SUBADDRESS_MONITOR_DAYS=0` continuous monitoring by default), epoch-scoped webhook recovery after reorgs, and `ACTIVE` / `ORPHANED` / `SWEPT` audit states.
-- **Double-Spend Protection & Crash-Safe Sweeps:** Outputs flagged `double_spend_seen == true` are excluded from paid totals. Isolated `sweep_all` operations record durable `sweep_attempts` (`PREPARED` → `SUBMITTED` → `CONFIRMED` / `RECONCILED` | `FAILED`) so crashed sweeps recover via `get_transfers(out, pending)` without double-sweeping.
+- **Double-Spend Protection & Crash-Safe Sweeps:** Outputs flagged `double_spend_seen == true` in mempool (`confirmations == 0`) stay excluded until canonically mined (`confirmations > 0 && !double_spend_seen`), which cleanly restores `ACTIVE` balance state. Isolated `sweep_all` operations record durable `sweep_attempts` (`PREPARED` → `SUBMITTED` → `CONFIRMED` (`>= SETTLEMENT_CONFIRMATIONS`) / `RECONCILED` | `FAILED` | `REORGED`) so crashed sweeps recover via `get_transfers(out, pending)`, and any disappeared or double-spent outbound sweep escalates `SWEPT -> REORGED` (`SWEEP_REORG_DETECTED`) while blocking automatic re-sweep.
 - **SSRF-Hardened Durable HMAC-SHA256 Webhooks:** Outbound `callback_url` targets undergo IP/DNS SSRF filtering (`ALLOW_PRIVATE_WEBHOOKS=false`, `REQUIRE_HTTPS_WEBHOOKS`), connection-time socket pinning against DNS rebinding, zero redirect following, and SQLite WAL outbox retries (`5s` up to `3600s`, 10 attempts).
 - **Constant-Time API Authentication:** `/api/v1/*` routes verify `X-API-Key` by hashing both presented and expected secrets with SHA-256 before `subtle::ConstantTimeEq` comparison, preventing length timing side-channels.
 
@@ -106,8 +106,9 @@ Designed for sovereign merchants, Telegram commerce bots, and privacy-first infr
               |                                                   |
               v                                                   v
       +-------+-------+                                   +-------+-------+
-      |   COMPLETED   |                                   |     SWEPT     | ---> Webhook: SWEPT
-      +---------------+                                   +-------+-------+
+      |   COMPLETED   | ---> (deep reorg -> REORGED)      |     SWEPT     | ---> Webhook: SWEPT
+      +---------------+      (recovers via CONFIRMED)     +-------+-------+      (outbound sweep reorg -> REORGED,
+                                                                                  auto re-sweep blocked)
       (continuously monitored via SUBADDRESS_MONITOR_DAYS=0; residual OVERPAYMENT / EXPIRED LATE_PAYMENT sweepable)
 ```
 
@@ -120,8 +121,8 @@ Designed for sovereign merchants, Telegram commerce bots, and privacy-first infr
 | **Private Spend Key on Server** | **Forbidden** (`start.sh` and gateway verify `query_key(spend_key)` fails or returns zero) | **Yes** (hot transit wallet; explicit opt-in required) |
 | **First-Run Bootstrap** | Fail-closed unless `MONERO_VIEW_ONLY_ADDRESS` & `MONERO_VIEW_ONLY_KEY` are set | Generates hot transit wallet (`ENABLE_AUTO_SWEEP=true` or `ALLOW_HOT_WALLET_WITHOUT_SWEEP=true`) |
 | **Remote Daemon Policy** | `--untrusted-daemon` by default (`MONERO_TRUSTED_DAEMON=false`) | `--untrusted-daemon` unless `MONERO_TRUSTED_DAEMON=true` |
-| **Settlement Flow** | Stays active in `CONFIRMED` for reorg checks until `SETTLED` webhook 2xx (`COMPLETED`) | Crash-safe `sweep_attempts` (`PREPARED`→`SUBMITTED`→`RECONCILED`) to `COLD_WALLET_ADDRESS` |
-| **Terminal State** | `COMPLETED` (continuously monitored when `SUBADDRESS_MONITOR_DAYS=0`) | `SWEPT` (`EXPIRED` preserves `EXPIRED` even after late-payment sweep) |
+| **Settlement Flow** | Stays active in `CONFIRMED` for reorg checks until `SETTLED` webhook 2xx (`COMPLETED`); `COMPLETED` stays monitored for deep reorgs | Crash-safe `sweep_attempts` (`PREPARED`→`SUBMITTED`→`CONFIRMED` at `>= SETTLEMENT_CONFIRMATIONS` / `RECONCILED` / `REORGED`) |
+| **Terminal State** | `COMPLETED` (monitored for deep reorg `COMPLETED->REORGED->CONFIRMED->SETTLED->COMPLETED`) | `SWEPT` (`SWEPT->REORGED` on outbound sweep reorg with auto re-sweep blocked; `EXPIRED` preserves `EXPIRED`) |
 
 ---
 

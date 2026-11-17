@@ -131,7 +131,8 @@ impl InvoiceStatus {
                 next,
                 Self::Confirming | Self::Confirmed | Self::Settled | Self::Expired
             ),
-            Self::Completed | Self::Swept | Self::Expired => false,
+            Self::Completed | Self::Swept => matches!(next, Self::Reorged),
+            Self::Expired => false,
         };
 
         if allowed {
@@ -565,7 +566,12 @@ pub fn compute_next_status(
 /// full chain-reorganization detection.
 ///
 /// # State Machine Guarantees
-/// - Terminal states (`COMPLETED`, `SWEPT`, `EXPIRED`) never transition.
+/// - `EXPIRED` never transitions via `compute_next_status_with_settlement`; `SWEPT` stays `SWEPT`
+///   against incoming reorgs and only escalates to `REORGED` via outbound sweep reconciliation.
+/// - `COMPLETED` (View-Only mode) remains monitored for deep reorgs: if `double_spend_seen`
+///   appears, `received_piconero` drops below `expected_amount`, or confirmations fall below
+///   `settlement_confirmations`, it transitions to `REORGED` and can recover back through
+///   `CONFIRMED -> SETTLED -> COMPLETED`.
 /// - `CONFIRMED` continues tracking confirmations until `settlement_confirmations` (reaching
 ///   `SETTLED`), and drops into `REORGED` if confirmations fall below `required_confirmations`,
 ///   observed balance drops below `expected_amount`, or `double_spend_seen` is flagged.
@@ -585,11 +591,20 @@ pub fn compute_next_status_with_settlement(
     now: DateTime<Utc>,
     expires_at: DateTime<Utc>,
 ) -> InvoiceStatus {
-    if current.is_terminal() {
+    if matches!(current, InvoiceStatus::Swept | InvoiceStatus::Expired) {
         return current;
     }
 
     match current {
+        InvoiceStatus::Completed => {
+            if eval.double_spend_seen
+                || eval.received_piconero < expected_amount
+                || eval.effective_confirmations < settlement_confirmations
+            {
+                return InvoiceStatus::Reorged;
+            }
+            InvoiceStatus::Completed
+        }
         InvoiceStatus::Settled => {
             if eval.double_spend_seen
                 || eval.received_piconero < expected_amount
@@ -665,7 +680,7 @@ pub fn compute_next_status_with_settlement(
 
             current
         }
-        InvoiceStatus::Completed | InvoiceStatus::Swept | InvoiceStatus::Expired => current,
+        InvoiceStatus::Swept | InvoiceStatus::Expired => current,
     }
 }
 

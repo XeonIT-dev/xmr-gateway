@@ -112,24 +112,29 @@ impl ScannerService {
         }
     }
 
+    fn monitor_cutoff(&self) -> Option<DateTime<Utc>> {
+        if self.config.subaddress_monitor_days == 0 {
+            None
+        } else {
+            let monitor_days = i64::try_from(self.config.subaddress_monitor_days).unwrap_or(90);
+            Some(Utc::now() - ChronoDuration::days(monitor_days))
+        }
+    }
+
     /// Executes one deterministic scan-and-sweep cycle across all monitored invoices.
     ///
-    /// Reconciles any interrupted (`PREPARED` / `SUBMITTED`) sweep attempts against outgoing RPC
-    /// transfer history, scans both active invoices and terminal subaddresses within
-    /// `SUBADDRESS_MONITOR_DAYS` (detecting late payments and overpayments), and triggers
-    /// isolated sweeps for unlocked funds.
+    /// Reconciles any active (`PREPARED` / `SUBMITTED`) and finalized (`CONFIRMED` / `RECONCILED`)
+    /// sweep attempts within `SUBADDRESS_MONITOR_DAYS` against outgoing RPC transfer history,
+    /// scans active, `COMPLETED` (for deep reorg detection), and terminal subaddresses (detecting
+    /// late payments and overpayments), and triggers isolated sweeps for unlocked funds unless
+    /// an unresolved `SWEEP_REORG_DETECTED` incident exists.
     ///
     /// # Errors
     /// Returns [`GatewayError::Database`] if monitored invoices cannot be fetched or updated, or
     /// [`GatewayError::RpcTransport`]/[`GatewayError::Rpc`] if batch `get_transfers` fails.
     pub async fn scan_once(&self) -> GatewayResult<ScanReport> {
         let reconciled = self.reconcile_in_flight_sweeps().await?;
-        let cutoff = if self.config.subaddress_monitor_days == 0 {
-            None
-        } else {
-            let monitor_days = i64::try_from(self.config.subaddress_monitor_days).unwrap_or(90);
-            Some(Utc::now() - ChronoDuration::days(monitor_days))
-        };
+        let cutoff = self.monitor_cutoff();
         let monitored_invoices = self.repo.list_monitored_invoices(cutoff).await?;
         let mut report = ScanReport {
             invoices_scanned: monitored_invoices.len(),
@@ -167,7 +172,23 @@ impl ScannerService {
                 );
             }
 
-            let updated = if invoice.status.is_terminal() {
+            let has_reorged_sweep = if matches!(
+                invoice.status,
+                InvoiceStatus::Settled
+                    | InvoiceStatus::Reorged
+                    | InvoiceStatus::Swept
+                    | InvoiceStatus::Expired
+            ) {
+                self.repo.has_reorged_sweep_attempt(invoice.id).await?
+            } else {
+                false
+            };
+
+            let updated = if matches!(
+                invoice.status,
+                InvoiceStatus::Swept | InvoiceStatus::Expired
+            ) || (invoice.status == InvoiceStatus::Reorged && has_reorged_sweep)
+            {
                 invoice.clone()
             } else {
                 let res = self.persist_evaluation(&invoice, &eval).await?;
@@ -186,7 +207,14 @@ impl ScannerService {
                 .settlement_confirmations
                 .max(MONERO_UNLOCK_CONFIRMATIONS);
 
-            let should_auto_sweep = if !self.config.enable_auto_sweep || !eval.all_unlocked {
+            let should_auto_sweep = if has_reorged_sweep {
+                tracing::warn!(
+                    invoice_id = %updated.id,
+                    order_id = %updated.order_id,
+                    "blocking automatic re-sweep due to unresolved SWEEP_REORG_DETECTED incident; manual reconciliation required"
+                );
+                false
+            } else if !self.config.enable_auto_sweep || !eval.all_unlocked {
                 false
             } else if updated.status == InvoiceStatus::Settled
                 && updated.received_piconero >= updated.amount_piconero
@@ -276,7 +304,10 @@ impl ScannerService {
             .unwrap_or(&[]);
 
         let eval = evaluate_subaddress_transfers(invoice.amount_piconero, subaddr_transfers);
-        let updated = if invoice.status.is_terminal() {
+        let updated = if matches!(
+            invoice.status,
+            InvoiceStatus::Swept | InvoiceStatus::Expired
+        ) {
             invoice
         } else {
             self.persist_evaluation(&invoice, &eval).await?
@@ -394,7 +425,10 @@ impl ScannerService {
         invoice: &Invoice,
         eval: &SubaddressEvaluation,
     ) -> GatewayResult<Invoice> {
-        if invoice.status.is_terminal() {
+        if matches!(
+            invoice.status,
+            InvoiceStatus::Completed | InvoiceStatus::Swept | InvoiceStatus::Expired
+        ) {
             let active_txids: Vec<String> = eval
                 .transfers
                 .iter()
@@ -729,9 +763,13 @@ impl ScannerService {
             .await
     }
 
-    /// Reconciles any `PREPARED` or `SUBMITTED` sweep attempts against `monero-wallet-rpc`
-    /// outgoing transfer history (`out` + `pending`) so crashes between `sweep_all` broadcast
-    /// and SQLite commit never cause duplicate sweep attempts or stuck invoices.
+    /// Reconciles active (`PREPARED`, `SUBMITTED`) and monitored (`CONFIRMED`, `RECONCILED`)
+    /// sweep attempts against `monero-wallet-rpc` outgoing transfer history (`out` + `pending`):
+    /// - Recovers crashed `PREPARED` attempts without duplicate `sweep_all` execution.
+    /// - Enforces `SETTLEMENT_CONFIRMATIONS` finality gating (`SUBMITTED -> CONFIRMED`).
+    /// - Detects disappeared or `double_spend_seen` outbound sweep transactions, escalating the
+    ///   attempt to `REORGED` (`SWEEP_REORG_DETECTED`) and transitioning `SWEPT -> REORGED` while
+    ///   blocking automatic re-sweep until manual operator reconciliation.
     ///
     /// Returns the number of interrupted `PREPARED` sweeps reconciled to `SWEPT`.
     ///
@@ -739,7 +777,10 @@ impl ScannerService {
     /// Returns [`GatewayError::Database`] or [`GatewayError::RpcTransport`] / [`GatewayError::Rpc`]
     /// if querying SQLite or `monero-wallet-rpc` fails.
     pub async fn reconcile_in_flight_sweeps(&self) -> GatewayResult<usize> {
-        let attempts = self.repo.list_in_flight_sweep_attempts().await?;
+        let attempts = self
+            .repo
+            .list_monitored_sweep_attempts(self.monitor_cutoff())
+            .await?;
         if attempts.is_empty() {
             return Ok(0);
         }
@@ -772,25 +813,15 @@ impl ScannerService {
             .get_outgoing_transfers(invoice.account_index, &[attempt.address_index])
             .await?;
 
-        if attempt.status == SweepAttemptStatus::Submitted {
-            let confirmed_on_chain = out_resp.out.iter().any(|entry| {
-                attempt.tx_hashes.contains(&entry.txid)
-                    || entry.matches_sweep(
-                        invoice.account_index,
-                        attempt.address_index,
-                        &attempt.destination_address,
-                    )
-            });
-            if confirmed_on_chain {
-                self.repo
-                    .update_sweep_attempt_status(
-                        attempt.id,
-                        SweepAttemptStatus::Confirmed,
-                        Utc::now(),
-                    )
-                    .await?;
-            }
-            return Ok(None);
+        if matches!(
+            attempt.status,
+            SweepAttemptStatus::Submitted
+                | SweepAttemptStatus::Confirmed
+                | SweepAttemptStatus::Reconciled
+        ) {
+            return self
+                .reconcile_tracked_sweep_attempt(&invoice, attempt, &out_resp)
+                .await;
         }
 
         if attempt.status != SweepAttemptStatus::Prepared {
@@ -802,11 +833,13 @@ impl ScannerService {
         let mut total_fee = 0_u64;
 
         for entry in out_resp.out.iter().chain(out_resp.pending.iter()) {
-            if !entry.matches_sweep(
-                invoice.account_index,
-                attempt.address_index,
-                &attempt.destination_address,
-            ) {
+            if entry.double_spend_seen
+                || !entry.matches_sweep(
+                    invoice.account_index,
+                    attempt.address_index,
+                    &attempt.destination_address,
+                )
+            {
                 continue;
             }
             if invoice.sweep_tx_hashes.contains(&entry.txid) {
@@ -858,6 +891,155 @@ impl ScannerService {
         Ok(Some(reconciled))
     }
 
+    async fn reconcile_tracked_sweep_attempt(
+        &self,
+        invoice: &Invoice,
+        attempt: &SweepAttempt,
+        out_resp: &GetTransfersResponse,
+    ) -> GatewayResult<Option<Invoice>> {
+        let mut mined_matches = Vec::new();
+        let mut double_spent_tx: Option<String> = None;
+        let mut missing_tx: Option<String> = None;
+
+        if attempt.tx_hashes.is_empty() {
+            let mut matched_any = false;
+            for entry in out_resp.out.iter().chain(out_resp.pending.iter()) {
+                if entry.matches_sweep(
+                    invoice.account_index,
+                    attempt.address_index,
+                    &attempt.destination_address,
+                ) {
+                    matched_any = true;
+                    if entry.double_spend_seen {
+                        double_spent_tx = Some(entry.txid.clone());
+                        break;
+                    }
+                }
+            }
+            for entry in &out_resp.out {
+                if !entry.double_spend_seen
+                    && entry.matches_sweep(
+                        invoice.account_index,
+                        attempt.address_index,
+                        &attempt.destination_address,
+                    )
+                {
+                    mined_matches.push(entry);
+                }
+            }
+            if !matched_any && double_spent_tx.is_none() {
+                missing_tx = Some("(unspecified sweep tx_hash)".to_string());
+            }
+        } else {
+            for txid in &attempt.tx_hashes {
+                let mined = out_resp.out.iter().find(|entry| &entry.txid == txid);
+                let pending = out_resp.pending.iter().find(|entry| &entry.txid == txid);
+                match (mined, pending) {
+                    (Some(entry), _) | (None, Some(entry)) if entry.double_spend_seen => {
+                        double_spent_tx = Some(txid.clone());
+                        break;
+                    }
+                    (Some(entry), _) => {
+                        mined_matches.push(entry);
+                    }
+                    (None, Some(_)) => {
+                        // Still in mempool (pending): keep Submitted/non-final and continue monitoring.
+                    }
+                    (None, None) => {
+                        missing_tx = Some(txid.clone());
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(reason) = double_spent_tx
+            .map(|txid| format!("outgoing sweep tx {txid} flagged double_spend_seen=true"))
+            .or_else(|| {
+                missing_tx.map(|txid| {
+                    format!(
+                        "outgoing sweep tx {txid} disappeared from get_transfers(out=true, pending=true)"
+                    )
+                })
+            })
+        {
+            let now = Utc::now();
+            let err_msg = format!("SWEEP_REORG_DETECTED: {reason}");
+            let mut projected = invoice.clone();
+            if invoice.status == InvoiceStatus::Swept {
+                projected.status = InvoiceStatus::Reorged;
+                projected.reorg_epoch = invoice.reorg_epoch.saturating_add(1);
+            }
+            projected.last_sweep_error = Some(err_msg.clone());
+
+            let webhook = if invoice.status == InvoiceStatus::Swept {
+                match invoice.callback_url.as_deref() {
+                    Some(url) => Some(build_webhook_delivery(
+                        &self.config.webhook_secret,
+                        &projected,
+                        WebhookEventType::Reorged,
+                        url,
+                        now,
+                    )?),
+                    None => None,
+                }
+            } else {
+                None
+            };
+
+            tracing::error!(
+                invoice_id = %invoice.id,
+                order_id = %invoice.order_id,
+                attempt_id = %attempt.id,
+                error = %err_msg,
+                "CRITICAL SECURITY ALERT: outbound sweep reorg/double-spend detected; auto re-sweep blocked pending manual reconciliation"
+            );
+
+            self.repo
+                .mark_sweep_attempt_reorged(attempt.id, invoice.id, &err_msg, webhook, now)
+                .await?;
+            return Ok(None);
+        }
+
+        let expected_count = if attempt.tx_hashes.is_empty() {
+            usize::from(!mined_matches.is_empty())
+        } else {
+            attempt.tx_hashes.len()
+        };
+        let all_final = expected_count > 0
+            && mined_matches.len() == expected_count
+            && mined_matches.iter().all(|entry| {
+                !entry.double_spend_seen
+                    && entry.confirmations >= self.config.settlement_confirmations
+            });
+
+        match attempt.status {
+            SweepAttemptStatus::Submitted | SweepAttemptStatus::Reconciled if all_final => {
+                self.repo
+                    .update_sweep_attempt_status(
+                        attempt.id,
+                        SweepAttemptStatus::Confirmed,
+                        Utc::now(),
+                    )
+                    .await?;
+            }
+            SweepAttemptStatus::Confirmed if !all_final => {
+                // Depth dropped below settlement_confirmations without disappearing or double-spending:
+                // return attempt to SUBMITTED so finality is re-verified.
+                self.repo
+                    .update_sweep_attempt_status(
+                        attempt.id,
+                        SweepAttemptStatus::Submitted,
+                        Utc::now(),
+                    )
+                    .await?;
+            }
+            _ => {}
+        }
+
+        Ok(None)
+    }
+
     async fn execute_sweep_internal(
         &self,
         invoice_id: Uuid,
@@ -878,6 +1060,12 @@ impl ScannerService {
         invoice_id: Uuid,
         allow_terminal_inflows: bool,
     ) -> GatewayResult<Invoice> {
+        if self.repo.has_reorged_sweep_attempt(invoice_id).await? {
+            return Err(GatewayError::Conflict(format!(
+                "invoice {invoice_id} has an unresolved SWEEP_REORG_DETECTED sweep incident requiring manual operator reconciliation"
+            )));
+        }
+
         let in_flight = self
             .repo
             .list_in_flight_sweep_attempts_for_invoice(invoice_id)
