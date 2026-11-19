@@ -18,6 +18,7 @@
   - [3.2. Интерактивное демо `demo-stagenet.sh`](#32-интерактивное-демо-demo-stagenetsh)
   - [3.3. Сводная таблица скриптов, портов и файлов](#33-сводная-таблица-скриптов-портов-и-файлов)
   - [3.4. Остановка процессов и очистка артефактов](#34-остановка-процессов-и-очистка-артефактов)
+  - [3.5. Единая админ-панель `./admin.sh` и модули `admin/`](#35-единая-админ-панель-adminsh-и-модули-admin)
 - [4. Настройка `.env` и переменных окружения](#4-настройка-env-и-переменных-окружения)
   - [4.1. HTTP-сервер и SQLite](#41-http-сервер-и-sqlite)
   - [4.2. Авторизация API и вебхуки](#42-авторизация-api-и-вебхуки)
@@ -217,6 +218,7 @@ PENDING ----------+-----------------------------> MEMPOOL (0-conf, не исте
 | `./start.sh --setup-rpc` | — | `bin/monero-wallet-rpc`, `bin/monero-wallet-cli` | Загрузка и SHA-256/GPG-проверка официального Monero CLI `v0.18.5.4` |
 | `./start.sh --init-wallet-only` | — | `.env`, `data/wallet/gateway_wallet*` | Инициализация `.env` и кошелька без запуска демонов |
 | `./demo-stagenet.sh` | `18082` (RPC), `8080` (API), `9000` (Python webhook listener) | Всё из `start.sh` + `/tmp/stagenet_qr.png` | Однотерминальная живая демонстрация полного цикла оплаты на Stagenet |
+| `./admin.sh` | Использует порты и пути из `--env` (по умолчанию `.env`) | `admin/*.sh`, `admin/lib/common.sh`, `data/pids/*.pid`, `data/xmr-gateway.log`, `data/backups/*` | Интерактивное меню и скриптовый CLI для полного администрирования сервисов, кошельков, инвойсов, вебхуков, БД и проверок безопасности |
 
 ### 3.4. Остановка процессов и очистка артефактов
 
@@ -239,6 +241,39 @@ PENDING ----------+-----------------------------> MEMPOOL (0-conf, не исте
   # Только если нужно пересоздать тестовый stagenet-кошелёк:
   rm -rf data/wallet/
   ```
+
+### 3.5. Единая админ-панель `./admin.sh` и модули `admin/`
+
+Для повседневного администрирования, диагностики, форензики SQLite и безопасных финансовых операций предусмотрена модульная CLI/интерактивная консоль **`./admin.sh`** (общая библиотека в `admin/lib/common.sh`, модули в `admin/`):
+
+- **Два режима работы:**
+  - `./admin.sh` (без аргументов в терминале) — интерактивное меню по всем 7 разделам.
+  - `./admin.sh [--env <path>] [--json] [--yes] <module> <command> [args...]` — скриптовый CLI с поддержкой машиночитаемого JSON (`--json`), выбора альтернативного конфига (`--env .env.mainnet`) и неинтерактивного подтверждения (`--yes`).
+- **Инварианты безопасности админ-панели:**
+  - Все секреты (`API_SECRET_KEY`, `OPERATOR_API_KEY`, `MONERO_RPC_PASS`, `MONERO_DAEMON_RPC_PASS`) передаются в `curl` строго через `stdin` (`curl --config -`), никогда не попадая в аргументы процесса (`ps aux`).
+  - Автоматический выбор RBAC-заголовка: `X-API-Key` для merchant-маршрутов, `X-Operator-Key` (при заданном `OPERATOR_API_KEY`, иначе fallback на `X-API-Key`) для операторских маршрутов (`/sweep`, `/sweep/resolve`, `/retry`).
+  - **Защита Mainnet:** при `MONERO_NETWORK=mainnet` перед финансовыми/деструктивными действиями (`transfer`, `sweep`, `sweep-all`, `resolve`, `rotate-keys`, `stop`, `set-mode`, `db shell --rw`) выводится красный баннер `[MAINNET]` с обязательным подтверждением (или `--yes`).
+  - Доступ к SQLite выполняется в режиме строгого чтения (`mode=ro`, `PRAGMA query_only = ON`, `busy_timeout = 5000`); горячие бэкапы выполняются через `sqlite3.Connection.backup()` с `chmod 600` и проверкой `PRAGMA integrity_check;`.
+
+| Модуль (`admin/*.sh`) | Команды | Назначение |
+|---|---|---|
+| `service` (`admin/service.sh`) | `start`, `stop`, `restart`, `status`, `logs [gateway\|rpc\|cli] [-f] [-n N]`, `build`, `setup-rpc`, `systemd [status\|install-dry-run\|restart]` | Жизненный цикл `monero-wallet-rpc` и `xmr-gateway` с PID-файлами, graceful shutdown (`wal_checkpoint(TRUNCATE)`), просмотр логов, сборка и хелпер для `deploy/systemd/`. |
+| `config` (`admin/config.sh`) | `show`, `doctor [--strict-live]`, `rotate-keys [api\|operator\|webhook\|rpc\|all]`, `set-mode <view_only\|hot_wallet>` | Просмотр конфига с маскированием секретов, fail-closed диагностика (`0600`, RBAC `API_SECRET_KEY != OPERATOR_API_KEY`, режим кошелька, SSRF, `/health`, синхронизация высот), ротация секретов с бэкапом `0600` и безопасное переключение режима. |
+| `wallet` (`admin/wallet.sh`) | `info` / `balance`, `transfers [in\|out\|pool\|pending\|all]`, `refresh`, `set-height <h>`, `rescan`, `create-hot`, `create-view-only`, `export-view-keys`, `transfer <addr> <xmr> [prio]`, `sweep-all <addr> [idx] [prio]`, `cli` | Полное управление hot и view-only кошельками; `transfer` и `sweep-all` используют точную десятичную конвертацию в пиконеро и fail-closed блокируются в режиме `view_only`. |
+| `invoices` (`admin/invoices.sh`) | `create`, `get <id>`, `list [--status ...] [--order-id ...] [--limit N]`, `inspect <id>`, `sweep <id>`, `resolve <id> <allow_resweep\|mark_reconciled> --note ...` | Создание и просмотр инвойсов через REST API, форензика по всем таблицам SQLite, ручной свип и разрешение инцидентов `REORGED` (`XMR-041` / `AUDIT-001` / `AUDIT-004`). |
+| `webhooks` (`admin/webhooks.sh`) | `list`, `inspect <id>`, `retry <id>`, `retry-invoice <invoice_id>`, `verify-sig <sig> [file\|-]`, `test-receiver [port]` | Диагностика очереди `webhook_deliveries`, операторский retry строго `FAILED`-записей (`AUDIT-002`), проверка `X-Signature-256` и встроенный локальный HMAC-приёмник. |
+| `db` (`admin/db.sh`) | `stats`, `audit-invariants`, `backup [dest_dir]`, `shell [--rw]` | Сводка по статусам/суммам XMR и размерам `.db`/`-wal`/`-shm`, fail-closed аудит `PRAGMA integrity_check` + инварианта баланса `AUDIT-005` + зависших свипов, безопасный онлайн-бэкап `0600` и SQLite-консоль (RO по умолчанию). |
+| `dev` (`admin/dev.sh`) | `check`, `health-rbac`, `demo` | Прогон `fmt`/`clippy`/`cargo test`, живая проверка RBAC-матрицы `GET /health` (`AUDIT-002`) и запуск `./demo-stagenet.sh`. |
+
+**Примеры использования и самопроверка админ-панели:**
+```bash
+./admin.sh                                      # Интерактивное меню
+./admin.sh config doctor                        # Fail-closed аудит конфигурации и прав
+./admin.sh --json db audit-invariants           # Проверка целостности БД и инварианта AUDIT-005
+./admin.sh db backup                            # Горячий онлайн-бэкап (0600 + integrity_check)
+./admin.sh dev health-rbac                      # Живая проверка матрицы RBAC на GET /health
+./admin/test_admin.sh                           # Изолированные автотесты самой админ-панели
+```
 
 ---
 

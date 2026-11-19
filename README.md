@@ -420,12 +420,31 @@ pub fn verify_webhook(secret: &str, raw_body: &[u8], signature_hex: &str) -> boo
 
 ---
 
+## Unified Admin CLI (`./admin.sh` & `admin/`)
+
+Run `./admin.sh` without arguments for an interactive menu, or invoke scriptable subcommands (`./admin.sh [--env FILE] [--json] [--yes] <module> <command> [args...]`):
+
+| Module | Key Commands | Purpose |
+| :--- | :--- | :--- |
+| `service` | `start`, `stop`, `restart`, `status`, `logs`, `build`, `setup-rpc`, `systemd` | Lifecycle control with PID files, graceful shutdown (`wal_checkpoint(TRUNCATE)`), logs, and systemd helper |
+| `config` | `show`, `doctor`, `rotate-keys`, `set-mode` | Masked config view, fail-closed security/RBAC/permissions diagnostics, 0600-backed key rotation, mode switching |
+| `wallet` | `info`/`balance`, `transfers`, `refresh`, `set-height`, `rescan`, `create-hot`, `create-view-only`, `export-view-keys`, `transfer`, `sweep-all`, `cli` | Full hot & view-only wallet management (fail-closed spend guard in `view_only` mode; zero-float Decimal piconero conversion) |
+| `invoices` | `create`, `get`, `list`, `inspect`, `sweep`, `resolve` | Merchant/operator REST API wrappers + read-only SQLite forensic inspection |
+| `webhooks` | `list`, `inspect`, `retry`, `retry-invoice`, `verify-sig`, `test-receiver` | Webhook outbox inspection, operator `FAILED`-only retry, HMAC-SHA256 verification, and local test receiver |
+| `db` | `stats`, `audit-invariants`, `backup`, `shell` | Read-only SQLite analytics, `AUDIT-005` balance-conservation audit, WAL-safe hot online backup (`0600`), RO/RW shell |
+| `dev` | `check`, `health-rbac`, `demo` | Rust fmt/clippy/test runner, live `GET /health` `AUDIT-002` RBAC verifier, Stagenet demo launcher |
+
+All secrets are passed to `curl` exclusively via stdin (`--config -`, never in process `argv`), SQLite inspection runs strictly read-only (`mode=ro`), and financial/destructive operations display a `[MAINNET]` confirmation banner when `MONERO_NETWORK=mainnet`.
+
+---
+
 ## Development & Verification
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test --all-targets
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets
+bash -n admin.sh admin/*.sh admin/lib/*.sh && ./admin/test_admin.sh
 ```
 
 Licensed under the [MIT License](LICENSE).
