@@ -10,17 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/common.sh"
 
 usage() {
-    cat <<'EOF'
-Usage: ./admin.sh config <command> [options]
-
-Commands:
-  show                                      Show active configuration with all secrets masked (--json)
-  doctor [--strict-live]                    Run fail-closed security, RBAC, permissions & sync diagnostics (--json)
-  rotate-keys [api|operator|webhook|rpc|all]
-                                            Generate fresh cryptographic secrets with 0600 .env backup
-  set-mode <view_only|hot_wallet>           Safely switch WALLET_MODE with prerequisite checks
-  help                                      Show this help message
-EOF
+    t config.usage
 }
 
 cmd_show() {
@@ -83,29 +73,54 @@ PYEOF
         return 0
     fi
 
-    printf '%s=== Active xmr-gateway Configuration (Secrets Masked) ===%s\n' "$C_BOLD" "$C_RESET"
-    printf '  Env File                     : %s\n' "$ACTIVE_ENV_FILE"
-    printf '  Bind Address                 : %s:%s\n' "$HOST" "$PORT"
-    printf '  DATABASE_URL                 : %s (path: %s)\n' "$DATABASE_URL" "${DB_PATH:-in-memory}"
-    printf '  MONERO_NETWORK               : %s\n' "$MONERO_NETWORK"
-    printf '  WALLET_MODE                  : %s\n' "$WALLET_MODE"
-    printf '  ENABLE_AUTO_SWEEP            : %s (allow_without_sweep=%s)\n' "$ENABLE_AUTO_SWEEP" "$ALLOW_HOT_WALLET_WITHOUT_SWEEP"
-    printf '  COLD_WALLET_ADDRESS          : %s\n' "${COLD_WALLET_ADDRESS:-<unset>}"
-    printf '  MONERO_VIEW_ONLY_ADDRESS     : %s\n' "${MONERO_VIEW_ONLY_ADDRESS:-<unset>}"
-    printf '  MONERO_VIEW_ONLY_KEY         : %s\n' "$(mask_secret "$MONERO_VIEW_ONLY_KEY")"
-    printf '  API_SECRET_KEY               : %s\n' "$(mask_secret "$API_SECRET_KEY")"
-    printf '  OPERATOR_API_KEY             : %s\n' "$(mask_secret "$OPERATOR_API_KEY")"
-    printf '  WEBHOOK_SECRET               : %s\n' "$(mask_secret "$WEBHOOK_SECRET")"
-    printf '  DEFAULT_WEBHOOK_URL          : %s\n' "${DEFAULT_WEBHOOK_URL:-<unset>}"
-    printf '  ALLOW_PRIVATE_WEBHOOKS       : %s | REQUIRE_HTTPS_WEBHOOKS=%s\n' "$ALLOW_PRIVATE_WEBHOOKS" "$REQUIRE_HTTPS_WEBHOOKS"
-    printf '  MONERO_RPC_URL               : %s (user=%s, pass=%s)\n' "$MONERO_RPC_URL" "${MONERO_RPC_USER:-<unset>}" "$(mask_secret "$MONERO_RPC_PASS")"
-    printf '  MONERO_DAEMON_RPC_URL        : %s (user=%s, pass=%s)\n' "${MONERO_DAEMON_RPC_URL:-<unset>}" "${MONERO_DAEMON_RPC_USER:-<unset>}" "$(mask_secret "$MONERO_DAEMON_RPC_PASS")"
-    printf '  MONERO_REMOTE_NODE           : %s (trusted=%s, proxy=%s)\n' "$MONERO_REMOTE_NODE" "$MONERO_TRUSTED_DAEMON" "${MONERO_RPC_PROXY:-<none>}"
-    printf '  RPC Overrides                : allow_unauth=%s | allow_insecure_remote=%s\n' "$ALLOW_UNAUTHENTICATED_RPC" "$ALLOW_INSECURE_REMOTE_RPC"
-    printf '  Confirmations                : required=%s | settlement=%s | sweep_priority=%s\n' "$REQUIRED_CONFIRMATIONS" "$SETTLEMENT_CONFIRMATIONS" "$SWEEP_PRIORITY"
-    printf '  Intervals / Retention        : ttl=%ss | scan=%ss | webhook_poll=%ss | monitor_days=%s\n' \
-        "$INVOICE_TTL_SECONDS" "$SCAN_INTERVAL_SECONDS" "$WEBHOOK_POLL_INTERVAL_SECONDS" "$SUBADDRESS_MONITOR_DAYS"
-    printf '  Logging                      : format=%s | RUST_LOG=%s\n' "$LOG_FORMAT" "$RUST_LOG"
+    printf '%s%s%s\n' "$C_BOLD" "$(t config.show_header)" "$C_RESET"
+    if [[ "$ADMIN_ACTIVE_LANG" == "ru" ]]; then
+        printf '  Файл окружения               : %s\n' "$ACTIVE_ENV_FILE"
+        printf '  Адрес прослушивания          : %s:%s\n' "$HOST" "$PORT"
+        printf '  DATABASE_URL                 : %s (файл: %s)\n' "$DATABASE_URL" "${DB_PATH:-в памяти}"
+        printf '  MONERO_NETWORK               : %s\n' "$MONERO_NETWORK"
+        printf '  WALLET_MODE                  : %s\n' "$WALLET_MODE"
+        printf '  ENABLE_AUTO_SWEEP            : %s (allow_without_sweep=%s)\n' "$ENABLE_AUTO_SWEEP" "$ALLOW_HOT_WALLET_WITHOUT_SWEEP"
+        printf '  COLD_WALLET_ADDRESS          : %s\n' "${COLD_WALLET_ADDRESS:-<не задан>}"
+        printf '  MONERO_VIEW_ONLY_ADDRESS     : %s\n' "${MONERO_VIEW_ONLY_ADDRESS:-<не задан>}"
+        printf '  MONERO_VIEW_ONLY_KEY         : %s\n' "$(mask_secret "$MONERO_VIEW_ONLY_KEY")"
+        printf '  API_SECRET_KEY               : %s\n' "$(mask_secret "$API_SECRET_KEY")"
+        printf '  OPERATOR_API_KEY             : %s\n' "$(mask_secret "$OPERATOR_API_KEY")"
+        printf '  WEBHOOK_SECRET               : %s\n' "$(mask_secret "$WEBHOOK_SECRET")"
+        printf '  DEFAULT_WEBHOOK_URL          : %s\n' "${DEFAULT_WEBHOOK_URL:-<не задан>}"
+        printf '  ALLOW_PRIVATE_WEBHOOKS       : %s | REQUIRE_HTTPS_WEBHOOKS=%s\n' "$ALLOW_PRIVATE_WEBHOOKS" "$REQUIRE_HTTPS_WEBHOOKS"
+        printf '  MONERO_RPC_URL               : %s (user=%s, pass=%s)\n' "$MONERO_RPC_URL" "${MONERO_RPC_USER:-<не задан>}" "$(mask_secret "$MONERO_RPC_PASS")"
+        printf '  MONERO_DAEMON_RPC_URL        : %s (user=%s, pass=%s)\n' "${MONERO_DAEMON_RPC_URL:-<не задан>}" "${MONERO_DAEMON_RPC_USER:-<не задан>}" "$(mask_secret "$MONERO_DAEMON_RPC_PASS")"
+        printf '  MONERO_REMOTE_NODE           : %s (trusted=%s, proxy=%s)\n' "$MONERO_REMOTE_NODE" "$MONERO_TRUSTED_DAEMON" "${MONERO_RPC_PROXY:-<нет>}"
+        printf '  Переопределения RPC          : allow_unauth=%s | allow_insecure_remote=%s\n' "$ALLOW_UNAUTHENTICATED_RPC" "$ALLOW_INSECURE_REMOTE_RPC"
+        printf '  Подтверждения                : required=%s | settlement=%s | sweep_priority=%s\n' "$REQUIRED_CONFIRMATIONS" "$SETTLEMENT_CONFIRMATIONS" "$SWEEP_PRIORITY"
+        printf '  Интервалы / мониторинг       : ttl=%ss | scan=%ss | webhook_poll=%ss | monitor_days=%s\n' \
+            "$INVOICE_TTL_SECONDS" "$SCAN_INTERVAL_SECONDS" "$WEBHOOK_POLL_INTERVAL_SECONDS" "$SUBADDRESS_MONITOR_DAYS"
+        printf '  Логирование                  : format=%s | RUST_LOG=%s\n' "$LOG_FORMAT" "$RUST_LOG"
+    else
+        printf '  Env File                     : %s\n' "$ACTIVE_ENV_FILE"
+        printf '  Bind Address                 : %s:%s\n' "$HOST" "$PORT"
+        printf '  DATABASE_URL                 : %s (path: %s)\n' "$DATABASE_URL" "${DB_PATH:-in-memory}"
+        printf '  MONERO_NETWORK               : %s\n' "$MONERO_NETWORK"
+        printf '  WALLET_MODE                  : %s\n' "$WALLET_MODE"
+        printf '  ENABLE_AUTO_SWEEP            : %s (allow_without_sweep=%s)\n' "$ENABLE_AUTO_SWEEP" "$ALLOW_HOT_WALLET_WITHOUT_SWEEP"
+        printf '  COLD_WALLET_ADDRESS          : %s\n' "${COLD_WALLET_ADDRESS:-<unset>}"
+        printf '  MONERO_VIEW_ONLY_ADDRESS     : %s\n' "${MONERO_VIEW_ONLY_ADDRESS:-<unset>}"
+        printf '  MONERO_VIEW_ONLY_KEY         : %s\n' "$(mask_secret "$MONERO_VIEW_ONLY_KEY")"
+        printf '  API_SECRET_KEY               : %s\n' "$(mask_secret "$API_SECRET_KEY")"
+        printf '  OPERATOR_API_KEY             : %s\n' "$(mask_secret "$OPERATOR_API_KEY")"
+        printf '  WEBHOOK_SECRET               : %s\n' "$(mask_secret "$WEBHOOK_SECRET")"
+        printf '  DEFAULT_WEBHOOK_URL          : %s\n' "${DEFAULT_WEBHOOK_URL:-<unset>}"
+        printf '  ALLOW_PRIVATE_WEBHOOKS       : %s | REQUIRE_HTTPS_WEBHOOKS=%s\n' "$ALLOW_PRIVATE_WEBHOOKS" "$REQUIRE_HTTPS_WEBHOOKS"
+        printf '  MONERO_RPC_URL               : %s (user=%s, pass=%s)\n' "$MONERO_RPC_URL" "${MONERO_RPC_USER:-<unset>}" "$(mask_secret "$MONERO_RPC_PASS")"
+        printf '  MONERO_DAEMON_RPC_URL        : %s (user=%s, pass=%s)\n' "${MONERO_DAEMON_RPC_URL:-<unset>}" "${MONERO_DAEMON_RPC_USER:-<unset>}" "$(mask_secret "$MONERO_DAEMON_RPC_PASS")"
+        printf '  MONERO_REMOTE_NODE           : %s (trusted=%s, proxy=%s)\n' "$MONERO_REMOTE_NODE" "$MONERO_TRUSTED_DAEMON" "${MONERO_RPC_PROXY:-<none>}"
+        printf '  RPC Overrides                : allow_unauth=%s | allow_insecure_remote=%s\n' "$ALLOW_UNAUTHENTICATED_RPC" "$ALLOW_INSECURE_REMOTE_RPC"
+        printf '  Confirmations                : required=%s | settlement=%s | sweep_priority=%s\n' "$REQUIRED_CONFIRMATIONS" "$SETTLEMENT_CONFIRMATIONS" "$SWEEP_PRIORITY"
+        printf '  Intervals / Retention        : ttl=%ss | scan=%ss | webhook_poll=%ss | monitor_days=%s\n' \
+            "$INVOICE_TTL_SECONDS" "$SCAN_INTERVAL_SECONDS" "$WEBHOOK_POLL_INTERVAL_SECONDS" "$SUBADDRESS_MONITOR_DAYS"
+        printf '  Logging                      : format=%s | RUST_LOG=%s\n' "$LOG_FORMAT" "$RUST_LOG"
+    fi
 }
 
 cmd_doctor() {
@@ -386,10 +401,45 @@ if os.environ.get("DOCTOR_JSON") == "1":
         "checks": checks,
     }, indent=2))
 else:
-    print(f"=== xmr-gateway Doctor ({env_file}) ===")
-    for c in checks:
-        print(f"  [{c['status']:4s}] {c['check']:<26s} {c['detail']}")
-    print(f"\nSummary: {len(passes)} PASS, {len(warns)} WARN, {len(fails)} FAIL")
+    lang = os.environ.get("ADMIN_ACTIVE_LANG", "en")
+    ru_labels = {
+        "env_permissions": "Права .env (0600)",
+        "wallet_keys_permissions": "Права файла ключей кошелька",
+        "wallet_pass_permissions": "Права файла пароля кошелька",
+        "db_permissions": "Права файла БД SQLite",
+        "wal_permissions": "Права файла -wal",
+        "shm_permissions": "Права файла -shm",
+        "secret_api_secret_key": "Секрет API_SECRET_KEY",
+        "secret_webhook_secret": "Секрет WEBHOOK_SECRET",
+        "secret_operator_api_key": "Секрет OPERATOR_API_KEY",
+        "rbac_key_separation": "Разделение RBAC (AUDIT-002)",
+        "wallet_mode": "Режим WALLET_MODE",
+        "cold_wallet_address": "Адрес COLD_WALLET_ADDRESS",
+        "view_only_bootstrap": "Параметры view_only",
+        "confirmations": "Пороги подтверждений",
+        "sweep_priority": "Приоритет SWEEP_PRIORITY",
+        "numeric_config": "Числовые параметры",
+        "ssrf_policy": "Политика SSRF вебхуков",
+        "rpc_auth": "Аутентификация RPC",
+        "daemon_rpc_security": "Безопасность MONERO_DAEMON_RPC_URL",
+        "sqlite_files": "Файлы SQLite / WAL / lock",
+        "health_anon_privacy": "Скрытие телеметрии /health",
+        "health_auth_api": "Диагностика /health (X-API-Key)",
+        "health_auth_operator": "Диагностика /health (X-Operator-Key)",
+        "health_live": "Доступность /health",
+        "wallet_daemon_sync": "Синхронизация кошелька и демона",
+    }
+    if lang == "ru":
+        print(f"=== Диагностика безопасности xmr-gateway ({env_file}) ===")
+        for c in checks:
+            lbl = ru_labels.get(c["check"], c["check"])
+            print(f"  [{c['status']:4s}] {lbl:<36s} ({c['check']}) — {c['detail']}")
+        print(f"\nИтог: {len(passes)} PASS, {len(warns)} WARN, {len(fails)} FAIL")
+    else:
+        print(f"=== xmr-gateway Doctor ({env_file}) ===")
+        for c in checks:
+            print(f"  [{c['status']:4s}] {c['check']:<26s} {c['detail']}")
+        print(f"\nSummary: {len(passes)} PASS, {len(warns)} WARN, {len(fails)} FAIL")
 
 sys.exit(1 if fails else 0)
 PYEOF
@@ -404,14 +454,14 @@ cmd_rotate_keys() {
         *) die "Invalid rotate-keys scope '$scope'. Expected: api | operator | webhook | rpc | all" ;;
     esac
 
-    confirm_dangerous_action "Rotate secrets ($scope) in $ACTIVE_ENV_FILE" 1
+    confirm_dangerous_action "$(t config.confirm_rotate "$scope" "$ACTIVE_ENV_FILE")" 1
 
     local ts backup_file
     ts="$(date -u +%Y%m%dT%H%M%SZ)"
     backup_file="${ACTIVE_ENV_FILE}.bak.${ts}"
     cp "$ACTIVE_ENV_FILE" "$backup_file"
     chmod 600 "$backup_file"
-    log_info "Created 0600 backup: $backup_file"
+    log_info "$(t config.backup_created "$backup_file")"
 
     local rotated=()
     if [[ "$scope" == "api" || "$scope" == "all" ]]; then
@@ -457,8 +507,8 @@ print(json.dumps({
 }, indent=2))
 PYEOF
     else
-        log_info "Rotated keys: ${rotated[*]}"
-        log_warn "Restart services ('./admin.sh service restart') and update client/bot credentials."
+        log_info "$(t config.rotated_keys "${rotated[*]}")"
+        log_warn "$(t config.restart_hint)"
     fi
 }
 
@@ -483,26 +533,26 @@ cmd_set_mode() {
         fi
     fi
 
-    confirm_dangerous_action "Switch WALLET_MODE to '$target_mode' in $ACTIVE_ENV_FILE" 1
+    confirm_dangerous_action "$(t config.confirm_set_mode "$target_mode" "$ACTIVE_ENV_FILE")" 1
 
     local ts backup_file
     ts="$(date -u +%Y%m%dT%H%M%SZ)"
     backup_file="${ACTIVE_ENV_FILE}.bak.${ts}"
     cp "$ACTIVE_ENV_FILE" "$backup_file"
     chmod 600 "$backup_file"
-    log_info "Created 0600 backup: $backup_file"
+    log_info "$(t config.backup_created "$backup_file")"
 
     set_env_kv_file "$ACTIVE_ENV_FILE" "WALLET_MODE" "$target_mode"
     if [[ "$target_mode" == "view_only" ]]; then
         set_env_kv_file "$ACTIVE_ENV_FILE" "ENABLE_AUTO_SWEEP" "false"
-        log_info "Set WALLET_MODE=view_only and ENABLE_AUTO_SWEEP=false."
-        log_warn "Ensure the wallet at $WALLET_FILE is genuinely view-only (no spend key) before starting."
+        log_info "$(t config.set_mode_vo_done)"
+        log_warn "$(t config.set_mode_vo_warn "$WALLET_FILE")"
     else
         if [[ -n "${COLD_WALLET_ADDRESS:-}" ]]; then
             set_env_kv_file "$ACTIVE_ENV_FILE" "ENABLE_AUTO_SWEEP" "true"
-            log_info "Set WALLET_MODE=hot_wallet and ENABLE_AUTO_SWEEP=true (cold destination: $COLD_WALLET_ADDRESS)."
+            log_info "$(t config.set_mode_hot_done "$COLD_WALLET_ADDRESS")"
         else
-            log_info "Set WALLET_MODE=hot_wallet (ALLOW_HOT_WALLET_WITHOUT_SWEEP=true)."
+            log_info "$(t config.set_mode_hot_nosweep)"
         fi
     fi
 }
@@ -519,7 +569,7 @@ main() {
         rotate-keys) cmd_rotate_keys "$@" ;;
         set-mode)    cmd_set_mode "$@" ;;
         help|-h|--help) usage ;;
-        *)           die "Unknown config command: '$cmd'. Run './admin.sh config help'." ;;
+        *)           die "$(t config.unknown_cmd "$cmd")" ;;
     esac
 }
 

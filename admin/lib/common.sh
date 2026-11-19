@@ -26,6 +26,10 @@ ADMIN_JSON="${ADMIN_JSON:-0}"
 ADMIN_YES="${ADMIN_YES:-0}"
 ADMIN_ENV_LOADED=0
 
+# Load pure-Bash RU/EN i18n subsystem
+# shellcheck source=admin/lib/i18n.sh
+source "$ADMIN_LIB_DIR/i18n.sh"
+
 # ANSI colors (disabled automatically when stdout/stderr is not a TTY or NO_COLOR is set)
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
     C_RESET=$'\033[0m'
@@ -76,11 +80,11 @@ die() {
 require_cmd() {
     local cmd="$1"
     if ! command -v "$cmd" >/dev/null 2>&1; then
-        die "Required command '$cmd' was not found in PATH."
+        die "$(t common.required_cmd_missing "$cmd")"
     fi
 }
 
-# Extracts global flags (--env, --json, --yes) from an argument list and stores
+# Extracts global flags (--env, --lang, --json, --yes) from an argument list and stores
 # the remaining arguments in the global array ADMIN_REST_ARGS.
 ADMIN_REST_ARGS=()
 parse_global_flags() {
@@ -88,12 +92,28 @@ parse_global_flags() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --env)
-                [[ $# -ge 2 ]] || die "--env requires a file path argument."
+                [[ $# -ge 2 ]] || die "$(t common.env_flag_missing)"
                 ADMIN_ENV_FILE="$2"
                 shift 2
                 ;;
             --env=*)
                 ADMIN_ENV_FILE="${1#*=}"
+                shift
+                ;;
+            --lang)
+                [[ $# -ge 2 ]] || die "$(t common.lang_flag_missing)"
+                if ! i18n_normalize_lang "$2" >/dev/null; then
+                    die "$(t common.invalid_lang "$2")"
+                fi
+                ADMIN_CLI_LANG="$(i18n_normalize_lang "$2")"
+                shift 2
+                ;;
+            --lang=*)
+                local raw_lang="${1#*=}"
+                if ! i18n_normalize_lang "$raw_lang" >/dev/null; then
+                    die "$(t common.invalid_lang "$raw_lang")"
+                fi
+                ADMIN_CLI_LANG="$(i18n_normalize_lang "$raw_lang")"
                 shift
                 ;;
             --json)
@@ -117,7 +137,8 @@ parse_global_flags() {
                 ;;
         esac
     done
-    export ADMIN_ENV_FILE ADMIN_JSON ADMIN_YES
+    i18n_init
+    export ADMIN_ENV_FILE ADMIN_JSON ADMIN_YES ADMIN_CLI_LANG ADMIN_ACTIVE_LANG ADMIN_LANG_SOURCE
 }
 
 resolve_env_file() {
@@ -169,7 +190,7 @@ load_env() {
             fi
         done < "$env_path"
     elif [[ "$optional" != "1" ]]; then
-        die "Environment file not found: $env_path (use --env <path> or copy .env.example to .env)"
+        die "$(t common.env_not_found "$env_path")"
     fi
 
     # Defaults matching src/config.rs and start.sh
@@ -332,33 +353,28 @@ confirm_dangerous_action() {
 
     if [[ "$is_mainnet" -eq 1 ]]; then
         printf '\n%s==============================================================================%s\n' "$CE_RED" "$CE_RESET" >&2
-        printf '%s  [MAINNET] WARNING: REAL FUNDS / PRODUCTION OPERATION%s\n' "$CE_RED" "$CE_RESET" >&2
-        printf '%s  Action : %s%s\n' "$CE_RED" "$action_desc" "$CE_RESET" >&2
-        printf '%s  Env    : %s%s\n' "$CE_RED" "${ACTIVE_ENV_FILE:-.env}" "$CE_RESET" >&2
+        printf '%s%s%s\n' "$CE_RED" "$(t common.mainnet_banner_title)" "$CE_RESET" >&2
+        printf '%s%s%s\n' "$CE_RED" "$(t common.mainnet_action_label "$action_desc")" "$CE_RESET" >&2
+        printf '%s%s%s\n' "$CE_RED" "$(t common.mainnet_env_label "${ACTIVE_ENV_FILE:-.env}")" "$CE_RESET" >&2
         printf '%s==============================================================================%s\n' "$CE_RED" "$CE_RESET" >&2
     else
-        printf '\n%s[CONFIRM]%s %s\n' "$CE_YELLOW" "$CE_RESET" "$action_desc" >&2
+        printf '\n%s%s%s\n' "$CE_YELLOW" "$(t common.confirm_tag "$action_desc")" "$CE_RESET" >&2
     fi
 
     if [[ "${ADMIN_YES:-0}" -eq 1 ]]; then
-        log_warn "Proceeding non-interactively (--yes specified)."
+        log_warn "$(t common.proceed_non_interactive)"
         return 0
     fi
 
     if [[ ! -t 0 ]]; then
-        die "Refusing to execute '$action_desc' non-interactively without --yes."
-    fi
-
-    local prompt_token="yes"
-    if [[ "$is_mainnet" -eq 1 ]]; then
-        prompt_token="MAINNET"
+        die "$(t common.refuse_non_interactive "$action_desc")"
     fi
 
     local reply=""
-    printf 'Type %s to confirm (anything else cancels): ' "$prompt_token" >&2
+    printf '%s' "$(t common.confirm_prompt)" >&2
     IFS= read -r reply || true
-    if [[ "$reply" != "$prompt_token" ]]; then
-        die "Operation cancelled by operator."
+    if [[ "$reply" != "yes" ]]; then
+        die "$(t common.cancelled)"
     fi
 }
 
@@ -454,7 +470,7 @@ gateway_api_call() {
         none)
             ;;
         merchant|health_api)
-            [[ -n "${API_SECRET_KEY:-}" ]] || { rm -f "$tmp_out" "${tmp_body:-}"; die "API_SECRET_KEY is not set in ${ACTIVE_ENV_FILE:-.env}."; }
+            [[ -n "${API_SECRET_KEY:-}" ]] || { rm -f "$tmp_out" "${tmp_body:-}"; die "$(t common.missing_api_key "${ACTIVE_ENV_FILE:-.env}")"; }
             cfg_lines+=("header = \"X-API-Key: $(curl_cfg_escape "$API_SECRET_KEY")\"")
             ;;
         operator)
@@ -464,7 +480,7 @@ gateway_api_call() {
                 cfg_lines+=("header = \"X-API-Key: $(curl_cfg_escape "$API_SECRET_KEY")\"")
             else
                 rm -f "$tmp_out" "${tmp_body:-}"
-                die "Neither OPERATOR_API_KEY nor API_SECRET_KEY is set in ${ACTIVE_ENV_FILE:-.env}."
+                die "$(t common.missing_operator_or_api_key "${ACTIVE_ENV_FILE:-.env}")"
             fi
             ;;
         health_operator)
@@ -621,8 +637,8 @@ pretty_print_json() {
 # Script source is read from stdin.
 sqlite_ro_python() {
     require_cmd python3
-    [[ -n "${DB_PATH:-}" ]] || die "DATABASE_URL is in-memory or empty; no file-backed SQLite database available."
-    [[ -f "$DB_PATH" ]] || die "SQLite database file not found: $DB_PATH"
+    [[ -n "${DB_PATH:-}" ]] || die "$(t common.db_memory_only)"
+    [[ -f "$DB_PATH" ]] || die "$(t common.db_not_found "$DB_PATH")"
     python3 - "$DB_PATH" "$@"
 }
 

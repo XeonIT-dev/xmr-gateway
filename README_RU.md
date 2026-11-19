@@ -246,9 +246,10 @@ PENDING ----------+-----------------------------> MEMPOOL (0-conf, не исте
 
 Для повседневного администрирования, диагностики, форензики SQLite и безопасных финансовых операций предусмотрена модульная CLI/интерактивная консоль **`./admin.sh`** (общая библиотека в `admin/lib/common.sh`, модули в `admin/`):
 
-- **Два режима работы:**
-  - `./admin.sh` (без аргументов в терминале) — интерактивное меню по всем 7 разделам.
-  - `./admin.sh [--env <path>] [--json] [--yes] <module> <command> [args...]` — скриптовый CLI с поддержкой машиночитаемого JSON (`--json`), выбора альтернативного конфига (`--env .env.mainnet`) и неинтерактивного подтверждения (`--yes`).
+- **Два режима работы и двуязычность (`RU` / `EN`):**
+  - `./admin.sh` (без аргументов в терминале) — интерактивное меню по всем 7 разделам с пунктами **`[G]`** (открыть инструкцию) и **`[L]`** (мгновенно переключить язык `RU ↔ EN`).
+  - `./admin.sh [--env <path>] [--lang <en|ru>] [--json] [--yes] <module> <command> [args...]` — скриптовый CLI с поддержкой выбора языка (`--lang`, `ADMIN_LANG`, `./admin.sh lang [show|en|ru]` с сохранением в `data/.admin_lang`), строго инвариантного к языку JSON (`--json`), альтернативного конфига (`--env .env.mainnet`) и неинтерактивного подтверждения (`--yes`).
+  - **Полные инструкции:** [admin/GUIDE_RU.md](admin/GUIDE_RU.md) (на русском) и [admin/GUIDE_EN.md](admin/GUIDE_EN.md) (in English), а также команда `./admin.sh guide [--path]` прямо из CLI.
 - **Инварианты безопасности админ-панели:**
   - Все секреты (`API_SECRET_KEY`, `OPERATOR_API_KEY`, `MONERO_RPC_PASS`, `MONERO_DAEMON_RPC_PASS`) передаются в `curl` строго через `stdin` (`curl --config -`), никогда не попадая в аргументы процесса (`ps aux`).
   - Автоматический выбор RBAC-заголовка: `X-API-Key` для merchant-маршрутов, `X-Operator-Key` (при заданном `OPERATOR_API_KEY`, иначе fallback на `X-API-Key`) для операторских маршрутов (`/sweep`, `/sweep/resolve`, `/retry`).
@@ -264,10 +265,13 @@ PENDING ----------+-----------------------------> MEMPOOL (0-conf, не исте
 | `webhooks` (`admin/webhooks.sh`) | `list`, `inspect <id>`, `retry <id>`, `retry-invoice <invoice_id>`, `verify-sig <sig> [file\|-]`, `test-receiver [port]` | Диагностика очереди `webhook_deliveries`, операторский retry строго `FAILED`-записей (`AUDIT-002`), проверка `X-Signature-256` и встроенный локальный HMAC-приёмник. |
 | `db` (`admin/db.sh`) | `stats`, `audit-invariants`, `backup [dest_dir]`, `shell [--rw]` | Сводка по статусам/суммам XMR и размерам `.db`/`-wal`/`-shm`, fail-closed аудит `PRAGMA integrity_check` + инварианта баланса `AUDIT-005` + зависших свипов, безопасный онлайн-бэкап `0600` и SQLite-консоль (RO по умолчанию). |
 | `dev` (`admin/dev.sh`) | `check`, `health-rbac`, `demo` | Прогон `fmt`/`clippy`/`cargo test`, живая проверка RBAC-матрицы `GET /health` (`AUDIT-002`) и запуск `./demo-stagenet.sh`. |
+| `lang` / `guide` (`admin.sh`) | `lang [show\|en\|ru]`, `guide [--path]` | Показ/переключение языка интерфейса (`RU`/`EN`) с сохранением в `data/.admin_lang` (`0600`) и просмотр встроенного руководства `admin/GUIDE_RU.md` / `admin/GUIDE_EN.md`. |
 
 **Примеры использования и самопроверка админ-панели:**
 ```bash
-./admin.sh                                      # Интерактивное меню
+./admin.sh                                      # Интерактивное меню (с переключением RU/EN)
+./admin.sh lang ru                              # Сохранить русский язык интерфейса
+./admin.sh guide                                # Открыть полное руководство (admin/GUIDE_RU.md)
 ./admin.sh config doctor                        # Fail-closed аудит конфигурации и прав
 ./admin.sh --json db audit-invariants           # Проверка целостности БД и инварианта AUDIT-005
 ./admin.sh db backup                            # Горячий онлайн-бэкап (0600 + integrity_check)

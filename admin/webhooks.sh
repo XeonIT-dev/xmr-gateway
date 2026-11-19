@@ -10,20 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/common.sh"
 
 usage() {
-    cat <<'EOF'
-Usage: ./admin.sh webhooks <command> [options]
-
-Commands:
-  list [--status PENDING|FAILED|DELIVERED] [--invoice-id UUID] [--limit N]
-                                         List webhook outbox deliveries from SQLite (read-only)
-  inspect <webhook_id>                   Show full delivery record (payload, attempts, last_status_code, error)
-  retry <webhook_id>                     Retry a FAILED webhook via POST /api/v1/webhooks/{id}/retry (operator)
-  retry-invoice <invoice_id>             Retry all FAILED webhooks for invoice via
-                                         POST /api/v1/invoices/{id}/webhooks/retry (operator)
-  verify-sig <signature_hex> [file|-]    Verify X-Signature-256 against WEBHOOK_SECRET (constant-time)
-  test-receiver [port]                   Run local Python HTTP webhook receiver verifying X-Signature-256 (default 9000)
-  help                                   Show this help message
-EOF
+    t webhooks.usage
 }
 
 cmd_list() {
@@ -155,7 +142,7 @@ cmd_retry() {
     if [[ "$ADMIN_JSON" -eq 1 ]]; then
         printf '%s\n' "$API_LAST_BODY" | pretty_print_json
     else
-        log_info "Scheduled retry for FAILED webhook $webhook_id:"
+        log_info "$(t webhooks.retry_done "$webhook_id")"
         printf '%s\n' "$API_LAST_BODY" | pretty_print_json
     fi
 }
@@ -173,7 +160,7 @@ cmd_retry_invoice() {
     if [[ "$ADMIN_JSON" -eq 1 ]]; then
         printf '%s\n' "$API_LAST_BODY" | pretty_print_json
     else
-        log_info "Scheduled batch retry for FAILED webhooks of invoice $invoice_id:"
+        log_info "$(t webhooks.retry_invoice_done "$invoice_id")"
         printf '%s\n' "$API_LAST_BODY" | pretty_print_json
     fi
 }
@@ -227,7 +214,7 @@ cmd_test_receiver() {
     [[ "$port" =~ ^[1-9][0-9]*$ ]] && [[ "$port" -le 65535 ]] || die "Invalid port: $port"
     [[ -n "${WEBHOOK_SECRET:-}" ]] || die "WEBHOOK_SECRET is not set in $ACTIVE_ENV_FILE."
 
-    log_info "Starting local HMAC-SHA256 webhook receiver on http://127.0.0.1:${port}/webhooks/monero (Ctrl+C to stop)..."
+    log_info "$(t webhooks.receiver_start "$port")"
     python3 -u - "$port" <<'PYEOF'
 import hashlib, hmac, json, os, sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -291,7 +278,7 @@ main() {
         verify-sig)    cmd_verify_sig "$@" ;;
         test-receiver) cmd_test_receiver "$@" ;;
         help|-h|--help) usage ;;
-        *)             die "Unknown webhooks command: '$cmd'. Run './admin.sh webhooks help'." ;;
+        *)             die "$(t webhooks.unknown_cmd "$cmd")" ;;
     esac
 }
 

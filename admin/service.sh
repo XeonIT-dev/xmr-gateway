@@ -10,22 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/common.sh"
 
 usage() {
-    cat <<'EOF'
-Usage: ./admin.sh service <command> [options]
-
-Commands:
-  start                            Start monero-wallet-rpc and xmr-gateway with PID files
-  stop                             Gracefully stop xmr-gateway (WAL checkpoint) & monero-wallet-rpc
-  restart                          Gracefully restart both services
-  status                           Show PIDs, ports, /health, and wallet RPC status (--json supported)
-  logs [gateway|rpc|cli] [-f] [-n N]
-                                   Show or tail service logs (default: gateway, -n 50)
-  build                            Build release binary (cargo build --release --locked)
-  setup-rpc                        Install & SHA256-verify Monero CLI tools via ./start.sh --setup-rpc
-  systemd [status|install-dry-run|restart]
-                                   Inspect or manage deploy/systemd/ service units
-  help                             Show this help message
-EOF
+    t service.usage
 }
 
 read_pid_file() {
@@ -49,11 +34,11 @@ stop_process_gracefully() {
     local pid=""
     if ! pid="$(read_pid_file "$pid_file")"; then
         rm -f "$pid_file"
-        log_info "$name is not running (no active PID in $pid_file)."
+        log_info "$(t service.not_running "$name" "$pid_file")"
         return 0
     fi
 
-    log_info "Sending SIGTERM to $name (PID $pid) for graceful shutdown..."
+    log_info "$(t service.sending_sigterm "$name" "$pid")"
     kill -TERM "$pid" 2>/dev/null || true
 
     local ticks=$((timeout_sec * 2))
@@ -64,13 +49,13 @@ stop_process_gracefully() {
     done
 
     if kill -0 "$pid" 2>/dev/null; then
-        log_warn "$name (PID $pid) did not exit within ${timeout_sec}s; sending SIGKILL."
+        log_warn "$(t service.sigkill_warn "$name" "$pid" "$timeout_sec")"
         kill -KILL "$pid" 2>/dev/null || true
         sleep 0.5
     fi
 
     rm -f "$pid_file"
-    log_info "$name stopped."
+    log_info "$(t service.stopped "$name")"
 }
 
 cmd_start() {
@@ -80,16 +65,16 @@ cmd_start() {
     chmod 700 "$DATA_DIR" "$WALLET_DIR" "$PID_DIR"
 
     local rpc_bin
-    rpc_bin="$(find_monero_bin monero-wallet-rpc)" || die "monero-wallet-rpc not found. Run: ./admin.sh service setup-rpc"
+    rpc_bin="$(find_monero_bin monero-wallet-rpc)" || die "$(t service.rpc_missing)"
 
     if [[ ! -f "${WALLET_FILE}.keys" ]]; then
-        die "Wallet file ${WALLET_FILE}.keys does not exist. Create one via './admin.sh wallet create-view-only' or './admin.sh wallet create-hot'."
+        die "$(t service.wallet_missing "${WALLET_FILE}.keys")"
     fi
     if [[ ! -f "$WALLET_PASS_FILE" ]]; then
-        die "Wallet password file missing: $WALLET_PASS_FILE"
+        die "$(t service.pass_missing "$WALLET_PASS_FILE")"
     fi
     if [[ ! -x "$GATEWAY_BIN" ]]; then
-        log_warn "Release binary not found at $GATEWAY_BIN; building first..."
+        log_warn "$(t service.building_missing_bin "$GATEWAY_BIN")"
         cmd_build
     fi
 
@@ -98,10 +83,10 @@ cmd_start() {
     rpc_port="$(extract_url_port "$MONERO_RPC_URL" 18082)"
 
     if read_pid_file "$RPC_PID_FILE" >/dev/null; then
-        log_info "monero-wallet-rpc is already running (PID $(cat "$RPC_PID_FILE"))."
+        log_info "$(t service.already_running "monero-wallet-rpc" "$(cat "$RPC_PID_FILE")")"
     else
         if [[ -z "${MONERO_RPC_USER:-}" || -z "${MONERO_RPC_PASS:-}" ]] && ! is_truthy "$ALLOW_UNAUTHENTICATED_RPC"; then
-            die "MONERO_RPC_USER and MONERO_RPC_PASS must be set in $ACTIVE_ENV_FILE."
+            die "MONERO_RPC_USER / MONERO_RPC_PASS: $ACTIVE_ENV_FILE"
         fi
 
         local rpc_args=(
@@ -133,7 +118,7 @@ cmd_start() {
             rpc_args+=(--proxy "$MONERO_RPC_PROXY")
         fi
 
-        log_step "Starting monero-wallet-rpc ($MONERO_NETWORK) on 127.0.0.1:${rpc_port}..."
+        log_step "$(t service.starting_rpc "$MONERO_NETWORK" "$rpc_port")"
         nohup "$rpc_bin" "${rpc_args[@]}" >/dev/null 2>&1 &
         local rpc_pid=$!
         printf '%s\n' "$rpc_pid" > "$RPC_PID_FILE"
@@ -143,27 +128,27 @@ cmd_start() {
         while [[ "$attempt" -lt 120 ]]; do
             if ! kill -0 "$rpc_pid" 2>/dev/null; then
                 rm -f "$RPC_PID_FILE"
-                log_err "monero-wallet-rpc exited unexpectedly. Last 20 log lines:"
+                log_err "$(t service.rpc_exited)"
                 tail -n 20 "$RPC_LOG_FILE" >&2 || true
                 exit 1
             fi
             if wallet_rpc_call "get_version" && [[ "$RPC_LAST_BODY" == *'"result"'* ]]; then
-                log_info "monero-wallet-rpc is ready (PID $rpc_pid)."
+                log_info "$(t service.rpc_ready "$rpc_pid")"
                 break
             fi
             sleep 0.5
             attempt=$((attempt + 1))
         done
         if [[ "$attempt" -ge 120 ]]; then
-            die "Timed out waiting for monero-wallet-rpc readiness on 127.0.0.1:${rpc_port}."
+            die "$(t service.rpc_timeout "$rpc_port")"
         fi
     fi
 
     # 2) Start xmr-gateway if not already running
     if read_pid_file "$GATEWAY_PID_FILE" >/dev/null; then
-        log_info "xmr-gateway is already running (PID $(cat "$GATEWAY_PID_FILE"))."
+        log_info "$(t service.already_running "xmr-gateway" "$(cat "$GATEWAY_PID_FILE")")"
     else
-        log_step "Starting xmr-gateway on ${GATEWAY_BASE_URL} (logs: $GATEWAY_LOG_FILE)..."
+        log_step "$(t service.starting_gw "$GATEWAY_BASE_URL" "$GATEWAY_LOG_FILE")"
         (
             cd "$REPO_ROOT"
             nohup "$GATEWAY_BIN" >> "$GATEWAY_LOG_FILE" 2>&1 &
@@ -177,24 +162,24 @@ cmd_start() {
         while [[ "$attempt" -lt 60 ]]; do
             if ! kill -0 "$gw_pid" 2>/dev/null; then
                 rm -f "$GATEWAY_PID_FILE"
-                log_err "xmr-gateway exited unexpectedly. Last 25 log lines:"
+                log_err "$(t service.gw_exited)"
                 tail -n 25 "$GATEWAY_LOG_FILE" >&2 || true
                 exit 1
             fi
             if gateway_api_call GET "/health" none && [[ "$API_LAST_HTTP_CODE" == "200" ]]; then
-                log_info "xmr-gateway is healthy (PID $gw_pid, ${GATEWAY_BASE_URL})."
+                log_info "$(t service.gw_healthy "$gw_pid" "$GATEWAY_BASE_URL")"
                 return 0
             fi
             sleep 0.5
             attempt=$((attempt + 1))
         done
-        log_warn "xmr-gateway started (PID $gw_pid) but /health did not return 200 within 30s; inspect logs via './admin.sh service logs gateway'."
+        log_warn "$(t service.gw_health_warn "$gw_pid")"
     fi
 }
 
 cmd_stop() {
     load_env
-    confirm_dangerous_action "Stop xmr-gateway (WAL checkpoint + close) and monero-wallet-rpc"
+    confirm_dangerous_action "$(t service.confirm_stop)"
     # Stop gateway FIRST so it runs PRAGMA wal_checkpoint(TRUNCATE) cleanly while RPC is still alive if needed
     stop_process_gracefully "xmr-gateway" "$GATEWAY_PID_FILE" 25
     stop_process_gracefully "monero-wallet-rpc" "$RPC_PID_FILE" 15
@@ -257,17 +242,27 @@ PYEOF
         return 0
     fi
 
-    printf '%s=== xmr-gateway Service Status ===%s\n' "$C_BOLD" "$C_RESET"
-    printf '  Env file         : %s\n' "$ACTIVE_ENV_FILE"
-    printf '  Network / Mode   : %s / %s\n' "$MONERO_NETWORK" "$WALLET_MODE"
-    printf '  xmr-gateway      : %s (URL: %s, /health HTTP: %s)\n' \
-        "${gw_pid:+RUNNING (PID $gw_pid)}" "${GATEWAY_BASE_URL}" "$health_http"
-    [[ -z "$gw_pid" ]] && printf '                     (no active PID file at %s)\n' "$GATEWAY_PID_FILE"
-    printf '  monero-wallet-rpc: %s (URL: %s, RPC HTTP: %s%s)\n' \
-        "${rpc_pid:+RUNNING (PID $rpc_pid)}" "$MONERO_RPC_URL" "$rpc_http" "${rpc_ver:+, version=$rpc_ver}"
-    [[ -z "$rpc_pid" ]] && printf '                     (no active PID file at %s)\n' "$RPC_PID_FILE"
+    local gw_state rpc_state
+    if [[ -n "$gw_pid" ]]; then
+        gw_state="$(t service.status_running "$gw_pid")"
+    else
+        gw_state="$(t service.status_stopped)"
+    fi
+    if [[ -n "$rpc_pid" ]]; then
+        rpc_state="$(t service.status_running "$rpc_pid")"
+    else
+        rpc_state="$(t service.status_stopped)"
+    fi
+
+    printf '%s%s%s\n' "$C_BOLD" "$(t service.status_header)" "$C_RESET"
+    tln service.status_env "$ACTIVE_ENV_FILE"
+    tln service.status_net "$MONERO_NETWORK" "$WALLET_MODE"
+    tln service.status_gw "$gw_state" "$GATEWAY_BASE_URL" "$health_http"
+    [[ -z "$gw_pid" ]] && tln service.status_no_pid "$GATEWAY_PID_FILE"
+    tln service.status_rpc "$rpc_state" "$MONERO_RPC_URL" "$rpc_http" "${rpc_ver:+, version=$rpc_ver}"
+    [[ -z "$rpc_pid" ]] && tln service.status_no_pid "$RPC_PID_FILE"
     if [[ "$health_http" == "200" || "$health_http" == "503" ]]; then
-        printf '\n%s/health response:%s\n' "$C_CYAN" "$C_RESET"
+        printf '\n%s%s%s\n' "$C_CYAN" "$(t service.status_health_hdr)" "$C_RESET"
         printf '%s\n' "$health_body" | pretty_print_json
     fi
 }
@@ -306,7 +301,7 @@ cmd_logs() {
         cli)     log_file="$CLI_LOG_FILE" ;;
     esac
 
-    [[ -f "$log_file" ]] || die "Log file not found: $log_file"
+    [[ -f "$log_file" ]] || die "$(t service.log_not_found "$log_file")"
     if [[ "$follow" -eq 1 ]]; then
         tail -n "$lines" -F "$log_file"
     else
@@ -316,13 +311,13 @@ cmd_logs() {
 
 cmd_build() {
     require_cmd cargo
-    log_step "Building xmr-gateway release binary (cargo build --release --locked)..."
+    log_step "$(t service.building_release)"
     (cd "$REPO_ROOT" && cargo build --release --locked)
     ls -lh "$REPO_ROOT/target/release/xmr-gateway"
 }
 
 cmd_setup_rpc() {
-    log_step "Running ./start.sh --setup-rpc (SHA256-verified Monero CLI installation)..."
+    log_step "$(t service.setup_rpc_run)"
     (cd "$REPO_ROOT" && ./start.sh --setup-rpc)
     for b in monero-wallet-rpc monero-wallet-cli; do
         if [[ -x "$REPO_ROOT/bin/$b" ]]; then
@@ -362,7 +357,7 @@ EOF
             ;;
         restart)
             load_env 1
-            confirm_dangerous_action "Restart systemd services monero-wallet-rpc.service and xmr-gateway.service"
+            confirm_dangerous_action "$(t service.confirm_systemd_restart)"
             require_cmd systemctl
             sudo systemctl restart monero-wallet-rpc.service xmr-gateway.service
             systemctl status --no-pager monero-wallet-rpc.service xmr-gateway.service || true
@@ -389,7 +384,7 @@ main() {
         setup-rpc) cmd_setup_rpc "$@" ;;
         systemd)   cmd_systemd "$@" ;;
         help|-h|--help) usage ;;
-        *)         die "Unknown service command: '$cmd'. Run './admin.sh service help'." ;;
+        *)         die "$(t service.unknown_cmd "$cmd")" ;;
     esac
 }
 

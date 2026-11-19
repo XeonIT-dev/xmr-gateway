@@ -70,6 +70,10 @@ assert_not_contains() {
     fi
 }
 
+# Isolate language state directory completely inside TMP_DIR (never touch real data/)
+export ADMIN_STATE_DIR="$TMP_DIR/state"
+unset ADMIN_LANG ADMIN_CLI_LANG ADMIN_ACTIVE_LANG ADMIN_LANG_SOURCE || true
+
 # ==============================================================================
 # 1. Syntax & static analysis (bash -n, optional shellcheck)
 # ==============================================================================
@@ -77,6 +81,9 @@ printf '\n=== 1. Syntax & Lint Checks ===\n'
 ALL_SCRIPTS=(
     "$REPO_ROOT/admin.sh"
     "$REPO_ROOT/admin/lib/common.sh"
+    "$REPO_ROOT/admin/lib/i18n.sh"
+    "$REPO_ROOT/admin/i18n/en.sh"
+    "$REPO_ROOT/admin/i18n/ru.sh"
     "$REPO_ROOT/admin/service.sh"
     "$REPO_ROOT/admin/config.sh"
     "$REPO_ROOT/admin/wallet.sh"
@@ -699,6 +706,134 @@ if [[ "$NEW_API_VAL" != "$API_KEY" && ${#NEW_API_VAL} -eq 64 ]]; then
 else
     fail "config rotate-keys did not update API_SECRET_KEY properly"
 fi
+
+# ==============================================================================
+# 8. i18n Dictionary Parity, Language Priority, RU/EN Output, --json Invariance & Guide
+# ==============================================================================
+printf '\n=== 8. i18n (RU/EN), --json Invariance & Guides ===\n'
+
+# 8a) 100% exact key parity & non-empty values between I18N_EN and I18N_RU
+if (
+    # shellcheck source=admin/i18n/en.sh
+    source "$REPO_ROOT/admin/i18n/en.sh"
+    # shellcheck source=admin/i18n/ru.sh
+    source "$REPO_ROOT/admin/i18n/ru.sh"
+    missing_in_ru=0
+    extra_in_ru=0
+    empty_vals=0
+    for k in "${!I18N_EN[@]}"; do
+        if [[ -z "${I18N_RU[$k]+x}" ]]; then
+            printf 'Missing key in I18N_RU: %s\n' "$k" >&2
+            missing_in_ru=$((missing_in_ru + 1))
+        fi
+        if [[ -z "${I18N_EN[$k]}" ]]; then
+            printf 'Empty value in I18N_EN: %s\n' "$k" >&2
+            empty_vals=$((empty_vals + 1))
+        fi
+    done
+    for k in "${!I18N_RU[@]}"; do
+        if [[ -z "${I18N_EN[$k]+x}" ]]; then
+            printf 'Extra key in I18N_RU: %s\n' "$k" >&2
+            extra_in_ru=$((extra_in_ru + 1))
+        fi
+        if [[ -z "${I18N_RU[$k]}" ]]; then
+            printf 'Empty value in I18N_RU: %s\n' "$k" >&2
+            empty_vals=$((empty_vals + 1))
+        fi
+    done
+    [[ "$missing_in_ru" -eq 0 && "$extra_in_ru" -eq 0 && "$empty_vals" -eq 0 && "${#I18N_EN[@]}" -gt 50 ]]
+); then
+    pass "100% key parity and non-empty values between I18N_EN and I18N_RU"
+else
+    fail "I18N_EN and I18N_RU dictionary parity check failed"
+fi
+
+# 8b) Language resolution priority: --lang > ADMIN_LANG > saved file > locale, fail-closed on invalid
+if "$ADMIN_SH" --lang fr help >/dev/null 2>&1; then
+    fail "--lang fr MUST fail closed"
+else
+    pass "--lang fr fails closed"
+fi
+
+if ADMIN_LANG=de "$ADMIN_SH" help >/dev/null 2>&1; then
+    fail "ADMIN_LANG=de MUST fail closed"
+else
+    pass "ADMIN_LANG=de fails closed"
+fi
+
+# Save 'ru' via `./admin.sh lang ru` -> stored in $ADMIN_STATE_DIR/.admin_lang (0600)
+"$ADMIN_SH" lang ru >/dev/null
+STATE_LANG_FILE="$ADMIN_STATE_DIR/.admin_lang"
+[[ -f "$STATE_LANG_FILE" ]] && pass "lang ru created isolated .admin_lang state file" || fail ".admin_lang missing"
+assert_eq "$(stat -c '%a' "$STATE_LANG_FILE")" "600" ".admin_lang has 0600 permissions"
+
+LANG_FILE_JSON="$("$ADMIN_SH" --json lang show)"
+assert_contains "$LANG_FILE_JSON" '"language": "ru"' "lang show reads saved 'ru' from file"
+assert_contains "$LANG_FILE_JSON" '"source": "file"' "lang show reports source=file"
+
+# ADMIN_LANG overrides saved file
+LANG_ENV_JSON="$(ADMIN_LANG=en "$ADMIN_SH" --json lang show)"
+assert_contains "$LANG_ENV_JSON" '"language": "en"' "ADMIN_LANG=en overrides saved file"
+assert_contains "$LANG_ENV_JSON" '"source": "env"' "lang show reports source=env"
+
+# --lang flag overrides ADMIN_LANG and saved file
+LANG_FLAG_JSON="$(ADMIN_LANG=en "$ADMIN_SH" --lang ru --json lang show)"
+assert_contains "$LANG_FLAG_JSON" '"language": "ru"' "--lang ru overrides ADMIN_LANG=en"
+assert_contains "$LANG_FLAG_JSON" '"source": "flag"' "lang show reports source=flag"
+
+# Restore valid DB state before comparing RU vs EN human & --json outputs
+python3 - "$DB_FILE" <<'PYEOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("UPDATE subaddress_transfers SET amount_piconero = 1350000000000 WHERE invoice_id = '11111111-1111-4111-8111-111111111111'")
+c.execute("UPDATE sweep_attempts SET status = 'CONFIRMED', error_message = NULL WHERE id = '33333333-3333-4333-8333-333333333333'")
+c.commit()
+c.close()
+PYEOF
+
+# 8c) Verify real localized RU vs EN output across key commands
+HELP_EN="$("$ADMIN_SH" --lang en help)"
+HELP_RU="$("$ADMIN_SH" --lang ru help)"
+assert_contains "$HELP_EN" "xmr-gateway Admin Control Center" "--lang en help outputs English"
+assert_contains "$HELP_RU" "Панель управления xmr-gateway" "--lang ru help outputs Russian"
+
+SHOW_EN="$("$ADMIN_SH" --env "$TEST_ENV" --lang en config show)"
+SHOW_RU="$("$ADMIN_SH" --env "$TEST_ENV" --lang ru config show)"
+assert_contains "$SHOW_EN" "Active xmr-gateway Configuration" "config show EN localized"
+assert_contains "$SHOW_RU" "Активная конфигурация xmr-gateway" "config show RU localized"
+
+DOC_EN="$("$ADMIN_SH" --env "$TEST_ENV" --lang en config doctor)"
+DOC_RU="$("$ADMIN_SH" --env "$TEST_ENV" --lang ru config doctor)"
+assert_contains "$DOC_EN" "Summary:" "config doctor EN localized"
+assert_contains "$DOC_RU" "Диагностика безопасности xmr-gateway" "config doctor RU localized"
+
+STATS_EN="$("$ADMIN_SH" --env "$TEST_ENV" --lang en db stats)"
+STATS_RU="$("$ADMIN_SH" --env "$TEST_ENV" --lang ru db stats)"
+assert_contains "$STATS_EN" "SQLite Database Stats" "db stats EN localized"
+assert_contains "$STATS_RU" "Статистика БД SQLite" "db stats RU localized"
+
+AUD_EN="$("$ADMIN_SH" --env "$TEST_ENV" --lang en db audit-invariants)"
+AUD_RU="$("$ADMIN_SH" --env "$TEST_ENV" --lang ru db audit-invariants)"
+assert_contains "$AUD_EN" "SQLite Invariants Audit" "db audit-invariants EN localized"
+assert_contains "$AUD_RU" "Аудит инвариантов SQLite" "db audit-invariants RU localized"
+
+# 8d) Strict byte-for-byte --json invariance between --lang en and --lang ru
+for subcmd in "config show" "db stats" "db audit-invariants" "invoices list"; do
+    # shellcheck disable=SC2086
+    out_en="$("$ADMIN_SH" --env "$TEST_ENV" --lang en --json $subcmd)"
+    # shellcheck disable=SC2086
+    out_ru="$("$ADMIN_SH" --env "$TEST_ENV" --lang ru --json $subcmd)"
+    python3 -c 'import json, sys; json.loads(sys.stdin.read())' <<< "$out_en"
+    assert_eq "$out_ru" "$out_en" "--json output for '$subcmd' is byte-for-byte identical between EN and RU"
+done
+
+# 8e) Guide files & `./admin.sh guide --path`
+GUIDE_EN_PATH="$("$ADMIN_SH" --lang en guide --path)"
+GUIDE_RU_PATH="$("$ADMIN_SH" --lang ru guide --path)"
+assert_eq "$GUIDE_EN_PATH" "$REPO_ROOT/admin/GUIDE_EN.md" "guide --path resolves GUIDE_EN.md for --lang en"
+assert_eq "$GUIDE_RU_PATH" "$REPO_ROOT/admin/GUIDE_RU.md" "guide --path resolves GUIDE_RU.md for --lang ru"
+[[ -s "$GUIDE_EN_PATH" ]] && pass "admin/GUIDE_EN.md exists and is non-empty" || fail "admin/GUIDE_EN.md missing or empty"
+[[ -s "$GUIDE_RU_PATH" ]] && pass "admin/GUIDE_RU.md exists and is non-empty" || fail "admin/GUIDE_RU.md missing or empty"
 
 printf '\n====================================================================\n'
 printf 'Admin Test Summary: %d PASSED, %d FAILED\n' "$PASS_COUNT" "$FAIL_COUNT"
