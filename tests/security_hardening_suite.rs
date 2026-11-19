@@ -36,7 +36,7 @@ use xmr_gateway::{
         validate_monero_address,
     },
     db::{
-        init_sqlite_pool,
+        acquire_database_lock, checkpoint_and_close_pool, init_sqlite_pool,
         repository::{
             ApplyScanUpdateParams, CompleteSweepAttemptParams, InvoiceRepository,
             RecordSubaddressTransferParams, SweepAttemptStatus, SweepResolutionAction,
@@ -8551,17 +8551,18 @@ async fn regression_phase37_p36_2_cross_invoice_toctou_and_overpayment_dust_bypa
             .mount(&mock_rpc)
             .await;
 
-        // Tick 1: Pending -> Confirmed (records OVERPAYMENT excess delta=1); Tick 2: Confirmed -> Settled & triggers sweep_all
+        // Tick 1: Pending -> Confirmed (records OVERPAYMENT full transfer amount in subaddress_transfers, excess delta=1 in webhook);
+        // Tick 2: Confirmed -> Settled & triggers sweep_all
         scanner.scan_once().await.unwrap();
         scanner.scan_once().await.unwrap();
 
-        // Confirm subaddress_transfers stored ONLY the 1-piconero excess delta
+        // Confirm subaddress_transfers preserves full actual transfer amount (`AUDIT-005` balance conservation)
         let sub_rows = repo
             .list_subaddress_transfers_for_invoice(inv.id)
             .await
             .unwrap();
         assert_eq!(sub_rows.len(), 1);
-        assert_eq!(sub_rows[0].amount_piconero, Piconero(1));
+        assert_eq!(sub_rows[0].amount_piconero, Piconero(10_000_000_000_001));
         assert_eq!(
             sub_rows[0].classification,
             TransferClassification::Overpayment
@@ -9841,4 +9842,995 @@ async fn regression_phase37_p36_7_empty_or_missing_tx_hash_list_stays_prepared()
             "missing tx_hash_list MUST fail deserialization and remain PREPARED (`P36-7`)"
         );
     }
+}
+
+#[tokio::test]
+async fn regression_audit_002_rbac_symmetry_failed_only_retry_and_health_diagnostics() {
+    let mock_rpc = MockServer::start().await;
+    let mock_hook = MockServer::start().await;
+    let pool = init_sqlite_pool("sqlite::memory:").await.unwrap();
+    let repo = InvoiceRepository::new(pool.clone());
+
+    let mut cfg_val = (*test_config(
+        format!("{}/json_rpc", mock_rpc.uri()),
+        Some(format!("{}/hook", mock_hook.uri())),
+        false,
+        2,
+        10,
+    ))
+    .clone();
+    let merchant_key = cfg_val.api_secret_key.clone();
+    let op_key = "operator-audit-002-distinct-secret-key-0123456789abcdef".to_string();
+
+    // 1) Config::validate() MUST reject OPERATOR_API_KEY == API_SECRET_KEY (AUDIT-002)
+    let mut dup_cfg = cfg_val.clone();
+    dup_cfg.operator_api_key = Some(merchant_key.clone());
+    assert!(
+        matches!(dup_cfg.validate(), Err(GatewayError::Config(_))),
+        "OPERATOR_API_KEY equal to API_SECRET_KEY must fail Config::validate()"
+    );
+
+    cfg_val.operator_api_key = Some(op_key.clone());
+    assert!(cfg_val.validate().is_ok());
+    let cfg = Arc::new(cfg_val);
+
+    let rpc = MoneroRpcClient::new(&cfg.monero_rpc_url, None, None).unwrap();
+    let scanner = ScannerService::new(repo.clone(), rpc.clone(), cfg.clone());
+    let app = build_router(AppState {
+        config: cfg.clone(),
+        repo: repo.clone(),
+        rpc,
+        scanner,
+    });
+
+    // 2) GET /health diagnostics authorization matrix with OPERATOR_API_KEY configured (AUDIT-002)
+    // 2a) Full diagnostics for X-Operator-Key: <op_key>, X-API-Key: <op_key>, X-API-Key: <merchant_key>
+    for (hdr_name, hdr_val) in [
+        ("X-Operator-Key", op_key.as_str()),
+        ("X-API-Key", op_key.as_str()),
+        ("X-API-Key", merchant_key.as_str()),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/health")
+                    .header(hdr_name, hdr_val)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let dto: HealthResponse =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(
+            dto.service.as_deref(),
+            Some("xmr-gateway"),
+            "expected full diagnostics for {hdr_name}"
+        );
+        assert!(dto.monero_rpc.is_some());
+        assert!(dto.auto_sweep_enabled.is_some());
+    }
+
+    // 2b) Minimal response (no telemetry) when unauthenticated, invalid key, or merchant key in X-Operator-Key
+    for maybe_hdr in [
+        None,
+        Some(("X-API-Key", "invalid-secret-key-value")),
+        Some(("X-Operator-Key", "invalid-operator-key-value")),
+        Some(("X-Operator-Key", merchant_key.as_str())),
+    ] {
+        let mut req = Request::get("/health");
+        if let Some((k, v)) = maybe_hdr {
+            req = req.header(k, v);
+        }
+        let resp = app
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = String::from_utf8(
+            resp.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            !text.contains("monero_rpc")
+                && !text.contains("auto_sweep_enabled")
+                && !text.contains("version"),
+            "minimal /health must not leak telemetry for {maybe_hdr:?}, got: {text}"
+        );
+    }
+
+    // 2c) Single-tenant mode (OPERATOR_API_KEY unset): X-Operator-Key: <merchant_key> gives full diagnostics
+    {
+        let mut single_cfg = (*cfg).clone();
+        single_cfg.operator_api_key = None;
+        let single_cfg = Arc::new(single_cfg);
+        let single_rpc = MoneroRpcClient::new(&single_cfg.monero_rpc_url, None, None).unwrap();
+        let single_scanner =
+            ScannerService::new(repo.clone(), single_rpc.clone(), single_cfg.clone());
+        let single_app = build_router(AppState {
+            config: single_cfg.clone(),
+            repo: repo.clone(),
+            rpc: single_rpc,
+            scanner: single_scanner,
+        });
+
+        let st_resp = single_app
+            .oneshot(
+                Request::get("/health")
+                    .header("X-Operator-Key", merchant_key.as_str())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(st_resp.status(), StatusCode::OK);
+        let st_dto: HealthResponse =
+            serde_json::from_slice(&st_resp.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(st_dto.service.as_deref(), Some("xmr-gateway"));
+        assert!(st_dto.monero_rpc.is_some());
+    }
+
+    // Seed invoice with 3 webhooks: 1 FAILED, 1 backed-off PENDING (attempts=2, future next_attempt_at), 1 DELIVERED
+    let inv = make_invoice(450, 1_000_000_000_000, cfg.default_webhook_url.clone());
+    repo.insert_invoice(&inv).await.unwrap();
+    let base_now = Utc::now();
+
+    let wh_failed = build_webhook_delivery(
+        &cfg.webhook_secret,
+        &inv,
+        WebhookEventType::Mempool,
+        inv.callback_url.as_deref().unwrap(),
+        base_now - ChronoDuration::seconds(30),
+    )
+    .unwrap();
+    let wh_pending = build_webhook_delivery(
+        &cfg.webhook_secret,
+        &inv,
+        WebhookEventType::Confirmed,
+        inv.callback_url.as_deref().unwrap(),
+        base_now - ChronoDuration::seconds(20),
+    )
+    .unwrap();
+    let wh_delivered = build_webhook_delivery(
+        &cfg.webhook_secret,
+        &inv,
+        WebhookEventType::Settled,
+        inv.callback_url.as_deref().unwrap(),
+        base_now - ChronoDuration::seconds(10),
+    )
+    .unwrap();
+
+    let failed_id = wh_failed.id;
+    let pending_id = wh_pending.id;
+    let delivered_id = wh_delivered.id;
+    let pending_next_at = base_now + ChronoDuration::minutes(15);
+
+    for (wh, status, attempts, next_at, last_code, last_err, delivered_at) in [
+        (
+            &wh_failed,
+            "FAILED",
+            10_i64,
+            base_now - ChronoDuration::seconds(5),
+            Some(502_i64),
+            Some("HTTP 502: bad gateway"),
+            None,
+        ),
+        (
+            &wh_pending,
+            "PENDING",
+            2_i64,
+            pending_next_at,
+            Some(503_i64),
+            Some("HTTP 503: temporary outage"),
+            None,
+        ),
+        (
+            &wh_delivered,
+            "DELIVERED",
+            1_i64,
+            base_now - ChronoDuration::seconds(10),
+            Some(200_i64),
+            None,
+            Some(base_now - ChronoDuration::seconds(10)),
+        ),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO webhook_deliveries (
+                id, invoice_id, event_type, dedupe_key, target_url,
+                payload_json, signature_hex, status, attempts, max_attempts,
+                next_attempt_at, last_status_code, last_error,
+                created_at, updated_at, delivered_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(wh.id.to_string())
+        .bind(wh.invoice_id.to_string())
+        .bind(wh.event_type.as_str())
+        .bind(&wh.dedupe_key)
+        .bind(&wh.target_url)
+        .bind(&wh.payload_json)
+        .bind(&wh.signature_hex)
+        .bind(status)
+        .bind(attempts)
+        .bind(i64::from(wh.max_attempts))
+        .bind(next_at.to_rfc3339())
+        .bind(last_code)
+        .bind(last_err)
+        .bind(wh.now.to_rfc3339())
+        .bind(wh.now.to_rfc3339())
+        .bind(delivered_at.map(|ts| ts.to_rfc3339()))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // 3) RBAC symmetry: POST /api/v1/invoices/{id}/webhooks/retry with merchant key -> 403 Forbidden (AUDIT-002)
+    let merchant_batch_forbidden = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/invoices/{}/webhooks/retry", inv.id))
+                .header("X-API-Key", merchant_key.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(merchant_batch_forbidden.status(), StatusCode::FORBIDDEN);
+
+    // Unknown key -> 401 Unauthorized
+    let unknown_batch_unauth = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/invoices/{}/webhooks/retry", inv.id))
+                .header("X-API-Key", "completely-unknown-key-0123456789")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unknown_batch_unauth.status(), StatusCode::UNAUTHORIZED);
+
+    // 4) Single retry on PENDING webhook MUST return 409 Conflict and preserve attempts & next_attempt_at (AUDIT-002)
+    let single_pending_conflict = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/webhooks/{pending_id}/retry"))
+                .header("X-Operator-Key", op_key.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(single_pending_conflict.status(), StatusCode::CONFLICT);
+
+    let hooks_after_single = repo.list_webhooks_for_invoice(inv.id).await.unwrap();
+    let pending_after_single = hooks_after_single
+        .iter()
+        .find(|w| w.id == pending_id)
+        .unwrap();
+    assert_eq!(pending_after_single.status, WebhookDeliveryStatus::Pending);
+    assert_eq!(pending_after_single.attempts, 2);
+    assert_eq!(pending_after_single.next_attempt_at, pending_next_at);
+    assert_eq!(
+        pending_after_single.last_error.as_deref(),
+        Some("HTTP 503: temporary outage")
+    );
+
+    // Single retry on DELIVERED webhook -> 409 Conflict
+    let single_delivered_conflict = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/webhooks/{delivered_id}/retry"))
+                .header("X-Operator-Key", op_key.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(single_delivered_conflict.status(), StatusCode::CONFLICT);
+
+    // 5) Batch retry with OPERATOR_API_KEY via X-Operator-Key resets ONLY FAILED, leaves PENDING & DELIVERED untouched
+    let op_batch_ok = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/invoices/{}/webhooks/retry", inv.id))
+                .header("X-Operator-Key", op_key.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(op_batch_ok.status(), StatusCode::OK);
+    let batch_dto: RetryWebhookResponse =
+        serde_json::from_slice(&op_batch_ok.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert_eq!(batch_dto.retried_count, 1);
+    assert_eq!(batch_dto.webhook_ids, vec![failed_id]);
+
+    let hooks_after_batch = repo.list_webhooks_for_invoice(inv.id).await.unwrap();
+    let failed_now = hooks_after_batch
+        .iter()
+        .find(|w| w.id == failed_id)
+        .unwrap();
+    let pending_now = hooks_after_batch
+        .iter()
+        .find(|w| w.id == pending_id)
+        .unwrap();
+    let delivered_now = hooks_after_batch
+        .iter()
+        .find(|w| w.id == delivered_id)
+        .unwrap();
+
+    assert_eq!(failed_now.status, WebhookDeliveryStatus::Pending);
+    assert_eq!(failed_now.attempts, 0);
+    assert!(failed_now.last_error.is_none());
+
+    // PENDING row MUST remain untouched (attempts=2, original future next_attempt_at, last_error preserved)
+    assert_eq!(pending_now.status, WebhookDeliveryStatus::Pending);
+    assert_eq!(pending_now.attempts, 2);
+    assert_eq!(pending_now.next_attempt_at, pending_next_at);
+    assert_eq!(
+        pending_now.last_error.as_deref(),
+        Some("HTTP 503: temporary outage")
+    );
+
+    assert_eq!(delivered_now.status, WebhookDeliveryStatus::Delivered);
+
+    // Repeating batch retry via X-API-Key: <OPERATOR_API_KEY> now returns 200 OK with 0 retried (no FAILED left)
+    let op_batch_empty = app
+        .oneshot(
+            Request::post(format!("/api/v1/invoices/{}/webhooks/retry", inv.id))
+                .header("X-API-Key", op_key.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(op_batch_empty.status(), StatusCode::OK);
+    let empty_dto: RetryWebhookResponse = serde_json::from_slice(
+        &op_batch_empty
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+    assert_eq!(empty_dto.retried_count, 0);
+    assert!(empty_dto.webhook_ids.is_empty());
+}
+
+// ============================================================================
+// AUDIT-005 Regression Tests:
+//   1. Overpayment balance conservation in subaddress_transfers & re-scan invariance
+//   2. Concurrent SQLite BEGIN IMMEDIATE write stress test (zero SQLITE_BUSY)
+//   3. Graceful shutdown (biased shutdown priority) & SQLite WAL TRUNCATE checkpoint
+// ============================================================================
+
+#[tokio::test]
+async fn regression_audit_005_overpayment_balance_conservation_and_rescan() {
+    let pool = init_sqlite_pool("sqlite::memory:").await.unwrap();
+    let repo = InvoiceRepository::new(pool.clone());
+    let mock_rpc = MockServer::start().await;
+    let mock_hook = MockServer::start().await;
+
+    let hook_url = format!("{}/audit-005-overpay", mock_hook.uri());
+    let cfg = test_config(
+        format!("{}/json_rpc", mock_rpc.uri()),
+        Some(hook_url.clone()),
+        true,
+        2,
+        10,
+    );
+    let rpc = MoneroRpcClient::new(&cfg.monero_rpc_url, None, None).unwrap();
+    let scanner = ScannerService::new(repo.clone(), rpc, cfg.clone());
+
+    // ------------------------------------------------------------------------
+    // Scenario 1: Single confirmed transfer exceeding invoice amount_piconero
+    // (1.0 XMR expected, 1.35 XMR received -> 0.35 XMR excess in webhook,
+    //  FULL 1.35 XMR preserved in subaddress_transfers.amount_piconero)
+    // ------------------------------------------------------------------------
+    let inv1 = make_invoice(501, 1_000_000_000_000, Some(hook_url.clone()));
+    repo.insert_invoice(&inv1).await.unwrap();
+    let tx_single = "51".repeat(32);
+
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_transfers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": {
+                "in": [{
+                    "txid": tx_single,
+                    "amount": 1_350_000_000_000_u64,
+                    "confirmations": 3,
+                    "double_spend_seen": false,
+                    "locked": true,
+                    "subaddr_index": { "major": 0, "minor": 501 }
+                }],
+                "pool": []
+            }
+        })))
+        .mount(&mock_rpc)
+        .await;
+
+    scanner.scan_once().await.unwrap();
+
+    let inv_txs_1 = repo.list_transfers_for_invoice(inv1.id).await.unwrap();
+    let sub_txs_1 = repo
+        .list_subaddress_transfers_for_invoice(inv1.id)
+        .await
+        .unwrap();
+    assert_eq!(sub_txs_1.len(), 1);
+    assert_eq!(
+        sub_txs_1[0].classification,
+        TransferClassification::Overpayment
+    );
+    assert_eq!(sub_txs_1[0].amount_piconero, Piconero(1_350_000_000_000));
+    let inv_sum_1: u64 = inv_txs_1
+        .iter()
+        .filter(|t| !t.orphaned && t.confirmations > 0)
+        .map(|t| t.amount_piconero.as_u64())
+        .sum();
+    let sub_sum_1: u64 = sub_txs_1
+        .iter()
+        .filter(|r| r.status != SubaddressTransferStatus::Orphaned)
+        .map(|r| r.amount_piconero.as_u64())
+        .sum();
+    assert_eq!(
+        sub_sum_1, inv_sum_1,
+        "Scenario 1 ledger balance conservation must hold"
+    );
+
+    // Webhook OVERPAYMENT payload still carries the excess delta (0.35 XMR)
+    let hooks_1 = repo.list_webhooks_for_invoice(inv1.id).await.unwrap();
+    let overpay_hook_1 = hooks_1
+        .iter()
+        .find(|w| w.event_type == WebhookEventType::Overpayment)
+        .expect("OVERPAYMENT webhook must be enqueued");
+    let overpay_json_1: serde_json::Value =
+        serde_json::from_str(&overpay_hook_1.payload_json).unwrap();
+    assert_eq!(
+        overpay_json_1["trigger_amount_piconero"].as_u64(),
+        Some(350_000_000_000)
+    );
+    assert_eq!(
+        overpay_json_1["received_piconero"].as_u64(),
+        Some(1_350_000_000_000)
+    );
+
+    // Simulate legacy pre-AUDIT-005 partial-delta corruption and verify re-scan self-heals it
+    sqlx::query("UPDATE subaddress_transfers SET amount_piconero = ? WHERE invoice_id = ?")
+        .bind(350_000_000_000_i64)
+        .bind(inv1.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Re-scan at 12 confirmations (unlocked=true) + auto-sweep of full 1.35 XMR balance
+    mock_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_transfers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "2",
+            "result": {
+                "in": [{
+                    "txid": tx_single,
+                    "amount": 1_350_000_000_000_u64,
+                    "confirmations": 12,
+                    "double_spend_seen": false,
+                    "locked": false,
+                    "subaddr_index": { "major": 0, "minor": 501 }
+                }],
+                "pool": []
+            }
+        })))
+        .mount(&mock_rpc)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("sweep_all"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "3",
+            "result": {
+                "tx_hash_list": ["5a".repeat(32)],
+                "amount_list": [1_349_900_000_000_u64],
+                "fee_list": [100_000_000_u64]
+            }
+        })))
+        .expect(1)
+        .mount(&mock_rpc)
+        .await;
+
+    let report_rescan = scanner.scan_once().await.unwrap();
+    assert_eq!(report_rescan.invoices_swept, 1);
+
+    let sub_txs_1_after = repo
+        .list_subaddress_transfers_for_invoice(inv1.id)
+        .await
+        .unwrap();
+    assert_eq!(sub_txs_1_after.len(), 1);
+    assert_eq!(
+        sub_txs_1_after[0].amount_piconero,
+        Piconero(1_350_000_000_000),
+        "Re-scan must self-heal and preserve full transfer amount"
+    );
+    assert_eq!(sub_txs_1_after[0].confirmations, 12);
+    assert!(sub_txs_1_after[0].swept);
+
+    // ------------------------------------------------------------------------
+    // Scenario 2: Two-transaction partial + crossing overpayment
+    // (1.0 XMR expected; tx1 = 0.6 XMR -> EXPECTED, tx2 = 0.7 XMR -> OVERPAYMENT
+    //  with excess = 0.3 XMR; ledger sum MUST equal 0.6 + 0.7 = 1.3 XMR)
+    // ------------------------------------------------------------------------
+    let inv2 = make_invoice(502, 1_000_000_000_000, Some(hook_url));
+    repo.insert_invoice(&inv2).await.unwrap();
+    let tx_part = "52".repeat(32);
+    let tx_cross = "53".repeat(32);
+
+    mock_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_transfers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "4",
+            "result": {
+                "in": [
+                    {
+                        "txid": tx_single,
+                        "amount": 1_350_000_000_000_u64,
+                        "confirmations": 13,
+                        "double_spend_seen": false,
+                        "locked": false,
+                        "subaddr_index": { "major": 0, "minor": 501 }
+                    },
+                    {
+                        "txid": tx_part,
+                        "amount": 600_000_000_000_u64,
+                        "confirmations": 5,
+                        "double_spend_seen": false,
+                        "locked": true,
+                        "subaddr_index": { "major": 0, "minor": 502 }
+                    },
+                    {
+                        "txid": tx_cross,
+                        "amount": 700_000_000_000_u64,
+                        "confirmations": 3,
+                        "double_spend_seen": false,
+                        "locked": true,
+                        "subaddr_index": { "major": 0, "minor": 502 }
+                    }
+                ],
+                "pool": []
+            }
+        })))
+        .mount(&mock_rpc)
+        .await;
+
+    scanner.scan_once().await.unwrap();
+
+    let inv_txs_2 = repo.list_transfers_for_invoice(inv2.id).await.unwrap();
+    let sub_txs_2 = repo
+        .list_subaddress_transfers_for_invoice(inv2.id)
+        .await
+        .unwrap();
+    assert_eq!(sub_txs_2.len(), 2);
+
+    let rec_part = sub_txs_2.iter().find(|r| r.txid == tx_part).unwrap();
+    let rec_cross = sub_txs_2.iter().find(|r| r.txid == tx_cross).unwrap();
+    assert_eq!(rec_part.classification, TransferClassification::Expected);
+    assert_eq!(rec_part.amount_piconero, Piconero(600_000_000_000));
+    assert_eq!(
+        rec_cross.classification,
+        TransferClassification::Overpayment
+    );
+    assert_eq!(
+        rec_cross.amount_piconero,
+        Piconero(700_000_000_000),
+        "Crossing OVERPAYMENT row must store full 0.7 XMR tx amount, not 0.3 XMR delta"
+    );
+
+    let inv_sum_2: u64 = inv_txs_2
+        .iter()
+        .filter(|t| !t.orphaned && t.confirmations > 0)
+        .map(|t| t.amount_piconero.as_u64())
+        .sum();
+    let sub_sum_2: u64 = sub_txs_2
+        .iter()
+        .filter(|r| r.status != SubaddressTransferStatus::Orphaned)
+        .map(|r| r.amount_piconero.as_u64())
+        .sum();
+    assert_eq!(inv_sum_2, 1_300_000_000_000);
+    assert_eq!(
+        sub_sum_2, inv_sum_2,
+        "Scenario 2 ledger conservation: SUM(subaddress_transfers) == SUM(invoice_transfers)"
+    );
+
+    let hooks_2 = repo.list_webhooks_for_invoice(inv2.id).await.unwrap();
+    let overpay_hook_2 = hooks_2
+        .iter()
+        .find(|w| w.event_type == WebhookEventType::Overpayment)
+        .expect("OVERPAYMENT webhook must be enqueued for crossing tx2");
+    let overpay_json_2: serde_json::Value =
+        serde_json::from_str(&overpay_hook_2.payload_json).unwrap();
+    assert_eq!(
+        overpay_json_2["trigger_amount_piconero"].as_u64(),
+        Some(300_000_000_000)
+    );
+
+    // Re-scan Scenario 2 with confirmations=12 & unlocked=true -> auto-sweeps full 1.3 XMR
+    mock_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_transfers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "5",
+            "result": {
+                "in": [
+                    {
+                        "txid": tx_single,
+                        "amount": 1_350_000_000_000_u64,
+                        "confirmations": 20,
+                        "double_spend_seen": false,
+                        "locked": false,
+                        "subaddr_index": { "major": 0, "minor": 501 }
+                    },
+                    {
+                        "txid": tx_part,
+                        "amount": 600_000_000_000_u64,
+                        "confirmations": 14,
+                        "double_spend_seen": false,
+                        "locked": false,
+                        "subaddr_index": { "major": 0, "minor": 502 }
+                    },
+                    {
+                        "txid": tx_cross,
+                        "amount": 700_000_000_000_u64,
+                        "confirmations": 12,
+                        "double_spend_seen": false,
+                        "locked": false,
+                        "subaddr_index": { "major": 0, "minor": 502 }
+                    }
+                ],
+                "pool": []
+            }
+        })))
+        .mount(&mock_rpc)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("sweep_all"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "6",
+            "result": {
+                "tx_hash_list": ["5b".repeat(32)],
+                "amount_list": [1_299_900_000_000_u64],
+                "fee_list": [100_000_000_u64]
+            }
+        })))
+        .expect(1)
+        .mount(&mock_rpc)
+        .await;
+
+    let report_2 = scanner.scan_once().await.unwrap();
+    assert_eq!(report_2.invoices_swept, 1);
+
+    let sub_txs_2_after = repo
+        .list_subaddress_transfers_for_invoice(inv2.id)
+        .await
+        .unwrap();
+    assert_eq!(sub_txs_2_after.len(), 2);
+    assert!(sub_txs_2_after.iter().all(|r| r.swept));
+    let sub_sum_2_after: u64 = sub_txs_2_after
+        .iter()
+        .map(|r| r.amount_piconero.as_u64())
+        .sum();
+    assert_eq!(sub_sum_2_after, 1_300_000_000_000);
+}
+
+#[tokio::test]
+async fn regression_audit_005_concurrent_begin_immediate_writes_no_sqlite_busy() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let db_path = tmp_dir.path().join("concurrent_immediate.db");
+    let db_url = format!("sqlite://{}", db_path.display());
+
+    let pool = init_sqlite_pool(&db_url).await.unwrap();
+    let repo = InvoiceRepository::new(pool.clone());
+    let now = Utc::now();
+
+    let mut invoice_ids = Vec::new();
+    for idx in 1..=8_u32 {
+        let mut inv = make_invoice(600 + idx, 1_000_000_000_000, None);
+        inv.status = InvoiceStatus::Settled;
+        inv.received_piconero = Piconero(1_000_000_000_000);
+        inv.confirmations = 12;
+        inv.unlocked = true;
+        inv.confirmed_at = Some(now);
+        inv.settled_at = Some(now);
+        repo.insert_invoice(&inv).await.unwrap();
+
+        // Seed a FAILED webhook via apply_scan_update so concurrent retry transactions contend too
+        let hook = build_webhook_delivery(
+            "secret-concurrent-0123456789abcdef",
+            &inv,
+            WebhookEventType::Settled,
+            "http://127.0.0.1:9999/hook",
+            now,
+        )
+        .unwrap();
+        let hook_id = hook.id;
+        repo.apply_scan_update(ApplyScanUpdateParams {
+            invoice_id: inv.id,
+            next_status: InvoiceStatus::Settled,
+            received_piconero: inv.received_piconero,
+            confirmations: inv.confirmations,
+            unlocked: inv.unlocked,
+            double_spend_seen: false,
+            transfers: Vec::new(),
+            webhook: Some(hook),
+            now,
+        })
+        .await
+        .unwrap();
+        repo.mark_webhook_retry_or_failed(hook_id, 10, None, Some(500), "seeded failure", now)
+            .await
+            .unwrap();
+
+        invoice_ids.push((inv.id, inv.address_index));
+    }
+
+    // Spawn 16 concurrent writers across all pool connections simultaneously (4 rounds each)
+    let barrier = Arc::new(Barrier::new(16));
+    let mut handles = Vec::with_capacity(16);
+
+    for worker in 0..16_usize {
+        let repo_cloned = repo.clone();
+        let barrier_cloned = barrier.clone();
+        let (inv_id, addr_idx) = invoice_ids[worker % invoice_ids.len()];
+        let dest = encode_monero_base58_address(18, &[0x33; 32], &[0x44; 32], None);
+
+        handles.push(tokio::spawn(async move {
+            barrier_cloned.wait().await;
+            for round in 0..4_u32 {
+                let ts = Utc::now();
+                let txid = format!("{:02x}{:02x}{}", worker, round, "a".repeat(60));
+                let tr = ObservedTransfer {
+                    txid: txid.clone(),
+                    amount_piconero: Piconero(250_000_000_000),
+                    confirmations: 12 + u64::from(round),
+                    unlocked: true,
+                    double_spend_seen: false,
+                    in_pool: false,
+                    orphaned: false,
+                };
+
+                match (worker + round as usize) % 4 {
+                    0 => {
+                        let rec = SubaddressTransferRecord {
+                            id: 0,
+                            txid,
+                            invoice_id: inv_id,
+                            address_index: addr_idx,
+                            amount_piconero: tr.amount_piconero,
+                            confirmations: tr.confirmations,
+                            classification: TransferClassification::Overpayment,
+                            status: SubaddressTransferStatus::Active,
+                            swept: false,
+                            sweep_attempt_id: None,
+                            created_at: ts,
+                        };
+                        repo_cloned
+                            .record_subaddress_transfer(RecordSubaddressTransferParams {
+                                record: rec,
+                                transfer: tr,
+                                received_piconero: Piconero(1_250_000_000_000),
+                                confirmations: 12,
+                                unlocked: true,
+                                webhook: None,
+                                now: ts,
+                            })
+                            .await
+                            .expect("record_subaddress_transfer must not hit SQLITE_BUSY");
+                    }
+                    1 => {
+                        let attempt = repo_cloned
+                            .create_prepared_sweep_attempt_with_min_confs(
+                                inv_id, addr_idx, &dest, 10, ts,
+                            )
+                            .await
+                            .expect("create_prepared_sweep_attempt must not hit SQLITE_BUSY");
+                        repo_cloned
+                            .mark_sweep_attempt_failed(attempt.id, inv_id, "simulated error", ts)
+                            .await
+                            .expect("mark_sweep_attempt_failed must not hit SQLITE_BUSY");
+                    }
+                    2 => {
+                        let _ = repo_cloned
+                            .reset_failed_webhooks_for_invoice(inv_id, ts)
+                            .await
+                            .expect("reset_failed_webhooks_for_invoice must not hit SQLITE_BUSY");
+                    }
+                    _ => {
+                        repo_cloned
+                            .apply_scan_update(ApplyScanUpdateParams {
+                                invoice_id: inv_id,
+                                next_status: InvoiceStatus::Settled,
+                                received_piconero: Piconero(1_000_000_000_000),
+                                confirmations: 12 + u64::from(round),
+                                unlocked: true,
+                                double_spend_seen: false,
+                                transfers: vec![tr],
+                                webhook: None,
+                                now: ts,
+                            })
+                            .await
+                            .expect("apply_scan_update must not hit SQLITE_BUSY");
+                    }
+                }
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle
+            .await
+            .expect("concurrent writer task panicked or failed with SQLITE_BUSY");
+    }
+
+    let summary = checkpoint_and_close_pool(pool, &db_url)
+        .await
+        .unwrap()
+        .expect("file-backed DB must return checkpoint summary");
+    assert_eq!(summary.busy, 0);
+}
+
+#[tokio::test]
+async fn regression_audit_005_graceful_shutdown_and_wal_checkpoint() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let db_path = tmp_dir.path().join("graceful_shutdown.db");
+    let wal_path = std::path::PathBuf::from(format!("{}-wal", db_path.display()));
+    let db_url = format!("sqlite://{}", db_path.display());
+
+    // 1) Acquire process lock, initialize WAL pool, persist financial state
+    let db_lock = acquire_database_lock(&db_url).unwrap();
+    let pool = init_sqlite_pool(&db_url).await.unwrap();
+    let repo = InvoiceRepository::new(pool.clone());
+
+    let mock_rpc = MockServer::start().await;
+    let mock_hook = MockServer::start().await;
+
+    // Neither worker may hit RPC or webhook server when shutdown is already signaled (`true`)
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&mock_rpc)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&mock_hook)
+        .await;
+
+    let hook_url = format!("{}/hook", mock_hook.uri());
+    let inv = make_invoice(701, 2_500_000_000_000, Some(hook_url.clone()));
+    repo.insert_invoice(&inv).await.unwrap();
+
+    let hook = build_webhook_delivery(
+        "shutdown-webhook-secret-0123456789abcdef",
+        &inv,
+        WebhookEventType::Mempool,
+        &hook_url,
+        Utc::now(),
+    )
+    .unwrap();
+    repo.apply_scan_update(ApplyScanUpdateParams {
+        invoice_id: inv.id,
+        next_status: InvoiceStatus::Mempool,
+        received_piconero: Piconero(2_500_000_000_000),
+        confirmations: 0,
+        unlocked: false,
+        double_spend_seen: false,
+        transfers: Vec::new(),
+        webhook: Some(hook),
+        now: Utc::now(),
+    })
+    .await
+    .unwrap();
+
+    // 2) Pre-signaled shutdown=true: both ScannerService::run and WebhookDispatcher::run
+    //    must exit immediately without executing an extra tick (biased shutdown priority).
+    let cfg = test_config(
+        format!("{}/json_rpc", mock_rpc.uri()),
+        Some(hook_url),
+        false,
+        2,
+        10,
+    );
+    let rpc = MoneroRpcClient::new(&cfg.monero_rpc_url, None, None).unwrap();
+    let scanner = ScannerService::new(repo.clone(), rpc, cfg.clone());
+    let dispatcher = WebhookDispatcher::new(
+        repo.clone(),
+        cfg.enable_auto_sweep,
+        Duration::from_millis(50),
+        cfg.webhook_url_policy(),
+    )
+    .unwrap();
+
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(true);
+    let scanner_handle = tokio::spawn(scanner.run(shutdown_rx.clone()));
+    let webhook_handle = tokio::spawn(dispatcher.run(shutdown_rx));
+
+    tokio::time::timeout(Duration::from_secs(2), scanner_handle)
+        .await
+        .expect("scanner must exit promptly when shutdown is already true")
+        .expect("scanner task must not panic");
+    tokio::time::timeout(Duration::from_secs(2), webhook_handle)
+        .await
+        .expect("webhook dispatcher must exit promptly when shutdown is already true")
+        .expect("webhook dispatcher task must not panic");
+
+    // 3) Run WAL TRUNCATE checkpoint & close pool BEFORE releasing DatabaseProcessLock
+    drop(repo);
+    let summary = checkpoint_and_close_pool(pool, &db_url)
+        .await
+        .unwrap()
+        .expect("file-backed DB must return WalCheckpointSummary");
+    assert_eq!(summary.busy, 0, "WAL checkpoint must finish with busy == 0");
+
+    if wal_path.exists() {
+        assert_eq!(
+            std::fs::metadata(&wal_path).unwrap().len(),
+            0,
+            "WAL file must be 0 bytes after TRUNCATE checkpoint and pool close"
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, ".db permissions must be 0600");
+    }
+
+    drop(db_lock);
+
+    // 4) Reopen DB and verify data integrity & persistence
+    let reopened = init_sqlite_pool(&db_url).await.unwrap();
+    let reopened_repo = InvoiceRepository::new(reopened.clone());
+    let loaded = reopened_repo
+        .get_invoice_by_id(inv.id)
+        .await
+        .unwrap()
+        .expect("persisted invoice must survive WAL checkpoint & reopen");
+    assert_eq!(loaded.amount_piconero, Piconero(2_500_000_000_000));
+    let loaded_hooks = reopened_repo
+        .list_webhooks_for_invoice(inv.id)
+        .await
+        .unwrap();
+    assert_eq!(loaded_hooks.len(), 1);
+    let integrity: String = sqlx::query_scalar("PRAGMA integrity_check;")
+        .fetch_one(&reopened)
+        .await
+        .unwrap();
+    assert_eq!(integrity, "ok");
+
+    checkpoint_and_close_pool(reopened, &db_url).await.unwrap();
 }

@@ -2,7 +2,6 @@
 /target/
 **/*.rs.bk
 # Note: Cargo.lock is intentionally tracked for reproducible binary builds
-
 # Environment files & local overrides (keep .env.example tracked)
 .env
 .env.*
@@ -39,3 +38,4 @@
 .vscode/
 .DS_Store
 Thumbs.db
+.obsidian

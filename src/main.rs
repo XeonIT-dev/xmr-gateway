@@ -14,7 +14,10 @@ use tracing_subscriber::{EnvFilter, fmt};
 use xmr_gateway::{
     api::{AppState, build_router},
     config::{Config, LogFormat},
-    db::{acquire_database_lock, init_sqlite_pool, repository::InvoiceRepository},
+    db::{
+        acquire_database_lock, checkpoint_and_close_pool, init_sqlite_pool,
+        repository::InvoiceRepository,
+    },
     error::{GatewayError, GatewayResult},
     rpc::client::MoneroRpcClient,
     security::url_policy::resolve_and_validate_webhook_url,
@@ -132,8 +135,14 @@ async fn run_gateway() -> GatewayResult<()> {
         tracing::error!(error = %err, "webhook dispatcher panicked during shutdown");
     }
 
-    pool.close().await;
+    if let Err(err) = checkpoint_and_close_pool(pool, &config.database_url).await {
+        tracing::error!(
+            error = %err,
+            "SQLite WAL checkpoint/close encountered an error during shutdown"
+        );
+    }
     tracing::info!("xmr-gateway shutdown complete");
+    drop(_db_lock);
     Ok(())
 }
 

@@ -48,10 +48,6 @@ pub fn build_router(state: AppState) -> Router {
     let merchant_v1 = Router::new()
         .route("/invoices", post(handlers::create_invoice))
         .route("/invoices/{invoice_id}", get(handlers::get_invoice))
-        .route(
-            "/invoices/{invoice_id}/webhooks/retry",
-            post(handlers::retry_invoice_webhooks),
-        )
         .route_layer(axum_mw::from_fn_with_state(
             state.clone(),
             middleware::require_api_key,
@@ -65,6 +61,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/invoices/{invoice_id}/sweep/resolve",
             post(handlers::resolve_sweep_incident),
+        )
+        .route(
+            "/invoices/{invoice_id}/webhooks/retry",
+            post(handlers::retry_invoice_webhooks),
         )
         .route(
             "/webhooks/{webhook_id}/retry",

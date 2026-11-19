@@ -441,16 +441,22 @@ impl WebhookDispatcher {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
+            if *shutdown.borrow() {
+                tracing::info!("webhook dispatcher received shutdown signal");
+                break;
+            }
+
             tokio::select! {
-                _ = ticker.tick() => {
-                    if let Err(err) = self.process_due_deliveries().await {
-                        tracing::error!(error = %err, "webhook dispatch tick failed");
-                    }
-                }
+                biased;
                 res = shutdown.changed() => {
                     if res.is_err() || *shutdown.borrow() {
                         tracing::info!("webhook dispatcher received shutdown signal");
                         break;
+                    }
+                }
+                _ = ticker.tick() => {
+                    if let Err(err) = self.process_due_deliveries().await {
+                        tracing::error!(error = %err, "webhook dispatch tick failed");
                     }
                 }
             }

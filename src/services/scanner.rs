@@ -40,7 +40,7 @@ use crate::{
             evaluate_subaddress_transfers,
         },
     },
-    error::{GatewayError, GatewayResult},
+    error::{DomainError, GatewayError, GatewayResult},
     rpc::{client::MoneroRpcClient, types::GetTransfersResponse},
     services::webhook::{
         build_sweep_webhook_delivery, build_transfer_anomaly_webhook_delivery,
@@ -138,16 +138,22 @@ impl ScannerService {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
+            if *shutdown.borrow() {
+                tracing::info!("blockchain scanner worker received shutdown signal");
+                break;
+            }
+
             tokio::select! {
-                _ = ticker.tick() => {
-                    if let Err(err) = self.scan_once().await {
-                        tracing::error!(error = %err, "scanner cycle failed");
-                    }
-                }
+                biased;
                 res = shutdown.changed() => {
                     if res.is_err() || *shutdown.borrow() {
                         tracing::info!("blockchain scanner worker received shutdown signal");
                         break;
+                    }
+                }
+                _ = ticker.tick() => {
+                    if let Err(err) = self.scan_once().await {
+                        tracing::error!(error = %err, "scanner cycle failed");
                     }
                 }
             }
@@ -202,7 +208,7 @@ impl ScannerService {
             .collect();
 
         let transfers_resp = self.rpc.get_transfers(0, &unique_indices, true).await?;
-        let grouped = group_transfers_by_subaddress(0, &transfers_resp);
+        let grouped = group_transfers_by_subaddress(0, &transfers_resp)?;
 
         for invoice in monitored_invoices {
             let subaddr_transfers = grouped
@@ -357,7 +363,7 @@ impl ScannerService {
             .rpc
             .get_transfers(invoice.account_index, &[invoice.address_index], true)
             .await?;
-        let grouped = group_transfers_by_subaddress(invoice.account_index, &transfers_resp);
+        let grouped = group_transfers_by_subaddress(invoice.account_index, &transfers_resp)?;
         let subaddr_transfers = grouped
             .get(&invoice.address_index)
             .map(Vec::as_slice)
@@ -568,10 +574,16 @@ impl ScannerService {
             if let Some(existing_rec) = existing_by_txid.get(tr.txid.as_str()) {
                 let unlocked_changed =
                     existing_unlocked_by_txid.get(tr.txid.as_str()).copied() != Some(tr.unlocked);
-                if existing_rec.confirmations != tr.confirmations || unlocked_changed {
+                if existing_rec.confirmations != tr.confirmations
+                    || existing_rec.amount_piconero != tr.amount_piconero
+                    || unlocked_changed
+                {
                     let now = Utc::now();
                     let mut synced = (*existing_rec).clone();
                     synced.confirmations = tr.confirmations;
+                    // Preserve full actual transfer amount so ledger conservation holds
+                    // across re-scans and self-heals any legacy partial-delta rows (`AUDIT-005`).
+                    synced.amount_piconero = tr.amount_piconero;
                     latest_invoice = self
                         .repo
                         .record_subaddress_transfer(RecordSubaddressTransferParams {
@@ -585,7 +597,12 @@ impl ScannerService {
                         })
                         .await?;
                 }
-                cumulative_confirmed = cumulative_confirmed.saturating_add(tx_amt);
+                cumulative_confirmed =
+                    cumulative_confirmed.checked_add(tx_amt).ok_or_else(|| {
+                        GatewayError::Domain(DomainError::AmountOverflow(
+                            "cumulative confirmed transfer sum overflowed u64".to_string(),
+                        ))
+                    })?;
                 continue;
             }
 
@@ -644,10 +661,18 @@ impl ScannerService {
                     })
                     .await?;
             } else if track_expected_and_overpayment {
-                let new_total = cumulative_confirmed.saturating_add(tx_amt);
+                let new_total = cumulative_confirmed.checked_add(tx_amt).ok_or_else(|| {
+                    GatewayError::Domain(DomainError::AmountOverflow(
+                        "cumulative confirmed transfer sum overflowed u64".to_string(),
+                    ))
+                })?;
                 if new_total > expected_u64 {
-                    let excess =
-                        Piconero(new_total.saturating_sub(cumulative_confirmed.max(expected_u64)));
+                    let baseline = cumulative_confirmed.max(expected_u64);
+                    let excess = Piconero(new_total.checked_sub(baseline).ok_or_else(|| {
+                        GatewayError::Domain(DomainError::AmountUnderflow(
+                            "overpayment excess delta underflowed u64".to_string(),
+                        ))
+                    })?);
                     let mut projected = latest_invoice.clone();
                     projected.received_piconero = eval.received_piconero;
                     projected.confirmations = eval.effective_confirmations;
@@ -666,12 +691,14 @@ impl ScannerService {
                         None => None,
                     };
 
+                    // Store full actual transfer amount (`tr.amount_piconero`) so ledger
+                    // conservation holds: SUM(subaddress_transfers) == SUM(invoice_transfers) (`AUDIT-005`).
                     let record = SubaddressTransferRecord {
                         id: 0,
                         txid: tr.txid.clone(),
                         invoice_id: latest_invoice.id,
                         address_index: latest_invoice.address_index,
-                        amount_piconero: excess,
+                        amount_piconero: tr.amount_piconero,
                         confirmations: tr.confirmations,
                         classification: TransferClassification::Overpayment,
                         status: SubaddressTransferStatus::Active,
@@ -684,6 +711,7 @@ impl ScannerService {
                         invoice_id = %latest_invoice.id,
                         order_id = %latest_invoice.order_id,
                         txid = %tr.txid,
+                        amount_piconero = tr.amount_piconero.as_u64(),
                         excess_piconero = excess.as_u64(),
                         "recorded OVERPAYMENT on subaddress"
                     );
@@ -735,7 +763,11 @@ impl ScannerService {
                 }
             }
 
-            cumulative_confirmed = cumulative_confirmed.saturating_add(tx_amt);
+            cumulative_confirmed = cumulative_confirmed.checked_add(tx_amt).ok_or_else(|| {
+                GatewayError::Domain(DomainError::AmountOverflow(
+                    "cumulative confirmed transfer sum overflowed u64".to_string(),
+                ))
+            })?;
         }
 
         Ok(latest_invoice)
@@ -1746,9 +1778,10 @@ impl ScannerService {
                     .has_other_live_sweep_attempt(invoice.id, attempt.id)
                     .await?;
 
-                // Dust protection (`A4-2` / `P36-2`): sum ACTUAL full incoming transfer amounts
-                // from `invoice_transfers.amount_piconero` (NOT `subaddress_transfers.amount_piconero`,
-                // which only stores excess delta for OVERPAYMENT rows) using checked_add.
+                // Dust protection (`A4-2` / `P36-2` / `AUDIT-005`): sum ACTUAL full incoming
+                // transfer amounts from `invoice_transfers.amount_piconero` (falling back to
+                // `subaddress_transfers.amount_piconero`, which also stores full actual transfer
+                // amounts as of `AUDIT-005`) using checked_add.
                 let inv_transfers = self.repo.list_transfers_for_invoice(invoice.id).await?;
                 let sub_transfers = self
                     .repo
@@ -1940,30 +1973,39 @@ impl ScannerService {
 fn group_transfers_by_subaddress(
     account_index: u32,
     resp: &GetTransfersResponse,
-) -> HashMap<u32, Vec<ObservedTransfer>> {
+) -> GatewayResult<HashMap<u32, Vec<ObservedTransfer>>> {
     let mut per_subaddr_by_txid: HashMap<u32, HashMap<String, ObservedTransfer>> = HashMap::new();
 
     for entry in &resp.pool {
         for (minor_idx, amt) in entry.subaddress_amounts(account_index) {
-            per_subaddr_by_txid
-                .entry(minor_idx)
-                .or_default()
-                .entry(entry.txid.clone())
-                .and_modify(|existing| {
-                    existing.amount_piconero =
-                        Piconero(existing.amount_piconero.as_u64().saturating_add(amt));
-                    existing.double_spend_seen =
-                        existing.double_spend_seen || entry.double_spend_seen;
-                })
-                .or_insert_with(|| ObservedTransfer {
-                    txid: entry.txid.clone(),
-                    amount_piconero: Piconero(amt),
-                    confirmations: 0,
-                    unlocked: false,
-                    double_spend_seen: entry.double_spend_seen,
-                    in_pool: true,
-                    orphaned: false,
-                });
+            let tx_map = per_subaddr_by_txid.entry(minor_idx).or_default();
+            if let Some(existing) = tx_map.get_mut(&entry.txid) {
+                let summed = existing
+                    .amount_piconero
+                    .as_u64()
+                    .checked_add(amt)
+                    .ok_or_else(|| {
+                        GatewayError::Domain(DomainError::AmountOverflow(format!(
+                            "pool transfer amount overflow for txid {}",
+                            entry.txid
+                        )))
+                    })?;
+                existing.amount_piconero = Piconero(summed);
+                existing.double_spend_seen = existing.double_spend_seen || entry.double_spend_seen;
+            } else {
+                tx_map.insert(
+                    entry.txid.clone(),
+                    ObservedTransfer {
+                        txid: entry.txid.clone(),
+                        amount_piconero: Piconero(amt),
+                        confirmations: 0,
+                        unlocked: false,
+                        double_spend_seen: entry.double_spend_seen,
+                        in_pool: true,
+                        orphaned: false,
+                    },
+                );
+            }
         }
     }
 
@@ -1984,8 +2026,17 @@ fn group_transfers_by_subaddress(
                     };
                 }
                 Some(existing) => {
-                    existing.amount_piconero =
-                        Piconero(existing.amount_piconero.as_u64().saturating_add(amt));
+                    let summed = existing
+                        .amount_piconero
+                        .as_u64()
+                        .checked_add(amt)
+                        .ok_or_else(|| {
+                            GatewayError::Domain(DomainError::AmountOverflow(format!(
+                                "confirmed transfer amount overflow for txid {}",
+                                entry.txid
+                            )))
+                        })?;
+                    existing.amount_piconero = Piconero(summed);
                     existing.confirmations = existing.confirmations.min(entry.confirmations);
                     existing.unlocked = existing.unlocked && is_unlocked;
                     existing.double_spend_seen =
@@ -2009,10 +2060,10 @@ fn group_transfers_by_subaddress(
         }
     }
 
-    per_subaddr_by_txid
+    Ok(per_subaddr_by_txid
         .into_iter()
         .map(|(minor_idx, tx_map)| (minor_idx, tx_map.into_values().collect()))
-        .collect()
+        .collect())
 }
 
 fn sum_u64_checked(values: &[u64], label: &str) -> GatewayResult<Piconero> {
@@ -3214,7 +3265,7 @@ mod tests {
         });
 
         let parsed: GetTransfersResponse = serde_json::from_value(json).unwrap();
-        let grouped = group_transfers_by_subaddress(0, &parsed);
+        let grouped = group_transfers_by_subaddress(0, &parsed).unwrap();
         assert_eq!(grouped.get(&1).unwrap().len(), 1);
         assert_eq!(
             grouped.get(&1).unwrap()[0].amount_piconero,
@@ -3229,5 +3280,69 @@ mod tests {
             Piconero(200_000_000_000)
         );
         assert!(!grouped.get(&2).unwrap()[0].in_pool);
+    }
+
+    #[test]
+    fn group_transfers_by_subaddress_rejects_amount_overflow_audit_005() {
+        let txid = "fe".repeat(32);
+
+        // Confirmed `in` duplicate entries summing past u64::MAX must fail closed with AmountOverflow
+        let in_overflow: GetTransfersResponse = serde_json::from_value(serde_json::json!({
+            "in": [
+                {
+                    "txid": txid,
+                    "amount": u64::MAX,
+                    "confirmations": 5,
+                    "double_spend_seen": false,
+                    "locked": false,
+                    "subaddr_index": { "major": 0, "minor": 7 }
+                },
+                {
+                    "txid": txid,
+                    "amount": 1_u64,
+                    "confirmations": 5,
+                    "double_spend_seen": false,
+                    "locked": false,
+                    "subaddr_index": { "major": 0, "minor": 7 }
+                }
+            ],
+            "pool": []
+        }))
+        .unwrap();
+        let err = group_transfers_by_subaddress(0, &in_overflow).unwrap_err();
+        assert!(
+            matches!(err, GatewayError::Domain(DomainError::AmountOverflow(_))),
+            "expected AmountOverflow for confirmed transfer sum overflow, got: {err:?}"
+        );
+
+        // Mempool `pool` duplicate entries summing past u64::MAX must also fail closed
+        let pool_overflow: GetTransfersResponse = serde_json::from_value(serde_json::json!({
+            "in": [],
+            "pool": [
+                {
+                    "txid": txid,
+                    "amount": u64::MAX,
+                    "confirmations": 0,
+                    "double_spend_seen": false,
+                    "subaddr_index": { "major": 0, "minor": 7 }
+                },
+                {
+                    "txid": txid,
+                    "amount": 1_u64,
+                    "confirmations": 0,
+                    "double_spend_seen": false,
+                    "subaddr_index": { "major": 0, "minor": 7 }
+                }
+            ]
+        }))
+        .unwrap();
+        let pool_err = group_transfers_by_subaddress(0, &pool_overflow).unwrap_err();
+        assert!(
+            matches!(
+                pool_err,
+                GatewayError::Domain(DomainError::AmountOverflow(_))
+            ),
+            "expected AmountOverflow for pool transfer sum overflow, got: {pool_err:?}"
+        );
     }
 }

@@ -437,6 +437,13 @@ impl InvoiceRepository {
         }
     }
 
+    /// Starts a SQLite `BEGIN IMMEDIATE` write transaction, acquiring the `RESERVED` write
+    /// lock upfront so concurrent readers/writers wait cleanly via `busy_timeout` instead of
+    /// failing immediately with `SQLITE_BUSY` on a `DEFERRED` read-to-write lock upgrade (`AUDIT-005`).
+    async fn begin_immediate(&self) -> Result<Transaction<'_, Sqlite>, sqlx::Error> {
+        self.pool.begin_with("BEGIN IMMEDIATE").await
+    }
+
     /// Acquires a per-`order_id` async mutex to serialize concurrent invoice creation requests
     /// so retried or racing requests never allocate orphaned Monero subaddresses (`XMR-019`).
     pub async fn acquire_order_lock(&self, order_id: &str) -> Arc<Mutex<()>> {
@@ -693,7 +700,7 @@ impl InvoiceRepository {
     /// Returns [`GatewayError::NotFound`] if the invoice vanished, [`GatewayError::Domain`] on
     /// illegal transitions or overflow, or [`GatewayError::Database`] on SQLite failures.
     pub async fn apply_scan_update(&self, params: ApplyScanUpdateParams) -> GatewayResult<Invoice> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let id_str = params.invoice_id.to_string();
 
         let existing_row: InvoiceRow = sqlx::query_as(
@@ -897,7 +904,7 @@ impl InvoiceRepository {
         invoice_id: Uuid,
         now: DateTime<Utc>,
     ) -> GatewayResult<Invoice> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let id_str = invoice_id.to_string();
         let now_str = now.to_rfc3339();
 
@@ -952,7 +959,7 @@ impl InvoiceRepository {
         active_txids: &[String],
         now: DateTime<Utc>,
     ) -> GatewayResult<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let id_str = invoice_id.to_string();
         let active_refs: Vec<&str> = active_txids.iter().map(String::as_str).collect();
         reconcile_orphaned_transfers_tx(&mut tx, &id_str, &active_refs, now).await?;
@@ -966,7 +973,7 @@ impl InvoiceRepository {
     /// Returns [`GatewayError::NotFound`] if missing, [`GatewayError::Conflict`] if the invoice
     /// is not in `SETTLED` status, or [`GatewayError::Database`] on SQL failure.
     pub async fn mark_invoice_swept(&self, params: MarkSweptParams) -> GatewayResult<Invoice> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let id_str = params.invoice_id.to_string();
 
         let existing_row: InvoiceRow = sqlx::query_as(
@@ -1129,7 +1136,7 @@ impl InvoiceRepository {
         now: DateTime<Utc>,
         complete_on_view_only: bool,
     ) -> GatewayResult<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let now_str = now.to_rfc3339();
 
         sqlx::query(
@@ -1274,19 +1281,24 @@ impl InvoiceRepository {
         row.map(WebhookDelivery::try_from).transpose()
     }
 
-    /// Resets a `FAILED` or backed-off `PENDING` webhook delivery for immediate retry (`XMR-028`).
+    /// Resets a permanently `FAILED` webhook delivery to `PENDING` (`attempts = 0`) for immediate
+    /// retry (`XMR-028` / `AUDIT-002`).
+    ///
+    /// Executes inside a `BEGIN IMMEDIATE` transaction and strictly permits transitioning ONLY
+    /// `FAILED` deliveries so manual retries can never race with `WebhookDispatcher` over active
+    /// or backed-off `PENDING` deliveries.
     ///
     /// Returns `Ok(None)` if no webhook delivery with `webhook_id` exists.
     ///
     /// # Errors
-    /// Returns [`GatewayError::Conflict`] if the webhook is already `DELIVERED`, or
-    /// [`GatewayError::Database`] on SQL failure.
+    /// Returns [`GatewayError::Conflict`] if the webhook is already `DELIVERED`, still `PENDING`,
+    /// or concurrently left `FAILED` status, or [`GatewayError::Database`] on SQL failure.
     pub async fn reset_webhook_delivery_for_retry(
         &self,
         webhook_id: Uuid,
         now: DateTime<Utc>,
     ) -> GatewayResult<Option<WebhookDelivery>> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let id_str = webhook_id.to_string();
 
         let existing_row: Option<WebhookRow> = sqlx::query_as(
@@ -1309,14 +1321,22 @@ impl InvoiceRepository {
             return Ok(None);
         };
         let existing = WebhookDelivery::try_from(row)?;
-        if existing.status == WebhookDeliveryStatus::Delivered {
-            return Err(GatewayError::Conflict(format!(
-                "webhook delivery {webhook_id} is already DELIVERED"
-            )));
+        match existing.status {
+            WebhookDeliveryStatus::Delivered => {
+                return Err(GatewayError::Conflict(format!(
+                    "webhook delivery {webhook_id} is already DELIVERED"
+                )));
+            }
+            WebhookDeliveryStatus::Pending => {
+                return Err(GatewayError::Conflict(format!(
+                    "webhook delivery {webhook_id} is currently PENDING (queued/retrying); only FAILED deliveries can be manually retried"
+                )));
+            }
+            WebhookDeliveryStatus::Failed => {}
         }
 
         let now_str = now.to_rfc3339();
-        sqlx::query(
+        let res = sqlx::query(
             r#"
             UPDATE webhook_deliveries
             SET
@@ -1326,7 +1346,7 @@ impl InvoiceRepository {
                 last_status_code = NULL,
                 last_error = NULL,
                 updated_at = ?
-            WHERE id = ?
+            WHERE id = ? AND status = 'FAILED'
             "#,
         )
         .bind(&now_str)
@@ -1334,6 +1354,12 @@ impl InvoiceRepository {
         .bind(&id_str)
         .execute(&mut *tx)
         .await?;
+
+        if res.rows_affected() != 1 {
+            return Err(GatewayError::Conflict(format!(
+                "webhook delivery {webhook_id} is no longer in FAILED status"
+            )));
+        }
 
         let updated_row: WebhookRow = sqlx::query_as(
             r#"
@@ -1354,8 +1380,12 @@ impl InvoiceRepository {
         Ok(Some(WebhookDelivery::try_from(updated_row)?))
     }
 
-    /// Resets all `FAILED` (or backed-off `PENDING`) webhook deliveries for `invoice_id` so they
-    /// are immediately retried by the webhook dispatcher (`XMR-028`).
+    /// Resets ONLY permanently `FAILED` webhook deliveries for `invoice_id` back to `PENDING`
+    /// (`attempts = 0`) for immediate retry (`XMR-028` / `AUDIT-002`).
+    ///
+    /// Executes inside a `BEGIN IMMEDIATE` transaction without touching already-`PENDING` or
+    /// `DELIVERED` rows, and returns strictly the deliveries transitioned from `FAILED` to
+    /// `PENDING` by this call.
     ///
     /// # Errors
     /// Returns [`GatewayError::NotFound`] if `invoice_id` does not exist, or [`GatewayError::Database`]
@@ -1365,7 +1395,7 @@ impl InvoiceRepository {
         invoice_id: Uuid,
         now: DateTime<Utc>,
     ) -> GatewayResult<Vec<WebhookDelivery>> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let id_str = invoice_id.to_string();
 
         let exists: Option<String> = sqlx::query_scalar("SELECT id FROM invoices WHERE id = ?")
@@ -1379,7 +1409,7 @@ impl InvoiceRepository {
         }
 
         let now_str = now.to_rfc3339();
-        sqlx::query(
+        let rows: Vec<WebhookRow> = sqlx::query_as(
             r#"
             UPDATE webhook_deliveries
             SET
@@ -1389,33 +1419,32 @@ impl InvoiceRepository {
                 last_status_code = NULL,
                 last_error = NULL,
                 updated_at = ?
-            WHERE invoice_id = ? AND status IN ('FAILED', 'PENDING')
-            "#,
-        )
-        .bind(&now_str)
-        .bind(&now_str)
-        .bind(&id_str)
-        .execute(&mut *tx)
-        .await?;
-
-        let rows: Vec<WebhookRow> = sqlx::query_as(
-            r#"
-            SELECT
+            WHERE invoice_id = ? AND status = 'FAILED'
+            RETURNING
                 id, invoice_id, event_type, dedupe_key, target_url,
                 payload_json, signature_hex, status, attempts, max_attempts,
                 next_attempt_at, last_status_code, last_error,
                 created_at, updated_at, delivered_at
-            FROM webhook_deliveries
-            WHERE invoice_id = ? AND status = 'PENDING'
-            ORDER BY created_at ASC
             "#,
         )
+        .bind(&now_str)
+        .bind(&now_str)
         .bind(&id_str)
         .fetch_all(&mut *tx)
         .await?;
 
         tx.commit().await?;
-        rows.into_iter().map(WebhookDelivery::try_from).collect()
+
+        let mut deliveries: Vec<WebhookDelivery> = rows
+            .into_iter()
+            .map(WebhookDelivery::try_from)
+            .collect::<GatewayResult<Vec<_>>>()?;
+        deliveries.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(deliveries)
     }
 
     /// Persists a `PREPARED` row in `sweep_attempts` BEFORE issuing `sweep_all` RPC (`XMR-003` / `XMR-023`),
@@ -1459,7 +1488,7 @@ impl InvoiceRepository {
         _min_sweep_confs: u64,
         now: DateTime<Utc>,
     ) -> GatewayResult<SweepAttempt> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let id = Uuid::new_v4();
         let inv_str = invoice_id.to_string();
         let now_str = now.to_rfc3339();
@@ -1619,6 +1648,7 @@ impl InvoiceRepository {
         exclude_attempt_id: Uuid,
         invoice_id: Uuid,
     ) -> GatewayResult<bool> {
+        // Read-only snapshot transaction (SELECT only).
         let mut tx = self.pool.begin().await?;
         let bound = is_tx_hash_bound_to_other_sweep_attempt_tx(
             &mut tx,
@@ -1673,6 +1703,7 @@ impl InvoiceRepository {
         invoice_id: Uuid,
         attempt_id: Uuid,
     ) -> GatewayResult<bool> {
+        // Read-only snapshot transaction (SELECT only).
         let mut tx = self.pool.begin().await?;
         let inv_str = invoice_id.to_string();
         let att_str = attempt_id.to_string();
@@ -1838,7 +1869,7 @@ impl InvoiceRepository {
         error_msg: &str,
         now: DateTime<Utc>,
     ) -> GatewayResult<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let now_str = now.to_rfc3339();
 
         let res = sqlx::query(
@@ -1914,7 +1945,7 @@ impl InvoiceRepository {
         webhook: Option<NewWebhookDelivery>,
         now: DateTime<Utc>,
     ) -> GatewayResult<Option<Invoice>> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.begin_immediate().await?;
         let now_str = now.to_rfc3339();
         let inv_str = invoice_id.to_string();
         let att_str = attempt_id.to_string();
@@ -2140,7 +2171,7 @@ impl InvoiceRepository {
         note: &str,
         now: DateTime<Utc>,
     ) -> GatewayResult<(Invoice, SweepAttempt)> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.begin_immediate().await?;
         let now_str = now.to_rfc3339();
         let inv_str = invoice_id.to_string();
         let att_str = attempt_id.to_string();
@@ -2361,7 +2392,7 @@ impl InvoiceRepository {
     {
         // Use BEGIN IMMEDIATE to serialize concurrent cross-invoice MARK_RECONCILED writes
         // and guarantee atomic tx_hash uniqueness enforcement (`P36-2`).
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.begin_immediate().await?;
         let now_str = now.to_rfc3339();
         let inv_str = invoice_id.to_string();
         let att_str = attempt_id.to_string();
@@ -2627,7 +2658,7 @@ impl InvoiceRepository {
     where
         F: FnOnce(&Invoice) -> GatewayResult<Option<NewWebhookDelivery>>,
     {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.begin_immediate().await?;
         let id_str = params.invoice_id.to_string();
         let attempt_id_str = params.attempt_id.to_string();
 
@@ -2900,7 +2931,7 @@ impl InvoiceRepository {
         &self,
         params: RecordSubaddressTransferParams,
     ) -> GatewayResult<Invoice> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let id_str = params.record.invoice_id.to_string();
 
         upsert_transfer_tx(&mut tx, &id_str, &params.transfer, params.now, false).await?;

@@ -374,6 +374,17 @@ impl Config {
         validate_secret("API_SECRET_KEY", &self.api_secret_key)?;
         if let Some(ref op_key) = self.operator_api_key {
             validate_secret("OPERATOR_API_KEY", op_key)?;
+            if crate::api::middleware::constant_time_key_match(op_key, &self.api_secret_key)
+                || crate::api::middleware::constant_time_key_match(
+                    op_key.trim(),
+                    self.api_secret_key.trim(),
+                )
+            {
+                return Err(GatewayError::Config(
+                    "OPERATOR_API_KEY must differ from API_SECRET_KEY when configured (AUDIT-002)"
+                        .to_string(),
+                ));
+            }
         }
         validate_secret("WEBHOOK_SECRET", &self.webhook_secret)?;
 
@@ -1169,5 +1180,26 @@ mod tests {
         let mut cfg2 = sample_valid_config();
         cfg2.webhook_secret = "replace-with-at-least-32-bytes-of-secret".to_string();
         assert!(cfg2.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_operator_api_key_identical_to_api_secret_key_audit_002() {
+        let mut same = sample_valid_config();
+        same.operator_api_key = Some(same.api_secret_key.clone());
+        let err = same.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("OPERATOR_API_KEY must differ"),
+            "expected distinct key error, got: {err}"
+        );
+
+        // Whitespace-padded duplicate must also be rejected
+        let mut padded = sample_valid_config();
+        padded.operator_api_key = Some(format!(" {} ", padded.api_secret_key));
+        assert!(padded.validate().is_err());
+
+        // Distinct >= 32-byte operator key succeeds
+        let mut distinct = sample_valid_config();
+        distinct.operator_api_key = Some("c".repeat(32));
+        assert!(distinct.validate().is_ok());
     }
 }

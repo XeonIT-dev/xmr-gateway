@@ -193,13 +193,14 @@ All `/api/v1/*` endpoints require header `X-API-Key: <API_SECRET_KEY>`.
 
 ### `GET /health` (Public Minified / Authenticated Detailed)
 
-Unauthenticated requests return ONLY `{"status": "ok" | "degraded" | "unhealthy"}` without leaking version, database, or RPC details (`XMR-033`). Passing a valid `X-API-Key` header returns full service, database, RPC, and auto-sweep diagnostics:
+Unauthenticated requests return ONLY `{"status": "ok" | "degraded" | "unhealthy"}` without leaking version, database, or RPC details (`XMR-033`). Passing a valid `X-API-Key` (merchant or operator key) or `X-Operator-Key` (`OPERATOR_API_KEY`, or `API_SECRET_KEY` when `OPERATOR_API_KEY` is unset; passing the merchant key in `X-Operator-Key` while `OPERATOR_API_KEY` is set is rejected as unauthenticated) returns full service, database, RPC, and auto-sweep diagnostics (`AUDIT-002`):
 
 ```bash
 curl -s http://127.0.0.1:8080/health | jq .
 # -> {"status": "ok"}
 
 curl -s -H "X-API-Key: ${API_SECRET_KEY}" http://127.0.0.1:8080/health | jq .
+curl -s -H "X-Operator-Key: ${OPERATOR_API_KEY}" http://127.0.0.1:8080/health | jq .
 ```
 
 ```json
@@ -286,11 +287,11 @@ curl -s -X POST http://127.0.0.1:8080/api/v1/invoices/3c8e0f18-7d66-4c31-97a0-6e
 
 ### `POST /api/v1/webhooks/{webhook_id}/retry` & `POST /api/v1/invoices/{invoice_id}/webhooks/retry`
 
-Resets permanently `FAILED` (or backed-off `PENDING`) webhook outbox deliveries back to `PENDING` with `attempts = 0` for immediate asynchronous retry (`XMR-028`):
+Both single-delivery and per-invoice webhook retry routes are operator-protected (`OPERATOR_API_KEY` via `X-Operator-Key` or `X-API-Key` when configured; otherwise `API_SECRET_KEY`) and reset strictly permanently `FAILED` webhook outbox deliveries back to `PENDING` (`attempts = 0`) for immediate asynchronous retry (`XMR-028` / `AUDIT-002`). Active or backed-off `PENDING` deliveries are never modified (`409 Conflict` on single retry, untouched and excluded from `retried_count`/`webhook_ids` on batch retry):
 
 ```bash
 curl -s -X POST http://127.0.0.1:8080/api/v1/invoices/3c8e0f18-7d66-4c31-97a0-6e8df4e53c12/webhooks/retry \
-  -H "X-API-Key: ${API_SECRET_KEY}" | jq .
+  -H "X-Operator-Key: ${OPERATOR_API_KEY:-${API_SECRET_KEY}}" | jq .
 ```
 
 ---
@@ -395,7 +396,22 @@ pub fn verify_webhook(secret: &str, raw_body: &[u8], signature_hex: &str) -> boo
 - **SSRF & DNS Rebinding Defense (`XMR-001`):** Leave `ALLOW_PRIVATE_WEBHOOKS=false` in production (and optionally set `REQUIRE_HTTPS_WEBHOOKS=true`) so webhook callbacks cannot target loopback, RFC1918 subnets, cloud metadata endpoints (`169.254.169.254`), or HTTP `3xx` redirects.
 - **Enforce Fail-Closed View-Only Mode (`XMR-002`):** Unless you require automated hot treasury sweeping, set `WALLET_MODE=view_only` and `ENABLE_AUTO_SWEEP=false`, providing `MONERO_VIEW_ONLY_ADDRESS` and `MONERO_VIEW_ONLY_KEY` in `.env`. Both `start.sh` and `xmr-gateway` abort startup if `monero-wallet-rpc` exposes a spend key in `view_only` mode.
 - **Untrusted Remote Nodes (`XMR-005`):** `MONERO_TRUSTED_DAEMON=false` passes `--untrusted-daemon` by default. Route traffic through Tor (`MONERO_RPC_PROXY=127.0.0.1:9050`) when connecting to third-party public nodes.
-- **SQLite Full Durability (`XMR-007`), Singleton Process Lock (`P1-3`), & Crash-Safe Sweeps (`XMR-003`):** SQLite WAL runs with `synchronous = FULL`; `acquire_database_lock` enforces an exclusive advisory lockfile (`<db_path>.lock`, mode `0600`) to prevent multiple instances from concurrently accessing the same wallet/DB; and `sweep_attempts` (`PREPARED`→`SUBMITTED`→`RECONCILED`) recovers interrupted sweeps via `get_transfers(out, pending)` without duplicate `sweep_all` calls.
+- **SQLite Full Durability (`XMR-007`), `BEGIN IMMEDIATE` & WAL Checkpoint (`AUDIT-005`), Singleton Process Lock (`P1-3`), & Crash-Safe Sweeps (`XMR-003`):**
+  - SQLite runs in WAL mode with `PRAGMA synchronous = FULL`, `PRAGMA foreign_keys = ON`, and a 5-second `busy_timeout`; all write transactions in `InvoiceRepository` acquire the write lock upfront via `BEGIN IMMEDIATE` to prevent `SQLITE_BUSY` errors during `DEFERRED` lock upgrades.
+  - Directories are hardened to `0700` and `.db`, `-wal`, `-shm`, and `<db_path>.lock` files to `0600` on Unix (`XMR-040` / `AUDIT-005`).
+  - On graceful shutdown (`SIGINT`/`SIGTERM`), HTTP serving and both background workers (`ScannerService` and `WebhookDispatcher`, using biased shutdown priority) exit cleanly before `checkpoint_and_close_pool()` executes `PRAGMA wal_checkpoint(TRUNCATE);`, re-enforces `0600` permissions, and closes the pool prior to releasing `<db_path>.lock`.
+  - **NEVER copy a live WAL database with `cp`** (copying `.db` without synchronized `-wal`/`-shm` frames produces a corrupt or stale backup). Perform safe online backups using `sqlite3` and verify integrity:
+    ```bash
+    # Option 1: Atomic self-contained snapshot (recommended)
+    sqlite3 data/xmr_gateway.db "VACUUM INTO 'data/xmr_gateway.backup.$(date +%F_%H%M%S).db';"
+    # Option 2: Online Backup API
+    sqlite3 data/xmr_gateway.db ".backup 'data/xmr_gateway.backup.$(date +%F_%H%M%S).db'"
+    chmod 600 data/xmr_gateway.backup.*.db
+    # Mandatory backup verification
+    sqlite3 data/xmr_gateway.backup.<TIMESTAMP>.db "PRAGMA integrity_check;"
+    ```
+  - **Safe restore procedure:** stop `xmr-gateway` cleanly, remove stale `xmr_gateway.db-wal` and `xmr_gateway.db-shm` sidecars, replace `data/xmr_gateway.db` with the verified backup (`chmod 600`), run `sqlite3 data/xmr_gateway.db "PRAGMA integrity_check;"`, and restart the service.
+  - `sweep_attempts` (`PREPARED`→`SUBMITTED`→`RECONCILED`) recovers interrupted sweeps via `get_transfers(out, pending)` without duplicate `sweep_all` calls, and `subaddress_transfers` preserves full transfer amounts on `OVERPAYMENT` rows so `SUM(subaddress_transfers) == SUM(confirmed non-orphaned invoice_transfers)` (`AUDIT-005`).
 - **Directory & Env Hardening:** `start.sh` enforces `umask 077`, `chmod 600 .env`, and `chmod 700` on `data/` and `data/wallet/` on every run.
 - **Mainnet vs. Stagenet Checklist:**
   - Verify `MONERO_NETWORK=mainnet` and a mainnet `MONERO_REMOTE_NODE` before production launch.
