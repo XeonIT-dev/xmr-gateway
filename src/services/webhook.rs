@@ -333,17 +333,24 @@ pub fn build_sweep_webhook_delivery(
         .map_err(|e| GatewayError::Webhook(format!("failed to serialize webhook payload: {e}")))?;
     let signature_hex = sign_payload_hmac_sha256(webhook_secret, payload_json.as_bytes())?;
 
-    let dedupe_key = if invoice.sweep_tx_hashes.len() > 1 {
-        format!("{}:SWEPT:{}", invoice.id, invoice.sweep_tx_hashes.len())
-    } else if invoice.status == InvoiceStatus::Expired {
-        let hash_suffix = invoice
-            .sweep_tx_hashes
-            .first()
-            .map(String::as_str)
-            .unwrap_or("late");
-        format!("{}:SWEPT:LATE:{}", invoice.id, hash_suffix)
+    let mut canonical_hashes = invoice.sweep_tx_hashes.clone();
+    canonical_hashes.sort();
+    canonical_hashes.dedup();
+    let hashes_part = if canonical_hashes.is_empty() {
+        "none".to_string()
     } else {
-        format!("{}:SWEPT", invoice.id)
+        canonical_hashes.join(",")
+    };
+
+    let dedupe_key = match sweep_reason.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(reason) => format!(
+            "{}:SWEPT:{}:epoch:{}:{}",
+            invoice.id, reason, invoice.reorg_epoch, hashes_part
+        ),
+        None => format!(
+            "{}:SWEPT:epoch:{}:{}",
+            invoice.id, invoice.reorg_epoch, hashes_part
+        ),
     };
 
     Ok(NewWebhookDelivery {

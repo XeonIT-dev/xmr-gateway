@@ -77,6 +77,49 @@ impl fmt::Display for WalletMode {
     }
 }
 
+/// Target Monero network configured for the gateway (`MONERO_NETWORK`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MoneroNetwork {
+    /// Monero mainnet (`MONERO_NETWORK=mainnet`).
+    #[default]
+    Mainnet,
+    /// Monero stagenet (`MONERO_NETWORK=stagenet`).
+    Stagenet,
+    /// Monero testnet (`MONERO_NETWORK=testnet`).
+    Testnet,
+}
+
+impl MoneroNetwork {
+    /// Returns canonical lowercase network name (`"mainnet"`, `"stagenet"`, or `"testnet"`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mainnet => "mainnet",
+            Self::Stagenet => "stagenet",
+            Self::Testnet => "testnet",
+        }
+    }
+
+    /// Parses `MONERO_NETWORK` environment variable value.
+    fn parse(raw: &str) -> GatewayResult<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "mainnet" => Ok(Self::Mainnet),
+            "stagenet" => Ok(Self::Stagenet),
+            "testnet" => Ok(Self::Testnet),
+            other => Err(GatewayError::Config(format!(
+                "invalid MONERO_NETWORK '{other}': expected 'mainnet', 'stagenet', or 'testnet'"
+            ))),
+        }
+    }
+}
+
+impl fmt::Display for MoneroNetwork {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Complete, validated configuration for `xmr-gateway`.
 ///
 /// # Security Invariants
@@ -108,11 +151,17 @@ pub struct Config {
     pub allow_private_webhooks: bool,
     /// Require `https://` scheme on all outbound webhook URLs.
     pub require_https_webhooks: bool,
+    /// Target Monero network (`mainnet`, `stagenet`, or `testnet`) (`AUDIT-001`).
+    pub monero_network: MoneroNetwork,
     /// Full HTTP/HTTPS URL to `monero-wallet-rpc` JSON-RPC endpoint.
     pub monero_rpc_url: String,
-    /// Optional explicit `monerod` JSON-RPC URL (`MONERO_DAEMON_RPC_URL`) used for `get_info` height
-    /// verification; falls back to `monero_rpc_url` when omitted.
+    /// Optional explicit `monerod` JSON-RPC URL (`MONERO_DAEMON_RPC_URL`) used for `get_info`
+    /// height verification during incident resolution (`AUDIT-001`).
     pub monero_daemon_rpc_url: Option<String>,
+    /// Optional RPC username for `MONERO_DAEMON_RPC_URL` Digest/Basic authentication (`AUDIT-001`).
+    pub monero_daemon_rpc_user: Option<String>,
+    /// Optional RPC password for `MONERO_DAEMON_RPC_URL` Digest/Basic authentication (`AUDIT-001`).
+    pub monero_daemon_rpc_pass: Option<String>,
     /// Optional RPC username for `--rpc-login` Digest/Basic authentication.
     pub monero_rpc_user: Option<String>,
     /// Optional RPC password for `--rpc-login` Digest/Basic authentication.
@@ -166,8 +215,14 @@ impl fmt::Debug for Config {
             .field("default_webhook_url", &self.default_webhook_url)
             .field("allow_private_webhooks", &self.allow_private_webhooks)
             .field("require_https_webhooks", &self.require_https_webhooks)
+            .field("monero_network", &self.monero_network)
             .field("monero_rpc_url", &self.monero_rpc_url)
             .field("monero_daemon_rpc_url", &self.monero_daemon_rpc_url)
+            .field("monero_daemon_rpc_user", &self.monero_daemon_rpc_user)
+            .field(
+                "monero_daemon_rpc_pass",
+                &self.monero_daemon_rpc_pass.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("monero_rpc_user", &self.monero_rpc_user)
             .field(
                 "monero_rpc_pass",
@@ -222,8 +277,11 @@ impl Config {
         let default_webhook_url = optional_non_empty_env("DEFAULT_WEBHOOK_URL");
         let allow_private_webhooks = parse_env_bool("ALLOW_PRIVATE_WEBHOOKS", false)?;
         let require_https_webhooks = parse_env_bool("REQUIRE_HTTPS_WEBHOOKS", false)?;
+        let monero_network = MoneroNetwork::parse(&env_or_default("MONERO_NETWORK", "mainnet"))?;
         let monero_rpc_url = env_or_default("MONERO_RPC_URL", "http://127.0.0.1:18082/json_rpc");
         let monero_daemon_rpc_url = optional_non_empty_env("MONERO_DAEMON_RPC_URL");
+        let monero_daemon_rpc_user = optional_non_empty_env("MONERO_DAEMON_RPC_USER");
+        let monero_daemon_rpc_pass = optional_non_empty_env("MONERO_DAEMON_RPC_PASS");
         let monero_rpc_user = optional_non_empty_env("MONERO_RPC_USER");
         let monero_rpc_pass = optional_non_empty_env("MONERO_RPC_PASS");
         let allow_unauthenticated_rpc = parse_env_bool("ALLOW_UNAUTHENTICATED_RPC", false)?;
@@ -268,8 +326,11 @@ impl Config {
             default_webhook_url,
             allow_private_webhooks,
             require_https_webhooks,
+            monero_network,
             monero_rpc_url,
             monero_daemon_rpc_url,
+            monero_daemon_rpc_user,
+            monero_daemon_rpc_pass,
             monero_rpc_user,
             monero_rpc_pass,
             allow_unauthenticated_rpc,
@@ -317,16 +378,51 @@ impl Config {
         validate_secret("WEBHOOK_SECRET", &self.webhook_secret)?;
 
         let rpc_url = validate_http_url(&self.monero_rpc_url, "MONERO_RPC_URL")?;
-        if let Some(ref daemon_url) = self.monero_daemon_rpc_url {
-            validate_http_url(daemon_url, "MONERO_DAEMON_RPC_URL")?;
-        }
         validate_rpc_security(
             &rpc_url,
             self.monero_rpc_user.as_deref(),
             self.monero_rpc_pass.as_deref(),
             self.allow_unauthenticated_rpc,
             self.allow_insecure_remote_rpc,
+            "MONERO_RPC_URL",
+            "MONERO_RPC_USER",
+            "MONERO_RPC_PASS",
         )?;
+
+        let daemon_url_trimmed = self
+            .monero_daemon_rpc_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let has_daemon_user = self
+            .monero_daemon_rpc_user
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
+        let has_daemon_pass = self
+            .monero_daemon_rpc_pass
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
+
+        if let Some(daemon_url) = daemon_url_trimmed {
+            let parsed_daemon_url = validate_http_url(daemon_url, "MONERO_DAEMON_RPC_URL")?;
+            validate_rpc_security(
+                &parsed_daemon_url,
+                self.monero_daemon_rpc_user.as_deref(),
+                self.monero_daemon_rpc_pass.as_deref(),
+                self.allow_unauthenticated_rpc,
+                self.allow_insecure_remote_rpc,
+                "MONERO_DAEMON_RPC_URL",
+                "MONERO_DAEMON_RPC_USER",
+                "MONERO_DAEMON_RPC_PASS",
+            )?;
+        } else if has_daemon_user || has_daemon_pass {
+            return Err(GatewayError::Config(
+                "MONERO_DAEMON_RPC_USER and MONERO_DAEMON_RPC_PASS require MONERO_DAEMON_RPC_URL to be set"
+                    .to_string(),
+            ));
+        }
 
         if let Some(ref webhook_url) = self.default_webhook_url {
             validate_webhook_url_static(
@@ -447,35 +543,42 @@ pub fn validate_http_url(raw: &str, field_name: &str) -> GatewayResult<Url> {
     Ok(parsed)
 }
 
-/// Validates RPC authentication and transport security policies (`XMR-031`).
+/// Validates RPC authentication and transport security policies (`XMR-031` / `AUDIT-001`).
+#[allow(clippy::too_many_arguments)]
 fn validate_rpc_security(
     rpc_url: &Url,
     rpc_user: Option<&str>,
     rpc_pass: Option<&str>,
     allow_unauthenticated_rpc: bool,
     allow_insecure_remote_rpc: bool,
+    url_env_name: &str,
+    user_env_name: &str,
+    pass_env_name: &str,
 ) -> GatewayResult<()> {
+    let user_opt = rpc_user.map(str::trim).filter(|s| !s.is_empty());
+    let pass_opt = rpc_pass.map(str::trim).filter(|s| !s.is_empty());
+
+    if user_opt.is_some() ^ pass_opt.is_some() {
+        return Err(GatewayError::Config(format!(
+            "{user_env_name} and {pass_env_name} must either both be set or both be omitted"
+        )));
+    }
+
     if !allow_unauthenticated_rpc {
-        let user = rpc_user
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                GatewayError::Config(
-                    "MONERO_RPC_USER is required when ALLOW_UNAUTHENTICATED_RPC=false".to_string(),
-                )
-            })?;
-        let pass = rpc_pass
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                GatewayError::Config(
-                    "MONERO_RPC_PASS is required when ALLOW_UNAUTHENTICATED_RPC=false".to_string(),
-                )
-            })?;
+        let user = user_opt.ok_or_else(|| {
+            GatewayError::Config(format!(
+                "{user_env_name} is required when ALLOW_UNAUTHENTICATED_RPC=false"
+            ))
+        })?;
+        let pass = pass_opt.ok_or_else(|| {
+            GatewayError::Config(format!(
+                "{pass_env_name} is required when ALLOW_UNAUTHENTICATED_RPC=false"
+            ))
+        })?;
         if user == pass {
-            return Err(GatewayError::Config(
-                "MONERO_RPC_PASS must differ from MONERO_RPC_USER".to_string(),
-            ));
+            return Err(GatewayError::Config(format!(
+                "{pass_env_name} must differ from {user_env_name}"
+            )));
         }
         let lower = pass.to_ascii_lowercase();
         if lower.starts_with("replace-with-")
@@ -483,14 +586,13 @@ fn validate_rpc_security(
             || lower.starts_with("example-")
             || matches!(lower.as_str(), "password" | "admin" | "123456" | "monero")
         {
-            return Err(GatewayError::Config(
-                "MONERO_RPC_PASS contains a placeholder or weak password; generate a random secret"
-                    .to_string(),
-            ));
+            return Err(GatewayError::Config(format!(
+                "{pass_env_name} contains a placeholder or weak password; generate a random secret"
+            )));
         }
         if pass.len() < 16 {
             return Err(GatewayError::Config(format!(
-                "MONERO_RPC_PASS must be at least 16 characters long (got {})",
+                "{pass_env_name} must be at least 16 characters long (got {})",
                 pass.len()
             )));
         }
@@ -505,7 +607,7 @@ fn validate_rpc_security(
                 .is_ok_and(|ip| ip.is_loopback());
         if !is_loopback {
             return Err(GatewayError::Config(format!(
-                "cleartext HTTP MONERO_RPC_URL targeting non-loopback host '{host}' is forbidden unless ALLOW_INSECURE_REMOTE_RPC=true (use https:// or an SSH/WireGuard loopback tunnel)"
+                "cleartext HTTP {url_env_name} targeting non-loopback host '{host}' is forbidden unless ALLOW_INSECURE_REMOTE_RPC=true (use https:// or an SSH/WireGuard loopback tunnel)"
             )));
         }
     }
@@ -875,8 +977,11 @@ mod tests {
             default_webhook_url: Some("https://bot.example.org/webhook".to_string()),
             allow_private_webhooks: false,
             require_https_webhooks: false,
+            monero_network: MoneroNetwork::Mainnet,
             monero_rpc_url: "http://127.0.0.1:18082/json_rpc".to_string(),
             monero_daemon_rpc_url: None,
+            monero_daemon_rpc_user: None,
+            monero_daemon_rpc_pass: None,
             monero_rpc_user: Some("rpcuser".to_string()),
             monero_rpc_pass: Some("super-secret-rpc-pass".to_string()),
             allow_unauthenticated_rpc: false,
@@ -903,11 +1008,13 @@ mod tests {
 
     #[test]
     fn debug_redacts_secrets() {
-        let cfg = sample_valid_config();
+        let mut cfg = sample_valid_config();
+        cfg.monero_daemon_rpc_pass = Some("daemon-super-secret-pass".to_string());
         let dbg = format!("{cfg:?}");
         assert!(!dbg.contains(&"a".repeat(32)));
         assert!(!dbg.contains(&"b".repeat(32)));
         assert!(!dbg.contains("super-secret-rpc-pass"));
+        assert!(!dbg.contains("daemon-super-secret-pass"));
         assert!(dbg.contains("[REDACTED]"));
     }
 
@@ -1017,6 +1124,40 @@ mod tests {
         // TLS remote RPC is allowed
         remote_http.monero_rpc_url = "https://rpc.internal.example:18082/json_rpc".to_string();
         assert!(remote_http.validate().is_ok());
+    }
+
+    #[test]
+    fn daemon_rpc_security_policy_enforced_audit_001() {
+        // Unpaired daemon user/pass or missing MONERO_DAEMON_RPC_URL rejected
+        let mut orphan_creds = sample_valid_config();
+        orphan_creds.monero_daemon_rpc_user = Some("daemon_user".to_string());
+        orphan_creds.monero_daemon_rpc_pass = Some("daemon-secret-pass-012345".to_string());
+        assert!(orphan_creds.validate().is_err());
+
+        let mut unpaired = sample_valid_config();
+        unpaired.allow_unauthenticated_rpc = true;
+        unpaired.monero_daemon_rpc_url = Some("http://127.0.0.1:18081/json_rpc".to_string());
+        unpaired.monero_daemon_rpc_user = Some("daemon_user".to_string());
+        unpaired.monero_daemon_rpc_pass = None;
+        assert!(unpaired.validate().is_err());
+
+        // Non-loopback cleartext HTTP MONERO_DAEMON_RPC_URL rejected
+        let mut remote_daemon_http = sample_valid_config();
+        remote_daemon_http.monero_daemon_rpc_url =
+            Some("http://10.0.0.25:18081/json_rpc".to_string());
+        remote_daemon_http.monero_daemon_rpc_user = Some("daemon_user".to_string());
+        remote_daemon_http.monero_daemon_rpc_pass = Some("daemon-secret-pass-012345".to_string());
+        assert!(remote_daemon_http.validate().is_err());
+
+        // HTTPS non-loopback MONERO_DAEMON_RPC_URL with valid credentials succeeds
+        remote_daemon_http.monero_daemon_rpc_url =
+            Some("https://node.internal.example:18081/json_rpc".to_string());
+        assert!(remote_daemon_http.validate().is_ok());
+
+        // Empty daemon credentials rejected when ALLOW_UNAUTHENTICATED_RPC=false
+        let mut no_daemon_auth = sample_valid_config();
+        no_daemon_auth.monero_daemon_rpc_url = Some("http://127.0.0.1:18081/json_rpc".to_string());
+        assert!(no_daemon_auth.validate().is_err());
     }
 
     #[test]

@@ -59,23 +59,43 @@ pub struct GetVersionResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct GetHeightResponse {
     /// Current synced blockchain height observed by the wallet.
-    pub height: u64,
+    #[serde(default)]
+    pub height: Option<u64>,
 }
 
-/// Response from `monerod` JSON-RPC method `get_info`.
+/// Response from `monerod` JSON-RPC method `get_info` (`COMMAND_RPC_GET_INFO::response_t`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct GetInfoResponse {
     /// Current tip height reported by the daemon.
-    pub height: u64,
+    #[serde(default)]
+    pub height: Option<u64>,
     /// Optional target height when daemon is still syncing.
     #[serde(default)]
     pub target_height: Option<u64>,
     /// Optional synchronization status reported by `monerod`.
     #[serde(default)]
     pub synchronized: Option<bool>,
+    /// Optional offline flag reported by `monerod`.
+    #[serde(default)]
+    pub offline: Option<bool>,
+    /// Optional untrusted daemon indicator inherited from `rpc_response_base`.
+    #[serde(default)]
+    pub untrusted: Option<bool>,
     /// Optional RPC status string (`"OK"`).
     #[serde(default)]
     pub status: Option<String>,
+    /// Optional Monero network type string (`"mainnet"`, `"stagenet"`, `"testnet"`).
+    #[serde(default)]
+    pub nettype: Option<String>,
+    /// Optional boolean indicating mainnet.
+    #[serde(default)]
+    pub mainnet: Option<bool>,
+    /// Optional boolean indicating stagenet.
+    #[serde(default)]
+    pub stagenet: Option<bool>,
+    /// Optional boolean indicating testnet.
+    #[serde(default)]
+    pub testnet: Option<bool>,
 }
 
 /// Request parameters for `query_key`.
@@ -269,6 +289,52 @@ impl TransferEntry {
         }
 
         true
+    }
+
+    /// Fail-closed destination verification for `MARK_RECONCILED` (`AUDIT-004`).
+    ///
+    /// Unlike [`Self::matches_sweep`], rejects entries with missing destination metadata
+    /// (`destinations` empty AND `address` empty) and rejects multi-destination transactions that
+    /// send any positive amount to an address other than `destination_address`. Returns the total
+    /// verified piconero sent exclusively to `destination_address`.
+    #[must_use]
+    pub fn verified_sweep_destination_amount(
+        &self,
+        account_index: u32,
+        address_index: u32,
+        destination_address: &str,
+    ) -> Option<u64> {
+        let subaddr_match = (self.subaddr_index.major == account_index
+            && self.subaddr_index.minor == address_index)
+            || self
+                .subaddr_indices
+                .iter()
+                .any(|idx| idx.major == account_index && idx.minor == address_index);
+
+        if !subaddr_match {
+            return None;
+        }
+
+        if !self.destinations.is_empty() {
+            let mut dest_sum = 0_u64;
+            for dest in &self.destinations {
+                if dest.amount == 0 {
+                    continue;
+                }
+                if dest.address != destination_address {
+                    return None;
+                }
+                dest_sum = dest_sum.checked_add(dest.amount)?;
+            }
+            return (dest_sum > 0).then_some(dest_sum);
+        }
+
+        let addr = self.address.trim();
+        if !addr.is_empty() && addr == destination_address && self.amount > 0 {
+            return Some(self.amount);
+        }
+
+        None
     }
     /// Determines whether this incoming output has cleared Monero's 10-block consensus lock.
     ///
