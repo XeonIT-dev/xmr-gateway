@@ -20,7 +20,7 @@ use crate::{
             ResolveSweepIncidentRequest, ResolveSweepIncidentResponse, RetryWebhookResponse,
             RpcHealthStatus, SweepAttemptDto, SweepInvoiceResponse,
         },
-        middleware::{API_KEY_HEADER, constant_time_key_match},
+        middleware::is_authorized_for_health_diagnostics,
     },
     domain::{
         amount::Piconero,
@@ -34,16 +34,14 @@ use crate::{
 /// Maximum permitted invoice TTL in seconds (30 days).
 const MAX_INVOICE_TTL_SECONDS: u64 = 2_592_000;
 
-/// Public / authenticated healthcheck handler (`GET /health`) (`XMR-033`).
+/// Public / authenticated healthcheck handler (`GET /health`) (`XMR-033` / `AUDIT-002`).
 ///
 /// Unauthenticated requests receive ONLY `{"status": "ok" | "degraded" | "unhealthy"}` without
 /// leaking service version, internal error details, RPC metadata, or custody mode. Requests
-/// carrying a valid `X-API-Key` header receive full diagnostic telemetry.
+/// authenticated with valid `X-API-Key` (merchant or operator key) or `X-Operator-Key` (operator
+/// key, or merchant key in single-tenant mode) receive full diagnostic telemetry.
 pub async fn health_check(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let authorized = headers
-        .get(API_KEY_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|presented| constant_time_key_match(presented, &state.config.api_secret_key));
+    let authorized = is_authorized_for_health_diagnostics(&headers, &state.config);
 
     if let Err(err) = state.repo.health_check().await {
         tracing::error!(error = %err, "healthcheck SQLite failure");
@@ -388,13 +386,16 @@ pub async fn resolve_sweep_incident(
     }))
 }
 
-/// Resets a permanently `FAILED` or backed-off `PENDING` webhook outbox delivery for immediate retry
-/// (`POST /api/v1/webhooks/{webhook_id}/retry`) (`XMR-028`).
+/// Resets a permanently `FAILED` webhook outbox delivery for immediate retry
+/// (`POST /api/v1/webhooks/{webhook_id}/retry`) (`XMR-028` / `AUDIT-002`).
+///
+/// Only deliveries in `FAILED` status may be reset so operator retries never race with
+/// in-flight or backed-off `PENDING` deliveries managed by `WebhookDispatcher`.
 ///
 /// # Errors
 /// - `400 Bad Request` if `webhook_id` is not a valid UUID.
 /// - `404 Not Found` if `webhook_id` does not exist.
-/// - `409 Conflict` if the webhook delivery is already `DELIVERED`.
+/// - `409 Conflict` if the webhook delivery is already `DELIVERED` or still `PENDING`.
 pub async fn retry_webhook(
     State(state): State<AppState>,
     Path(webhook_id_raw): Path<String>,
@@ -426,8 +427,12 @@ pub async fn retry_webhook(
     }))
 }
 
-/// Resets all `FAILED` or backed-off `PENDING` webhook outbox deliveries for an invoice
-/// (`POST /api/v1/invoices/{invoice_id}/webhooks/retry`) (`XMR-028`).
+/// Resets all permanently `FAILED` webhook outbox deliveries for an invoice
+/// (`POST /api/v1/invoices/{invoice_id}/webhooks/retry`) (`XMR-028` / `AUDIT-002`).
+///
+/// Existing `PENDING` and `DELIVERED` rows are left untouched; `retried_count` and
+/// `webhook_ids` report strictly the deliveries transitioned from `FAILED` to `PENDING`
+/// by this call.
 ///
 /// # Errors
 /// - `400 Bad Request` if `invoice_id` is not a valid UUID.

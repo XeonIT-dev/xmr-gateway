@@ -333,17 +333,24 @@ pub fn build_sweep_webhook_delivery(
         .map_err(|e| GatewayError::Webhook(format!("failed to serialize webhook payload: {e}")))?;
     let signature_hex = sign_payload_hmac_sha256(webhook_secret, payload_json.as_bytes())?;
 
-    let dedupe_key = if invoice.sweep_tx_hashes.len() > 1 {
-        format!("{}:SWEPT:{}", invoice.id, invoice.sweep_tx_hashes.len())
-    } else if invoice.status == InvoiceStatus::Expired {
-        let hash_suffix = invoice
-            .sweep_tx_hashes
-            .first()
-            .map(String::as_str)
-            .unwrap_or("late");
-        format!("{}:SWEPT:LATE:{}", invoice.id, hash_suffix)
+    let mut canonical_hashes = invoice.sweep_tx_hashes.clone();
+    canonical_hashes.sort();
+    canonical_hashes.dedup();
+    let hashes_part = if canonical_hashes.is_empty() {
+        "none".to_string()
     } else {
-        format!("{}:SWEPT", invoice.id)
+        canonical_hashes.join(",")
+    };
+
+    let dedupe_key = match sweep_reason.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(reason) => format!(
+            "{}:SWEPT:{}:epoch:{}:{}",
+            invoice.id, reason, invoice.reorg_epoch, hashes_part
+        ),
+        None => format!(
+            "{}:SWEPT:epoch:{}:{}",
+            invoice.id, invoice.reorg_epoch, hashes_part
+        ),
     };
 
     Ok(NewWebhookDelivery {
@@ -434,16 +441,22 @@ impl WebhookDispatcher {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
+            if *shutdown.borrow() {
+                tracing::info!("webhook dispatcher received shutdown signal");
+                break;
+            }
+
             tokio::select! {
-                _ = ticker.tick() => {
-                    if let Err(err) = self.process_due_deliveries().await {
-                        tracing::error!(error = %err, "webhook dispatch tick failed");
-                    }
-                }
+                biased;
                 res = shutdown.changed() => {
                     if res.is_err() || *shutdown.borrow() {
                         tracing::info!("webhook dispatcher received shutdown signal");
                         break;
+                    }
+                }
+                _ = ticker.tick() => {
+                    if let Err(err) = self.process_due_deliveries().await {
+                        tracing::error!(error = %err, "webhook dispatch tick failed");
                     }
                 }
             }

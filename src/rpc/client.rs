@@ -22,7 +22,7 @@ use tokio::sync::Mutex;
 use url::Url;
 
 use crate::{
-    config::WalletMode,
+    config::{MoneroNetwork, WalletMode},
     error::{GatewayError, GatewayResult},
     rpc::types::{
         CreateAddressParams, CreateAddressResponse, EmptyParams, GetHeightResponse,
@@ -148,7 +148,10 @@ impl MoneroRpcClient {
         self.call("get_height", EmptyParams {}).await
     }
 
-    /// Queries `monerod` `get_info` for canonical node height and sync status (`XMR-043`).
+    /// Queries `monerod` `get_info` for canonical node height and sync status (`XMR-043` / `AUDIT-001`).
+    ///
+    /// NOTE: `get_info` is a daemon (`monerod`) JSON-RPC method and MUST NEVER be called on
+    /// `monero-wallet-rpc` (which only exposes `get_height`).
     ///
     /// # Errors
     /// Returns [`GatewayError::RpcTransport`] or [`GatewayError::Rpc`] on failure.
@@ -156,57 +159,135 @@ impl MoneroRpcClient {
         self.call("get_info", EmptyParams {}).await
     }
 
-    /// Verifies fail-closed that `monero-wallet-rpc` is fully caught up with `monerod` (`XMR-043`):
-    /// `wallet_height > 0`, `daemon_height > 0`, daemon `synchronized != Some(false)`, and
-    /// `wallet_height >= daemon_height`.
+    /// Verifies fail-closed that `monero-wallet-rpc` is fully caught up with the `monerod` chain tip
+    /// (`XMR-043` / `AUDIT-001`):
+    /// - Requires `daemon_rpc_url` (`MONERO_DAEMON_RPC_URL`) to be configured; fails closed with
+    ///   [`GatewayError::ServiceUnavailable`] (`503`) if omitted without ever calling non-existent
+    ///   `get_info` or `get_wallet_info` on `monero-wallet-rpc`.
+    /// - Queries wallet height via `monero-wallet-rpc` `get_height` AND queries the separate
+    ///   `monerod` client (using `daemon_rpc_user` / `daemon_rpc_pass`) via `get_info`.
+    /// - Requires mandatory `get_info` fields (`height`, `status`, `untrusted`, `offline`,
+    ///   `synchronized`), rejects with [`GatewayError::Conflict`] (`409`) unless
+    ///   `untrusted == Some(false)`, `offline == Some(false)`, `synchronized == Some(true)`,
+    ///   `status == Some("OK")`, `expected_network` matches `nettype`/boolean network flags,
+    ///   `wallet_height > 0`, `effective_daemon_tip > 0`, and `wallet_height >= effective_daemon_tip`.
     ///
     /// # Errors
-    /// - [`GatewayError::ServiceUnavailable`] (`503`) if wallet or daemon RPC fails/unreachable.
-    /// - [`GatewayError::Conflict`] (`409`) if wallet lags behind daemon height or height is zero.
+    /// - [`GatewayError::ServiceUnavailable`] (`503`) if `MONERO_DAEMON_RPC_URL` is unset/invalid,
+    ///   wallet/daemon RPC fails or is unreachable, or mandatory RPC fields are missing.
+    /// - [`GatewayError::Conflict`] (`409`) if wallet height is zero, daemon tip is zero, daemon is
+    ///   untrusted/offline/unsynced/non-OK, daemon network mismatches `expected_network`, or wallet
+    ///   lags behind daemon height (`wallet_height < daemon_tip`).
     pub async fn verify_wallet_synced(
         &self,
         daemon_rpc_url: Option<&str>,
+        daemon_rpc_user: Option<&str>,
+        daemon_rpc_pass: Option<&str>,
+        expected_network: MoneroNetwork,
     ) -> GatewayResult<(u64, u64)> {
+        let Some(url) = daemon_rpc_url.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Err(GatewayError::ServiceUnavailable(
+                "MONERO_DAEMON_RPC_URL is required to independently verify wallet/daemon synchronization before allow_resweep (monero-wallet-rpc v0.18 does not expose daemon tip height; refusing unsafe unlock)"
+                    .to_string(),
+            ));
+        };
+
         let wallet_height = self
             .get_height()
             .await
             .map_err(|err| {
                 GatewayError::ServiceUnavailable(format!(
-                    "unable to verify wallet sync height via get_height: {err}"
+                    "unable to verify wallet sync height via monero-wallet-rpc get_height: {err}"
                 ))
             })?
-            .height;
+            .height
+            .ok_or_else(|| {
+                GatewayError::ServiceUnavailable(
+                    "incomplete get_height response from monero-wallet-rpc: missing height"
+                        .to_string(),
+                )
+            })?;
 
-        let daemon_info = match daemon_rpc_url {
-            Some(url) if url != self.endpoint.as_str() => {
-                let daemon_client = Self::new(url, None, None).map_err(|err| {
-                    GatewayError::ServiceUnavailable(format!(
-                        "invalid MONERO_DAEMON_RPC_URL configuration: {err}"
-                    ))
-                })?;
-                daemon_client.get_info().await
-            }
-            _ => self.get_info().await,
-        }
+        let daemon_client = Self::new(
+            url,
+            daemon_rpc_user
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned),
+            daemon_rpc_pass
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned),
+        )
         .map_err(|err| {
             GatewayError::ServiceUnavailable(format!(
-                "unable to verify daemon tip height via get_info: {err}"
+                "invalid MONERO_DAEMON_RPC_URL configuration: {err}"
             ))
         })?;
 
-        let effective_daemon_tip = daemon_info
-            .target_height
-            .filter(|&th| th > daemon_info.height)
-            .unwrap_or(daemon_info.height);
+        let daemon_info = daemon_client.get_info().await.map_err(|err| {
+            GatewayError::ServiceUnavailable(format!(
+                "unable to verify daemon tip height via monerod get_info: {err}"
+            ))
+        })?;
 
-        if wallet_height == 0
+        let daemon_height = daemon_info.height.ok_or_else(|| {
+            GatewayError::ServiceUnavailable(
+                "incomplete get_info response from monerod: missing height".to_string(),
+            )
+        })?;
+        let status = daemon_info.status.as_deref().ok_or_else(|| {
+            GatewayError::ServiceUnavailable(
+                "incomplete get_info response from monerod: missing status".to_string(),
+            )
+        })?;
+        let untrusted = daemon_info.untrusted.ok_or_else(|| {
+            GatewayError::ServiceUnavailable(
+                "incomplete get_info response from monerod: missing untrusted".to_string(),
+            )
+        })?;
+        let offline = daemon_info.offline.ok_or_else(|| {
+            GatewayError::ServiceUnavailable(
+                "incomplete get_info response from monerod: missing offline".to_string(),
+            )
+        })?;
+        let synchronized = daemon_info.synchronized.ok_or_else(|| {
+            GatewayError::ServiceUnavailable(
+                "incomplete get_info response from monerod: missing synchronized".to_string(),
+            )
+        })?;
+
+        if !daemon_matches_network(&daemon_info, expected_network) {
+            return Err(GatewayError::Conflict(format!(
+                "monerod get_info network mismatch or missing network identity: expected '{}' (got nettype={:?}, mainnet={:?}, stagenet={:?}, testnet={:?}); refusing unsafe unlock",
+                expected_network,
+                daemon_info.nettype,
+                daemon_info.mainnet,
+                daemon_info.stagenet,
+                daemon_info.testnet
+            )));
+        }
+
+        let effective_daemon_tip = daemon_height.max(daemon_info.target_height.unwrap_or(0));
+
+        if untrusted
+            || offline
+            || !synchronized
+            || status != "OK"
+            || wallet_height == 0
+            || daemon_height == 0
             || effective_daemon_tip == 0
-            || daemon_info.synchronized == Some(false)
             || wallet_height < effective_daemon_tip
         {
             return Err(GatewayError::Conflict(format!(
-                "wallet is not fully synced with daemon tip (wallet_height={}, daemon_height={}, synchronized={:?}); refusing unsafe unlock",
-                wallet_height, effective_daemon_tip, daemon_info.synchronized
+                "wallet is not fully synced with trusted monerod tip (wallet_height={}, daemon_height={}, target_height={:?}, synchronized={}, offline={}, untrusted={}, status={}); refusing unsafe unlock",
+                wallet_height,
+                daemon_height,
+                daemon_info.target_height,
+                synchronized,
+                offline,
+                untrusted,
+                status
             )));
         }
 
@@ -559,6 +640,52 @@ impl MoneroRpcClient {
                 "HTTP request to monero-wallet-rpc failed: {sanitized}"
             ))
         })
+    }
+}
+
+/// Verifies that `monerod` `get_info` identifies the expected Monero network with no conflicting
+/// network indicators (`AUDIT-001`).
+fn daemon_matches_network(info: &GetInfoResponse, expected: MoneroNetwork) -> bool {
+    let expected_str = expected.as_str();
+    if let Some(ref nettype) = info.nettype
+        && !nettype.eq_ignore_ascii_case(expected_str)
+    {
+        return false;
+    }
+
+    let nettype_is_expected = info
+        .nettype
+        .as_deref()
+        .is_some_and(|n| n.eq_ignore_ascii_case(expected_str));
+
+    match expected {
+        MoneroNetwork::Mainnet => {
+            if info.stagenet == Some(true)
+                || info.testnet == Some(true)
+                || info.mainnet == Some(false)
+            {
+                return false;
+            }
+            nettype_is_expected || info.mainnet == Some(true)
+        }
+        MoneroNetwork::Stagenet => {
+            if info.mainnet == Some(true)
+                || info.testnet == Some(true)
+                || info.stagenet == Some(false)
+            {
+                return false;
+            }
+            nettype_is_expected || info.stagenet == Some(true)
+        }
+        MoneroNetwork::Testnet => {
+            if info.mainnet == Some(true)
+                || info.stagenet == Some(true)
+                || info.testnet == Some(false)
+            {
+                return false;
+            }
+            nettype_is_expected || info.testnet == Some(true)
+        }
     }
 }
 

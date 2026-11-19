@@ -16,8 +16,9 @@ use crate::{
     domain::{
         amount::Piconero,
         invoice::{
-            Invoice, InvoiceStatus, ObservedTransfer, SubaddressTransferRecord,
-            SubaddressTransferStatus, TransferClassification, WebhookEventType,
+            Invoice, InvoiceStatus, MONERO_UNLOCK_CONFIRMATIONS, ObservedTransfer,
+            SubaddressTransferRecord, SubaddressTransferStatus, TransferClassification,
+            WebhookEventType,
         },
     },
     error::{GatewayError, GatewayResult},
@@ -436,6 +437,13 @@ impl InvoiceRepository {
         }
     }
 
+    /// Starts a SQLite `BEGIN IMMEDIATE` write transaction, acquiring the `RESERVED` write
+    /// lock upfront so concurrent readers/writers wait cleanly via `busy_timeout` instead of
+    /// failing immediately with `SQLITE_BUSY` on a `DEFERRED` read-to-write lock upgrade (`AUDIT-005`).
+    async fn begin_immediate(&self) -> Result<Transaction<'_, Sqlite>, sqlx::Error> {
+        self.pool.begin_with("BEGIN IMMEDIATE").await
+    }
+
     /// Acquires a per-`order_id` async mutex to serialize concurrent invoice creation requests
     /// so retried or racing requests never allocate orphaned Monero subaddresses (`XMR-019`).
     pub async fn acquire_order_lock(&self, order_id: &str) -> Arc<Mutex<()>> {
@@ -692,7 +700,7 @@ impl InvoiceRepository {
     /// Returns [`GatewayError::NotFound`] if the invoice vanished, [`GatewayError::Domain`] on
     /// illegal transitions or overflow, or [`GatewayError::Database`] on SQLite failures.
     pub async fn apply_scan_update(&self, params: ApplyScanUpdateParams) -> GatewayResult<Invoice> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let id_str = params.invoice_id.to_string();
 
         let existing_row: InvoiceRow = sqlx::query_as(
@@ -715,18 +723,62 @@ impl InvoiceRepository {
         })?;
 
         let existing = Invoice::try_from(existing_row)?;
-        if matches!(
-            existing.status,
-            InvoiceStatus::Swept | InvoiceStatus::Expired
-        ) {
+
+        // Terminal Swept and non-reorg Completed invoices MUST NOT have their transfers,
+        // confirmations, or unlocked state clobbered by a stale in-flight scan (`P36-6`).
+        // Preserve sticky double_spend_seen if newly observed, then return early.
+        if existing.status == InvoiceStatus::Swept
+            || (existing.status == InvoiceStatus::Completed
+                && params.next_status != InvoiceStatus::Reorged)
+        {
+            if params.double_spend_seen && !existing.double_spend_seen {
+                sqlx::query(
+                    r#"
+                    UPDATE invoices
+                    SET double_spend_seen = 1, updated_at = ?
+                    WHERE id = ?
+                    "#,
+                )
+                .bind(params.now.to_rfc3339())
+                .bind(&id_str)
+                .execute(&mut *tx)
+                .await?;
+
+                let updated_row: InvoiceRow = sqlx::query_as(
+                    r#"
+                    SELECT
+                        id, order_id, account_index, address_index, subaddress,
+                        amount_piconero, received_piconero, confirmations, unlocked, double_spend_seen,
+                        reorg_epoch, status, callback_url, monero_uri, qr_code_base64,
+                        sweep_tx_hashes, sweep_amount_piconero, sweep_fee_piconero, last_sweep_error,
+                        created_at, updated_at, expires_at, confirmed_at, settled_at, swept_at, completed_at
+                    FROM invoices
+                    WHERE id = ?
+                    "#,
+                )
+                .bind(&id_str)
+                .fetch_one(&mut *tx)
+                .await?;
+
+                tx.commit().await?;
+                return Invoice::try_from(updated_row);
+            }
+
             tx.commit().await?;
             return Ok(existing);
         }
 
-        existing.status.validate_transition(params.next_status)?;
+        let keep_terminal_status = existing.status == InvoiceStatus::Expired;
+
+        let effective_status = if keep_terminal_status {
+            existing.status
+        } else {
+            existing.status.validate_transition(params.next_status)?;
+            params.next_status
+        };
 
         for tr in &params.transfers {
-            upsert_transfer_tx(&mut tx, &id_str, tr, params.now).await?;
+            upsert_transfer_tx(&mut tx, &id_str, tr, params.now, keep_terminal_status).await?;
         }
 
         let active_txids: Vec<&str> = params
@@ -744,10 +796,10 @@ impl InvoiceRepository {
         .fetch_one(&mut *tx)
         .await?;
 
-        let confirmed_at = if existing.confirmed_at.is_some() {
+        let confirmed_at = if existing.confirmed_at.is_some() || keep_terminal_status {
             existing.confirmed_at
         } else if matches!(
-            params.next_status,
+            effective_status,
             InvoiceStatus::Confirmed | InvoiceStatus::Settled | InvoiceStatus::Completed
         ) {
             Some(params.now)
@@ -755,17 +807,17 @@ impl InvoiceRepository {
             None
         };
 
-        let settled_at = if existing.settled_at.is_some() {
+        let settled_at = if existing.settled_at.is_some() || keep_terminal_status {
             existing.settled_at
-        } else if params.next_status == InvoiceStatus::Settled {
+        } else if effective_status == InvoiceStatus::Settled {
             Some(params.now)
         } else {
             None
         };
 
-        let completed_at = if existing.completed_at.is_some() {
+        let completed_at = if existing.completed_at.is_some() || keep_terminal_status {
             existing.completed_at
-        } else if params.next_status == InvoiceStatus::Completed {
+        } else if effective_status == InvoiceStatus::Completed {
             Some(params.now)
         } else {
             None
@@ -773,9 +825,13 @@ impl InvoiceRepository {
 
         let received_i64 = params.received_piconero.to_i64()?;
         let conf_i64 = u64_to_i64(params.confirmations, "confirmations")?;
-        let double_spend_flag = params.double_spend_seen || has_tainted_transfer;
+        let double_spend_flag = if keep_terminal_status {
+            existing.double_spend_seen || params.double_spend_seen || has_tainted_transfer
+        } else {
+            params.double_spend_seen || has_tainted_transfer
+        };
         let next_reorg_epoch = if existing.status != InvoiceStatus::Reorged
-            && params.next_status == InvoiceStatus::Reorged
+            && effective_status == InvoiceStatus::Reorged
         {
             existing.reorg_epoch.saturating_add(1)
         } else {
@@ -804,7 +860,7 @@ impl InvoiceRepository {
         .bind(i64::from(params.unlocked))
         .bind(i64::from(double_spend_flag))
         .bind(i64::from(next_reorg_epoch))
-        .bind(params.next_status.as_str())
+        .bind(effective_status.as_str())
         .bind(params.now.to_rfc3339())
         .bind(confirmed_at.map(|ts| ts.to_rfc3339()))
         .bind(settled_at.map(|ts| ts.to_rfc3339()))
@@ -813,8 +869,61 @@ impl InvoiceRepository {
         .execute(&mut *tx)
         .await?;
 
-        if let Some(webhook) = params.webhook {
+        if !keep_terminal_status && let Some(webhook) = params.webhook {
             insert_webhook_tx(&mut tx, &webhook).await?;
+        }
+
+        let updated_row: InvoiceRow = sqlx::query_as(
+            r#"
+            SELECT
+                id, order_id, account_index, address_index, subaddress,
+                amount_piconero, received_piconero, confirmations, unlocked, double_spend_seen,
+                reorg_epoch, status, callback_url, monero_uri, qr_code_base64,
+                sweep_tx_hashes, sweep_amount_piconero, sweep_fee_piconero, last_sweep_error,
+                created_at, updated_at, expires_at, confirmed_at, settled_at, swept_at, completed_at
+            FROM invoices
+            WHERE id = ?
+            "#,
+        )
+        .bind(&id_str)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Invoice::try_from(updated_row)
+    }
+
+    /// Persists sticky `double_spend_seen = 1` on `invoice_id` without altering terminal status,
+    /// balances, or transfers (used by `scan_once()` for `SWEPT`/`EXPIRED` invoices, `P36-6`).
+    ///
+    /// # Errors
+    /// Returns [`GatewayError::NotFound`] if the invoice is missing or [`GatewayError::Database`]
+    /// on SQL failure.
+    pub async fn mark_invoice_double_spend_seen(
+        &self,
+        invoice_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> GatewayResult<Invoice> {
+        let mut tx = self.begin_immediate().await?;
+        let id_str = invoice_id.to_string();
+        let now_str = now.to_rfc3339();
+
+        let res = sqlx::query(
+            r#"
+            UPDATE invoices
+            SET double_spend_seen = 1, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(&now_str)
+        .bind(&id_str)
+        .execute(&mut *tx)
+        .await?;
+
+        if res.rows_affected() == 0 {
+            return Err(GatewayError::NotFound(format!(
+                "invoice {invoice_id} not found"
+            )));
         }
 
         let updated_row: InvoiceRow = sqlx::query_as(
@@ -850,7 +959,7 @@ impl InvoiceRepository {
         active_txids: &[String],
         now: DateTime<Utc>,
     ) -> GatewayResult<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let id_str = invoice_id.to_string();
         let active_refs: Vec<&str> = active_txids.iter().map(String::as_str).collect();
         reconcile_orphaned_transfers_tx(&mut tx, &id_str, &active_refs, now).await?;
@@ -864,7 +973,7 @@ impl InvoiceRepository {
     /// Returns [`GatewayError::NotFound`] if missing, [`GatewayError::Conflict`] if the invoice
     /// is not in `SETTLED` status, or [`GatewayError::Database`] on SQL failure.
     pub async fn mark_invoice_swept(&self, params: MarkSweptParams) -> GatewayResult<Invoice> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let id_str = params.invoice_id.to_string();
 
         let existing_row: InvoiceRow = sqlx::query_as(
@@ -1027,7 +1136,7 @@ impl InvoiceRepository {
         now: DateTime<Utc>,
         complete_on_view_only: bool,
     ) -> GatewayResult<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let now_str = now.to_rfc3339();
 
         sqlx::query(
@@ -1172,19 +1281,24 @@ impl InvoiceRepository {
         row.map(WebhookDelivery::try_from).transpose()
     }
 
-    /// Resets a `FAILED` or backed-off `PENDING` webhook delivery for immediate retry (`XMR-028`).
+    /// Resets a permanently `FAILED` webhook delivery to `PENDING` (`attempts = 0`) for immediate
+    /// retry (`XMR-028` / `AUDIT-002`).
+    ///
+    /// Executes inside a `BEGIN IMMEDIATE` transaction and strictly permits transitioning ONLY
+    /// `FAILED` deliveries so manual retries can never race with `WebhookDispatcher` over active
+    /// or backed-off `PENDING` deliveries.
     ///
     /// Returns `Ok(None)` if no webhook delivery with `webhook_id` exists.
     ///
     /// # Errors
-    /// Returns [`GatewayError::Conflict`] if the webhook is already `DELIVERED`, or
-    /// [`GatewayError::Database`] on SQL failure.
+    /// Returns [`GatewayError::Conflict`] if the webhook is already `DELIVERED`, still `PENDING`,
+    /// or concurrently left `FAILED` status, or [`GatewayError::Database`] on SQL failure.
     pub async fn reset_webhook_delivery_for_retry(
         &self,
         webhook_id: Uuid,
         now: DateTime<Utc>,
     ) -> GatewayResult<Option<WebhookDelivery>> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let id_str = webhook_id.to_string();
 
         let existing_row: Option<WebhookRow> = sqlx::query_as(
@@ -1207,14 +1321,22 @@ impl InvoiceRepository {
             return Ok(None);
         };
         let existing = WebhookDelivery::try_from(row)?;
-        if existing.status == WebhookDeliveryStatus::Delivered {
-            return Err(GatewayError::Conflict(format!(
-                "webhook delivery {webhook_id} is already DELIVERED"
-            )));
+        match existing.status {
+            WebhookDeliveryStatus::Delivered => {
+                return Err(GatewayError::Conflict(format!(
+                    "webhook delivery {webhook_id} is already DELIVERED"
+                )));
+            }
+            WebhookDeliveryStatus::Pending => {
+                return Err(GatewayError::Conflict(format!(
+                    "webhook delivery {webhook_id} is currently PENDING (queued/retrying); only FAILED deliveries can be manually retried"
+                )));
+            }
+            WebhookDeliveryStatus::Failed => {}
         }
 
         let now_str = now.to_rfc3339();
-        sqlx::query(
+        let res = sqlx::query(
             r#"
             UPDATE webhook_deliveries
             SET
@@ -1224,7 +1346,7 @@ impl InvoiceRepository {
                 last_status_code = NULL,
                 last_error = NULL,
                 updated_at = ?
-            WHERE id = ?
+            WHERE id = ? AND status = 'FAILED'
             "#,
         )
         .bind(&now_str)
@@ -1232,6 +1354,12 @@ impl InvoiceRepository {
         .bind(&id_str)
         .execute(&mut *tx)
         .await?;
+
+        if res.rows_affected() != 1 {
+            return Err(GatewayError::Conflict(format!(
+                "webhook delivery {webhook_id} is no longer in FAILED status"
+            )));
+        }
 
         let updated_row: WebhookRow = sqlx::query_as(
             r#"
@@ -1252,8 +1380,12 @@ impl InvoiceRepository {
         Ok(Some(WebhookDelivery::try_from(updated_row)?))
     }
 
-    /// Resets all `FAILED` (or backed-off `PENDING`) webhook deliveries for `invoice_id` so they
-    /// are immediately retried by the webhook dispatcher (`XMR-028`).
+    /// Resets ONLY permanently `FAILED` webhook deliveries for `invoice_id` back to `PENDING`
+    /// (`attempts = 0`) for immediate retry (`XMR-028` / `AUDIT-002`).
+    ///
+    /// Executes inside a `BEGIN IMMEDIATE` transaction without touching already-`PENDING` or
+    /// `DELIVERED` rows, and returns strictly the deliveries transitioned from `FAILED` to
+    /// `PENDING` by this call.
     ///
     /// # Errors
     /// Returns [`GatewayError::NotFound`] if `invoice_id` does not exist, or [`GatewayError::Database`]
@@ -1263,7 +1395,7 @@ impl InvoiceRepository {
         invoice_id: Uuid,
         now: DateTime<Utc>,
     ) -> GatewayResult<Vec<WebhookDelivery>> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let id_str = invoice_id.to_string();
 
         let exists: Option<String> = sqlx::query_scalar("SELECT id FROM invoices WHERE id = ?")
@@ -1277,7 +1409,7 @@ impl InvoiceRepository {
         }
 
         let now_str = now.to_rfc3339();
-        sqlx::query(
+        let rows: Vec<WebhookRow> = sqlx::query_as(
             r#"
             UPDATE webhook_deliveries
             SET
@@ -1287,39 +1419,36 @@ impl InvoiceRepository {
                 last_status_code = NULL,
                 last_error = NULL,
                 updated_at = ?
-            WHERE invoice_id = ? AND status IN ('FAILED', 'PENDING')
-            "#,
-        )
-        .bind(&now_str)
-        .bind(&now_str)
-        .bind(&id_str)
-        .execute(&mut *tx)
-        .await?;
-
-        let rows: Vec<WebhookRow> = sqlx::query_as(
-            r#"
-            SELECT
+            WHERE invoice_id = ? AND status = 'FAILED'
+            RETURNING
                 id, invoice_id, event_type, dedupe_key, target_url,
                 payload_json, signature_hex, status, attempts, max_attempts,
                 next_attempt_at, last_status_code, last_error,
                 created_at, updated_at, delivered_at
-            FROM webhook_deliveries
-            WHERE invoice_id = ? AND status = 'PENDING'
-            ORDER BY created_at ASC
             "#,
         )
+        .bind(&now_str)
+        .bind(&now_str)
         .bind(&id_str)
         .fetch_all(&mut *tx)
         .await?;
 
         tx.commit().await?;
-        rows.into_iter().map(WebhookDelivery::try_from).collect()
+
+        let mut deliveries: Vec<WebhookDelivery> = rows
+            .into_iter()
+            .map(WebhookDelivery::try_from)
+            .collect::<GatewayResult<Vec<_>>>()?;
+        deliveries.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(deliveries)
     }
 
-    /// Persists a `PREPARED` row in `sweep_attempts` BEFORE issuing `sweep_all` RPC (`XMR-003` / `XMR-023`).
-    ///
-    /// Captures the exact snapshot of currently `ACTIVE`, unswept `subaddress_transfers.txid` rows
-    /// for `invoice_id` so newly arriving post-sweep inflows are never erroneously marked swept.
+    /// Persists a `PREPARED` row in `sweep_attempts` BEFORE issuing `sweep_all` RPC (`XMR-003` / `XMR-023`),
+    /// snapshotting only unlocked (`>= MONERO_UNLOCK_CONFIRMATIONS`) active unswept transfers.
     ///
     /// # Errors
     /// Returns [`GatewayError::Database`] on SQL failure.
@@ -1330,20 +1459,61 @@ impl InvoiceRepository {
         destination_address: &str,
         now: DateTime<Utc>,
     ) -> GatewayResult<SweepAttempt> {
-        let mut tx = self.pool.begin().await?;
+        self.create_prepared_sweep_attempt_with_min_confs(
+            invoice_id,
+            address_index,
+            destination_address,
+            MONERO_UNLOCK_CONFIRMATIONS,
+            now,
+        )
+        .await
+    }
+
+    /// Persists a `PREPARED` row in `sweep_attempts` BEFORE issuing `sweep_all` RPC (`A3-2` / `P36-3`),
+    /// snapshotting all `ACTIVE`, unswept, non-orphaned, non-double-spent `subaddress_transfers`
+    /// that meet Monero's actual unlock threshold (`MONERO_UNLOCK_CONFIRMATIONS = 10` and
+    /// `unlocked = 1` in `invoice_transfers`).
+    ///
+    /// Using Monero's actual unlock threshold (`10`) rather than `SETTLEMENT_CONFIRMATIONS > 10`
+    /// ensures `snapshot_txids` matches what `monero-wallet-rpc::sweep_all` will actually spend
+    /// on-chain while excluding still-locked (`< 10` confs / `unlocked = 0`) inflows (`P36-3`).
+    ///
+    /// # Errors
+    /// Returns [`GatewayError::Database`] on SQL failure.
+    pub async fn create_prepared_sweep_attempt_with_min_confs(
+        &self,
+        invoice_id: Uuid,
+        address_index: u32,
+        destination_address: &str,
+        _min_sweep_confs: u64,
+        now: DateTime<Utc>,
+    ) -> GatewayResult<SweepAttempt> {
+        let mut tx = self.begin_immediate().await?;
         let id = Uuid::new_v4();
         let inv_str = invoice_id.to_string();
         let now_str = now.to_rfc3339();
+        let unlock_confs_i64 = u64_to_i64(MONERO_UNLOCK_CONFIRMATIONS, "unlock_confs")?;
 
         let snapshot_txids: Vec<String> = sqlx::query_scalar(
             r#"
-            SELECT txid
-            FROM subaddress_transfers
-            WHERE invoice_id = ? AND status = 'ACTIVE' AND swept = 0
-            ORDER BY id ASC
+            SELECT st.txid
+            FROM subaddress_transfers st
+            LEFT JOIN invoice_transfers it
+                ON it.invoice_id = st.invoice_id AND it.txid = st.txid
+            WHERE st.invoice_id = ?
+              AND st.status = 'ACTIVE'
+              AND st.swept = 0
+              AND st.confirmations >= ?
+              AND COALESCE(it.confirmations, st.confirmations) >= ?
+              AND COALESCE(it.orphaned, 0) = 0
+              AND COALESCE(it.double_spend_seen, 0) = 0
+              AND (it.txid IS NULL OR it.unlocked = 1)
+            ORDER BY st.id ASC
             "#,
         )
         .bind(&inv_str)
+        .bind(unlock_confs_i64)
+        .bind(unlock_confs_i64)
         .fetch_all(&mut *tx)
         .await?;
 
@@ -1414,9 +1584,9 @@ impl InvoiceRepository {
         rows.into_iter().map(SweepAttempt::try_from).collect()
     }
 
-    /// Lists all active (`PREPARED`, `SUBMITTED`) and finalized (`CONFIRMED`, `RECONCILED`)
-    /// sweep attempts whose parent invoice remains within the monitoring window (`cutoff`) and
-    /// which have not already been explicitly closed by operator `MARK_RECONCILED` resolution.
+    /// Lists all active/unfinalized (`PREPARED`, `SUBMITTED`, `RECONCILED`) sweep attempts
+    /// unconditionally regardless of `cutoff` (`A4-4`), plus finalized (`CONFIRMED`) attempts whose
+    /// parent invoice remains within the monitoring window (`cutoff`).
     ///
     /// # Errors
     /// Returns [`GatewayError::Database`] on SQL failure.
@@ -1436,11 +1606,8 @@ impl InvoiceRepository {
                         sa.created_at, sa.updated_at
                     FROM sweep_attempts sa
                     JOIN invoices inv ON inv.id = sa.invoice_id
-                    WHERE COALESCE(sa.resolution_action, '') != 'MARK_RECONCILED'
-                      AND (
-                          sa.status IN ('PREPARED', 'SUBMITTED')
-                          OR (sa.status IN ('CONFIRMED', 'RECONCILED') AND inv.created_at >= ?)
-                      )
+                    WHERE sa.status IN ('PREPARED', 'SUBMITTED', 'RECONCILED')
+                       OR (sa.status = 'CONFIRMED' AND inv.created_at >= ?)
                     ORDER BY sa.created_at ASC
                     "#,
                 )
@@ -1457,8 +1624,7 @@ impl InvoiceRepository {
                         error_message, resolved_at, resolution_action, resolution_note,
                         created_at, updated_at
                     FROM sweep_attempts
-                    WHERE COALESCE(resolution_action, '') != 'MARK_RECONCILED'
-                      AND status IN ('PREPARED', 'SUBMITTED', 'CONFIRMED', 'RECONCILED')
+                    WHERE status IN ('PREPARED', 'SUBMITTED', 'CONFIRMED', 'RECONCILED')
                     ORDER BY created_at ASC
                     "#,
                 )
@@ -1468,6 +1634,127 @@ impl InvoiceRepository {
         };
 
         rows.into_iter().map(SweepAttempt::try_from).collect()
+    }
+
+    /// Returns `true` if `tx_hash` (case-insensitive) is already recorded on any other
+    /// `sweep_attempts` row (`id != exclude_attempt_id`) or on another invoice's `sweep_tx_hashes`
+    /// (`A4-2` / `P36-2`, fail-closed on corrupt JSON).
+    ///
+    /// # Errors
+    /// Returns [`GatewayError::Database`] on SQL failure or [`GatewayError::Internal`] on corrupt JSON.
+    pub async fn is_tx_hash_bound_to_other_sweep_attempt(
+        &self,
+        tx_hash: &str,
+        exclude_attempt_id: Uuid,
+        invoice_id: Uuid,
+    ) -> GatewayResult<bool> {
+        // Read-only snapshot transaction (SELECT only).
+        let mut tx = self.pool.begin().await?;
+        let bound = is_tx_hash_bound_to_other_sweep_attempt_tx(
+            &mut tx,
+            tx_hash,
+            &exclude_attempt_id.to_string(),
+            &invoice_id.to_string(),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(bound)
+    }
+
+    /// Returns `true` if `invoice_id` has at least one live (`SUBMITTED`, `RECONCILED`, or
+    /// `CONFIRMED`) `sweep_attempts` row other than `exclude_attempt_id` (`P36-2` / `P36-4`).
+    ///
+    /// # Errors
+    /// Returns [`GatewayError::Database`] on SQL failure.
+    pub async fn has_other_live_sweep_attempt(
+        &self,
+        invoice_id: Uuid,
+        exclude_attempt_id: Uuid,
+    ) -> GatewayResult<bool> {
+        let exists: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                FROM sweep_attempts
+                WHERE invoice_id = ?
+                  AND id != ?
+                  AND status IN ('SUBMITTED', 'RECONCILED', 'CONFIRMED')
+            )
+            "#,
+        )
+        .bind(invoice_id.to_string())
+        .bind(exclude_attempt_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
+    }
+
+    /// Determines whether reorging `attempt_id` on `invoice_id` should preserve `SWEPT` status
+    /// (true ONLY if another live sweep attempt remains AND `attempt_id` does not touch any
+    /// primary `EXPECTED` transfer AND no `EXPECTED` transfer is unswept, `P36-4`).
+    ///
+    /// Used by `ScannerService::escalate_sweep_reorg` so the projected `REORGED` webhook matches
+    /// the exact DB status computed by [`Self::mark_sweep_attempt_reorged`].
+    ///
+    /// # Errors
+    /// Returns [`GatewayError::Database`] on SQL failure or [`GatewayError::Internal`] on corrupt JSON.
+    pub async fn should_preserve_swept_on_attempt_reorg(
+        &self,
+        invoice_id: Uuid,
+        attempt_id: Uuid,
+    ) -> GatewayResult<bool> {
+        // Read-only snapshot transaction (SELECT only).
+        let mut tx = self.pool.begin().await?;
+        let inv_str = invoice_id.to_string();
+        let att_str = attempt_id.to_string();
+
+        let snap_json: Option<String> =
+            sqlx::query_scalar("SELECT snapshot_txids_json FROM sweep_attempts WHERE id = ?")
+                .bind(&att_str)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let snapshot_txids: Vec<String> = match snap_json {
+            Some(raw) => serde_json::from_str(&raw).map_err(|e| {
+                GatewayError::Internal(format!("corrupt sweep_attempt snapshot_txids_json: {e}"))
+            })?,
+            None => Vec::new(),
+        };
+
+        let touches_expected =
+            attempt_touches_expected_tx(&mut tx, &inv_str, &att_str, &snapshot_txids).await?;
+        let has_other_live: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                FROM sweep_attempts
+                WHERE invoice_id = ?
+                  AND id != ?
+                  AND status IN ('SUBMITTED', 'RECONCILED', 'CONFIRMED')
+            )
+            "#,
+        )
+        .bind(&inv_str)
+        .bind(&att_str)
+        .fetch_one(&mut *tx)
+        .await?;
+        let has_unswept_expected: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                FROM subaddress_transfers
+                WHERE invoice_id = ?
+                  AND classification = 'EXPECTED'
+                  AND status = 'ACTIVE'
+                  AND swept = 0
+            )
+            "#,
+        )
+        .bind(&inv_str)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(has_other_live && !touches_expected && !has_unswept_expected)
     }
 
     /// Returns `true` if `invoice_id` has an unresolved `REORGED` sweep incident (`SWEEP_REORG_DETECTED`)
@@ -1517,6 +1804,32 @@ impl InvoiceRepository {
         rows.into_iter().map(SweepAttempt::try_from).collect()
     }
 
+    /// Fetches a single [`SweepAttempt`] by its UUID, returning `None` if absent.
+    ///
+    /// # Errors
+    /// Returns [`GatewayError::Database`] on SQL failure.
+    pub async fn get_sweep_attempt_by_id(
+        &self,
+        attempt_id: Uuid,
+    ) -> GatewayResult<Option<SweepAttempt>> {
+        let row: Option<SweepAttemptRow> = sqlx::query_as(
+            r#"
+            SELECT
+                id, invoice_id, address_index, destination_address, snapshot_txids_json,
+                status, tx_hashes_json, swept_amount_piconero, fee_piconero,
+                error_message, resolved_at, resolution_action, resolution_note,
+                created_at, updated_at
+            FROM sweep_attempts
+            WHERE id = ?
+            "#,
+        )
+        .bind(attempt_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(SweepAttempt::try_from).transpose()
+    }
+
     /// Lists every sweep attempt recorded for `invoice_id` in chronological order.
     ///
     /// # Errors
@@ -1556,14 +1869,14 @@ impl InvoiceRepository {
         error_msg: &str,
         now: DateTime<Utc>,
     ) -> GatewayResult<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let now_str = now.to_rfc3339();
 
-        sqlx::query(
+        let res = sqlx::query(
             r#"
             UPDATE sweep_attempts
             SET status = 'FAILED', error_message = ?, updated_at = ?
-            WHERE id = ?
+            WHERE id = ? AND status IN ('PREPARED', 'SUBMITTED')
             "#,
         )
         .bind(error_msg)
@@ -1572,18 +1885,20 @@ impl InvoiceRepository {
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query(
-            r#"
-            UPDATE invoices
-            SET last_sweep_error = ?, updated_at = ?
-            WHERE id = ?
-            "#,
-        )
-        .bind(error_msg)
-        .bind(&now_str)
-        .bind(invoice_id.to_string())
-        .execute(&mut *tx)
-        .await?;
+        if res.rows_affected() > 0 {
+            sqlx::query(
+                r#"
+                UPDATE invoices
+                SET last_sweep_error = ?, updated_at = ?
+                WHERE id = ?
+                "#,
+            )
+            .bind(error_msg)
+            .bind(&now_str)
+            .bind(invoice_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        }
 
         tx.commit().await?;
         Ok(())
@@ -1630,9 +1945,30 @@ impl InvoiceRepository {
         webhook: Option<NewWebhookDelivery>,
         now: DateTime<Utc>,
     ) -> GatewayResult<Option<Invoice>> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let now_str = now.to_rfc3339();
         let inv_str = invoice_id.to_string();
+        let att_str = attempt_id.to_string();
+
+        let att_snap_json: Option<String> = sqlx::query_scalar(
+            r#"
+            SELECT snapshot_txids_json
+            FROM sweep_attempts
+            WHERE id = ?
+            "#,
+        )
+        .bind(&att_str)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let snapshot_txids: Vec<String> = att_snap_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| GatewayError::Internal(format!("invalid snapshot_txids_json: {e}")))?
+            .unwrap_or_default();
+
+        let touches_expected =
+            attempt_touches_expected_tx(&mut tx, &inv_str, &att_str, &snapshot_txids).await?;
 
         sqlx::query(
             r#"
@@ -1643,7 +1979,7 @@ impl InvoiceRepository {
         )
         .bind(error_msg)
         .bind(&now_str)
-        .bind(attempt_id.to_string())
+        .bind(&att_str)
         .execute(&mut *tx)
         .await?;
 
@@ -1670,7 +2006,14 @@ impl InvoiceRepository {
         let existing = Invoice::try_from(existing_row)?;
         let next_epoch = existing.reorg_epoch.saturating_add(1);
 
-        if existing.status == InvoiceStatus::Swept {
+        // Determine live sweep state strictly from `sweep_attempts` (`P36-4`):
+        // preserve `SWEPT` ONLY if at least one other live attempt remains AND the reorged
+        // attempt does not affect primary `EXPECTED` funds AND no `EXPECTED` transfer is unswept.
+        let agg = recompute_invoice_sweep_aggregates_tx(&mut tx, &inv_str).await?;
+        let preserve_swept =
+            agg.live_attempt_count > 0 && !touches_expected && !agg.has_unswept_expected;
+
+        if existing.status == InvoiceStatus::Swept && !preserve_swept {
             existing
                 .status
                 .validate_transition(InvoiceStatus::Reorged)?;
@@ -1828,7 +2171,7 @@ impl InvoiceRepository {
         note: &str,
         now: DateTime<Utc>,
     ) -> GatewayResult<(Invoice, SweepAttempt)> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let now_str = now.to_rfc3339();
         let inv_str = invoice_id.to_string();
         let att_str = attempt_id.to_string();
@@ -1923,48 +2266,62 @@ impl InvoiceRepository {
         .execute(&mut *tx)
         .await?;
 
-        let remaining_hashes: Vec<String> = existing_inv
-            .sweep_tx_hashes
-            .iter()
-            .filter(|h| !attempt.tx_hashes.contains(h))
-            .cloned()
-            .collect();
-        let hashes_json = serde_json::to_string(&remaining_hashes).map_err(|e| {
+        // Recompute invoice sweep aggregates strictly from live `sweep_attempts` (`P36-4`/`P36-5`).
+        let agg = recompute_invoice_sweep_aggregates_tx(&mut tx, &inv_str).await?;
+        let hashes_json = serde_json::to_string(&agg.live_tx_hashes).map_err(|e| {
             GatewayError::Internal(format!("failed to serialize remaining sweep hashes: {e}"))
         })?;
-
-        let (next_amt_i64, next_fee_i64) = if remaining_hashes.is_empty() {
+        let (next_amt_i64, next_fee_i64) = if agg.live_attempt_count == 0 {
             (None, None)
         } else {
-            let amt = existing_inv.sweep_amount_piconero.map(|prev| {
-                prev.as_u64()
-                    .saturating_sub(attempt.swept_amount_piconero.map_or(0, Piconero::as_u64))
-            });
-            let fee = existing_inv.sweep_fee_piconero.map(|prev| {
-                prev.as_u64()
-                    .saturating_sub(attempt.fee_piconero.map_or(0, Piconero::as_u64))
-            });
             (
-                amt.map(|v| Piconero(v).to_i64()).transpose()?,
-                fee.map(|v| Piconero(v).to_i64()).transpose()?,
+                Some(agg.total_swept_amount.to_i64()?),
+                Some(agg.total_swept_fee.to_i64()?),
             )
+        };
+        let clear_swept_at = agg.live_attempt_count == 0;
+        let next_last_sweep_error = if agg.reorged_attempt_count > 0 {
+            agg.latest_reorged_error
+                .or_else(|| existing_inv.last_sweep_error.clone())
+        } else {
+            None
+        };
+
+        // If primary EXPECTED funds are now unswept (or no live attempts remain) on a SWEPT invoice,
+        // move out of SWEPT -> REORGED so scanner / manual_sweep can re-sweep them (`P36-4`).
+        let next_status = if existing_inv.status == InvoiceStatus::Expired {
+            InvoiceStatus::Expired
+        } else if existing_inv.status == InvoiceStatus::Swept
+            && (agg.live_attempt_count == 0 || agg.has_unswept_expected)
+        {
+            existing_inv
+                .status
+                .validate_transition(InvoiceStatus::Reorged)?;
+            InvoiceStatus::Reorged
+        } else {
+            existing_inv.status
         };
 
         sqlx::query(
             r#"
             UPDATE invoices
             SET
+                status = ?,
                 sweep_tx_hashes = ?,
                 sweep_amount_piconero = ?,
                 sweep_fee_piconero = ?,
-                last_sweep_error = NULL,
+                swept_at = CASE WHEN ? THEN NULL ELSE swept_at END,
+                last_sweep_error = ?,
                 updated_at = ?
             WHERE id = ?
             "#,
         )
+        .bind(next_status.as_str())
         .bind(hashes_json)
         .bind(next_amt_i64)
         .bind(next_fee_i64)
+        .bind(clear_swept_at)
+        .bind(next_last_sweep_error)
         .bind(&now_str)
         .bind(&inv_str)
         .execute(&mut *tx)
@@ -2017,15 +2374,25 @@ impl InvoiceRepository {
     /// # Errors
     /// Returns [`GatewayError::Conflict`] if the attempt is no longer `REORGED`,
     /// [`GatewayError::NotFound`] if missing, or [`GatewayError::Database`] on SQL failure.
-    pub async fn resolve_sweep_incident_mark_reconciled(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_sweep_incident_mark_reconciled<F>(
         &self,
         attempt_id: Uuid,
         invoice_id: Uuid,
         replacement_tx_hash: Option<&str>,
+        verified_amount_piconero: Piconero,
+        verified_fee_piconero: Piconero,
+        min_sweep_confs: u64,
         note: &str,
+        build_webhook: F,
         now: DateTime<Utc>,
-    ) -> GatewayResult<(Invoice, SweepAttempt)> {
-        let mut tx = self.pool.begin().await?;
+    ) -> GatewayResult<(Invoice, SweepAttempt)>
+    where
+        F: FnOnce(&Invoice) -> GatewayResult<Option<NewWebhookDelivery>>,
+    {
+        // Use BEGIN IMMEDIATE to serialize concurrent cross-invoice MARK_RECONCILED writes
+        // and guarantee atomic tx_hash uniqueness enforcement (`P36-2`).
+        let mut tx = self.begin_immediate().await?;
         let now_str = now.to_rfc3339();
         let inv_str = invoice_id.to_string();
         let att_str = attempt_id.to_string();
@@ -2076,23 +2443,31 @@ impl InvoiceRepository {
             )));
         }
 
-        let mut att_hashes = attempt.tx_hashes.clone();
-        let mut inv_hashes = existing_inv.sweep_tx_hashes.clone();
-        if let Some(rep_hash) = replacement_tx_hash {
-            if !att_hashes.iter().any(|h| h == rep_hash) {
-                att_hashes.push(rep_hash.to_string());
-            }
-            if !inv_hashes.iter().any(|h| h == rep_hash) {
-                inv_hashes.push(rep_hash.to_string());
+        let resolved_att_hashes: Vec<String> = match replacement_tx_hash {
+            Some(rep_hash) => vec![rep_hash.trim().to_ascii_lowercase()],
+            None => attempt
+                .tx_hashes
+                .iter()
+                .map(|h| h.trim().to_ascii_lowercase())
+                .collect(),
+        };
+
+        // Atomic in-transaction uniqueness check preventing cross-invoice TOCTOU (`P36-2`).
+        for target_txid in &resolved_att_hashes {
+            if is_tx_hash_bound_to_other_sweep_attempt_tx(&mut tx, target_txid, &att_str, &inv_str)
+                .await?
+            {
+                return Err(GatewayError::Conflict(format!(
+                    "tx_hash {target_txid} is already bound to another sweep attempt or invoice and cannot be reused for attempt {attempt_id}"
+                )));
             }
         }
 
-        let att_hashes_json = serde_json::to_string(&att_hashes).map_err(|e| {
+        let att_hashes_json = serde_json::to_string(&resolved_att_hashes).map_err(|e| {
             GatewayError::Internal(format!("failed to serialize sweep attempt hashes: {e}"))
         })?;
-        let inv_hashes_json = serde_json::to_string(&inv_hashes).map_err(|e| {
-            GatewayError::Internal(format!("failed to serialize invoice sweep hashes: {e}"))
-        })?;
+        let att_amt_i64 = verified_amount_piconero.to_i64()?;
+        let att_fee_i64 = verified_fee_piconero.to_i64()?;
 
         sqlx::query(
             r#"
@@ -2100,6 +2475,9 @@ impl InvoiceRepository {
             SET
                 status = 'RECONCILED',
                 tx_hashes_json = ?,
+                swept_amount_piconero = ?,
+                fee_piconero = ?,
+                error_message = NULL,
                 resolved_at = ?,
                 resolution_action = 'MARK_RECONCILED',
                 resolution_note = ?,
@@ -2108,6 +2486,8 @@ impl InvoiceRepository {
             "#,
         )
         .bind(att_hashes_json)
+        .bind(att_amt_i64)
+        .bind(att_fee_i64)
         .bind(&now_str)
         .bind(note)
         .bind(&now_str)
@@ -2115,13 +2495,42 @@ impl InvoiceRepository {
         .execute(&mut *tx)
         .await?;
 
-        let next_status = if existing_inv.status == InvoiceStatus::Expired {
-            InvoiceStatus::Expired
+        let att_created_str = attempt.created_at.to_rfc3339();
+        mark_snapshot_transfers_swept_tx(
+            &mut tx,
+            &inv_str,
+            &att_str,
+            &attempt.snapshot_txids,
+            Some(&att_created_str),
+            min_sweep_confs,
+        )
+        .await?;
+
+        // Recompute aggregate hashes, amounts, fees, and remaining REORGED count strictly from
+        // `sweep_attempts` (`P36-4` / `P36-5`).
+        let agg = recompute_invoice_sweep_aggregates_tx(&mut tx, &inv_str).await?;
+        let inv_hashes_json = serde_json::to_string(&agg.live_tx_hashes).map_err(|e| {
+            GatewayError::Internal(format!("failed to serialize invoice sweep hashes: {e}"))
+        })?;
+        let total_amt_i64 = agg.total_swept_amount.to_i64()?;
+        let total_fee_i64 = agg.total_swept_fee.to_i64()?;
+
+        let (next_status, next_last_sweep_error) = if agg.reorged_attempt_count > 0 {
+            // Other unresolved REORGED incidents remain: DO NOT clear last_sweep_error or
+            // prematurely transition out of REORGED (`P36-5`).
+            let err = agg
+                .latest_reorged_error
+                .or_else(|| existing_inv.last_sweep_error.clone());
+            (existing_inv.status, err)
+        } else if existing_inv.status == InvoiceStatus::Expired {
+            (InvoiceStatus::Expired, None)
+        } else if agg.has_unswept_expected {
+            (existing_inv.status, None)
         } else {
             existing_inv
                 .status
                 .validate_transition(InvoiceStatus::Swept)?;
-            InvoiceStatus::Swept
+            (InvoiceStatus::Swept, None)
         };
 
         sqlx::query(
@@ -2130,7 +2539,9 @@ impl InvoiceRepository {
             SET
                 status = ?,
                 sweep_tx_hashes = ?,
-                last_sweep_error = NULL,
+                sweep_amount_piconero = ?,
+                sweep_fee_piconero = ?,
+                last_sweep_error = ?,
                 swept_at = CASE WHEN ? = 'SWEPT' THEN COALESCE(swept_at, ?) ELSE swept_at END,
                 updated_at = ?
             WHERE id = ?
@@ -2138,6 +2549,9 @@ impl InvoiceRepository {
         )
         .bind(next_status.as_str())
         .bind(inv_hashes_json)
+        .bind(total_amt_i64)
+        .bind(total_fee_i64)
+        .bind(next_last_sweep_error)
         .bind(next_status.as_str())
         .bind(&now_str)
         .bind(&now_str)
@@ -2160,6 +2574,16 @@ impl InvoiceRepository {
         .bind(&inv_str)
         .fetch_one(&mut *tx)
         .await?;
+        let updated_inv = Invoice::try_from(updated_inv_row)?;
+
+        // Build and enqueue the signed SWEPT webhook from the exact committed Invoice row ONLY
+        // when no unresolved REORGED attempts remain and invoice is SWEPT (`P36-5`).
+        if agg.reorged_attempt_count == 0
+            && updated_inv.status == InvoiceStatus::Swept
+            && let Some(wh) = build_webhook(&updated_inv)?
+        {
+            insert_webhook_tx(&mut tx, &wh).await?;
+        }
 
         let updated_att_row: SweepAttemptRow = sqlx::query_as(
             r#"
@@ -2177,10 +2601,7 @@ impl InvoiceRepository {
         .await?;
 
         tx.commit().await?;
-        Ok((
-            Invoice::try_from(updated_inv_row)?,
-            SweepAttempt::try_from(updated_att_row)?,
-        ))
+        Ok((updated_inv, SweepAttempt::try_from(updated_att_row)?))
     }
 
     /// Atomically updates `sweep_attempts` (`SUBMITTED`/`CONFIRMED`/`RECONCILED`), transitions the
@@ -2196,7 +2617,48 @@ impl InvoiceRepository {
         &self,
         params: CompleteSweepAttemptParams,
     ) -> GatewayResult<Invoice> {
-        let mut tx = self.pool.begin().await?;
+        self.complete_sweep_attempt_with_min_confs(params, MONERO_UNLOCK_CONFIRMATIONS)
+            .await
+    }
+
+    /// Completes a sweep attempt enforcing `min_sweep_confs` when marking snapshot transfers as
+    /// `SWEPT` so concurrently arriving locked outputs (`< min_sweep_confs`) are never marked
+    /// swept (`A3-2`).
+    ///
+    /// # Errors
+    /// Returns [`GatewayError::NotFound`] if the invoice is missing, [`GatewayError::Conflict`] if
+    /// the invoice is not in `SETTLED`, `SWEPT`, or `EXPIRED` status, or [`GatewayError::Database`]
+    /// on SQL failure.
+    pub async fn complete_sweep_attempt_with_min_confs(
+        &self,
+        mut params: CompleteSweepAttemptParams,
+        min_sweep_confs: u64,
+    ) -> GatewayResult<Invoice> {
+        let prebuilt = params.webhook.take();
+        self.complete_sweep_attempt_with_webhook_builder(params, min_sweep_confs, move |_| {
+            Ok(prebuilt)
+        })
+        .await
+    }
+
+    /// Completes a sweep attempt in a `BEGIN IMMEDIATE` transaction, recomputing invoice totals
+    /// exclusively from live `sweep_attempts` rows with checked arithmetic, and invokes
+    /// `build_webhook` with the exact committed [`Invoice`] row before committing (`P36-5`).
+    ///
+    /// # Errors
+    /// Returns [`GatewayError::NotFound`] if the invoice is missing, [`GatewayError::Conflict`] if
+    /// the invoice is not in `SETTLED`, `SWEPT`, or `EXPIRED` status, or [`GatewayError::Database`]
+    /// on SQL failure.
+    pub async fn complete_sweep_attempt_with_webhook_builder<F>(
+        &self,
+        params: CompleteSweepAttemptParams,
+        min_sweep_confs: u64,
+        build_webhook: F,
+    ) -> GatewayResult<Invoice>
+    where
+        F: FnOnce(&Invoice) -> GatewayResult<Option<NewWebhookDelivery>>,
+    {
+        let mut tx = self.begin_immediate().await?;
         let id_str = params.invoice_id.to_string();
         let attempt_id_str = params.attempt_id.to_string();
 
@@ -2249,9 +2711,15 @@ impl InvoiceRepository {
             None => (Vec::new(), None),
         };
 
-        let attempt_hashes_json = serde_json::to_string(&params.sweep_tx_hashes).map_err(|e| {
-            GatewayError::Internal(format!("failed to serialize attempt sweep hashes: {e}"))
-        })?;
+        let normalized_attempt_hashes: Vec<String> = params
+            .sweep_tx_hashes
+            .iter()
+            .map(|h| h.trim().to_ascii_lowercase())
+            .collect();
+        let attempt_hashes_json =
+            serde_json::to_string(&normalized_attempt_hashes).map_err(|e| {
+                GatewayError::Internal(format!("failed to serialize attempt sweep hashes: {e}"))
+            })?;
         let attempt_amt_i64 = params.sweep_amount_piconero.to_i64()?;
         let attempt_fee_i64 = params.sweep_fee_piconero.to_i64()?;
         let now_str = params.now.to_rfc3339();
@@ -2278,37 +2746,29 @@ impl InvoiceRepository {
         .execute(&mut *tx)
         .await?;
 
-        let (merged_hashes, total_amount, total_fee) = if !existing.sweep_tx_hashes.is_empty() {
-            let mut hashes = existing.sweep_tx_hashes.clone();
-            let mut has_new_tx = false;
-            for h in &params.sweep_tx_hashes {
-                if !hashes.contains(h) {
-                    hashes.push(h.clone());
-                    has_new_tx = true;
-                }
-            }
-            if has_new_tx {
-                let prev_amt = existing.sweep_amount_piconero.unwrap_or(Piconero::ZERO);
-                let prev_fee = existing.sweep_fee_piconero.unwrap_or(Piconero::ZERO);
-                (
-                    hashes,
-                    prev_amt.checked_add(params.sweep_amount_piconero)?,
-                    prev_fee.checked_add(params.sweep_fee_piconero)?,
-                )
-            } else {
-                (
-                    hashes,
-                    existing
-                        .sweep_amount_piconero
-                        .unwrap_or(params.sweep_amount_piconero),
-                    existing
-                        .sweep_fee_piconero
-                        .unwrap_or(params.sweep_fee_piconero),
-                )
-            }
+        // Snapshot-scoped ledger update (XMR-023 / A3-2 / P36-3): mark unlocked transfers
+        // captured at attempt prepare time.
+        mark_snapshot_transfers_swept_tx(
+            &mut tx,
+            &id_str,
+            &attempt_id_str,
+            &snapshot_txids,
+            attempt_created_at.as_deref(),
+            min_sweep_confs,
+        )
+        .await?;
+
+        // Recompute invoice totals exclusively from live `sweep_attempts` (`P36-5`).
+        let agg = recompute_invoice_sweep_aggregates_tx(&mut tx, &id_str).await?;
+        let (merged_hashes, total_amount, total_fee) = if agg.live_attempt_count > 0 {
+            (
+                agg.live_tx_hashes,
+                agg.total_swept_amount,
+                agg.total_swept_fee,
+            )
         } else {
             (
-                params.sweep_tx_hashes.clone(),
+                normalized_attempt_hashes,
                 params.sweep_amount_piconero,
                 params.sweep_fee_piconero,
             )
@@ -2360,41 +2820,6 @@ impl InvoiceRepository {
         .execute(&mut *tx)
         .await?;
 
-        // Snapshot-scoped ledger update (XMR-023): mark ONLY transfers captured at attempt prepare time.
-        if !snapshot_txids.is_empty() {
-            for snap_txid in &snapshot_txids {
-                sqlx::query(
-                    r#"
-                    UPDATE subaddress_transfers
-                    SET swept = 1, status = 'SWEPT', sweep_attempt_id = ?
-                    WHERE invoice_id = ? AND txid = ? AND status = 'ACTIVE'
-                    "#,
-                )
-                .bind(&attempt_id_str)
-                .bind(&id_str)
-                .bind(snap_txid)
-                .execute(&mut *tx)
-                .await?;
-            }
-        } else if let Some(ref created_cutoff) = attempt_created_at {
-            sqlx::query(
-                r#"
-                UPDATE subaddress_transfers
-                SET swept = 1, status = 'SWEPT', sweep_attempt_id = ?
-                WHERE invoice_id = ? AND status = 'ACTIVE' AND swept = 0 AND created_at <= ?
-                "#,
-            )
-            .bind(&attempt_id_str)
-            .bind(&id_str)
-            .bind(created_cutoff)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        if let Some(webhook) = params.webhook {
-            insert_webhook_tx(&mut tx, &webhook).await?;
-        }
-
         let updated_row: InvoiceRow = sqlx::query_as(
             r#"
             SELECT
@@ -2410,9 +2835,14 @@ impl InvoiceRepository {
         .bind(&id_str)
         .fetch_one(&mut *tx)
         .await?;
+        let updated_inv = Invoice::try_from(updated_row)?;
+
+        if let Some(webhook) = build_webhook(&updated_inv)? {
+            insert_webhook_tx(&mut tx, &webhook).await?;
+        }
 
         tx.commit().await?;
-        Invoice::try_from(updated_row)
+        Ok(updated_inv)
     }
 
     /// Lists all classified ledger records from `subaddress_transfers` for `invoice_id`.
@@ -2442,35 +2872,53 @@ impl InvoiceRepository {
             .collect()
     }
 
-    /// Returns `true` if `invoice_id` has any active, unswept `OVERPAYMENT` or `LATE_PAYMENT` inflows
-    /// recorded in `subaddress_transfers` (`XMR-017` / `XMR-026`).
+    /// Returns `true` if `invoice_id` has any active, unswept, non-orphaned, non-double-spent
+    /// `OVERPAYMENT` or `LATE_PAYMENT` inflows in `subaddress_transfers` meeting `min_sweep_confs`
+    /// (and unlocked in `invoice_transfers` when `min_sweep_confs > 0`) (`XMR-017` / `XMR-026` / `A3-2`).
     ///
     /// # Errors
     /// Returns [`GatewayError::Database`] on SQL failure.
-    pub async fn has_unswept_inflows(&self, invoice_id: Uuid) -> GatewayResult<bool> {
+    pub async fn has_unswept_inflows(
+        &self,
+        invoice_id: Uuid,
+        min_sweep_confs: u64,
+    ) -> GatewayResult<bool> {
+        let min_confs_i64 = u64_to_i64(min_sweep_confs, "min_sweep_confs")?;
         let count: i64 = sqlx::query_scalar(
             r#"
             SELECT COUNT(*)
-            FROM subaddress_transfers
-            WHERE invoice_id = ?
-              AND classification IN ('OVERPAYMENT', 'LATE_PAYMENT')
-              AND status = 'ACTIVE'
-              AND swept = 0
+            FROM subaddress_transfers st
+            LEFT JOIN invoice_transfers it
+                ON it.invoice_id = st.invoice_id AND it.txid = st.txid
+            WHERE st.invoice_id = ?
+              AND st.classification IN ('OVERPAYMENT', 'LATE_PAYMENT')
+              AND st.status = 'ACTIVE'
+              AND st.swept = 0
+              AND st.confirmations >= ?
+              AND COALESCE(it.confirmations, st.confirmations) >= ?
+              AND COALESCE(it.orphaned, 0) = 0
+              AND COALESCE(it.double_spend_seen, 0) = 0
+              AND (it.txid IS NULL OR it.unlocked = 1 OR ? = 0)
             "#,
         )
         .bind(invoice_id.to_string())
+        .bind(min_confs_i64)
+        .bind(min_confs_i64)
+        .bind(min_confs_i64)
         .fetch_one(&self.pool)
         .await?;
 
         Ok(count > 0)
     }
 
-    /// Backwards-compatible alias for [`InvoiceRepository::has_unswept_inflows`].
+    /// Backwards-compatible alias for [`InvoiceRepository::has_unswept_inflows`] using
+    /// `MONERO_UNLOCK_CONFIRMATIONS` (`10`).
     ///
     /// # Errors
     /// Returns [`GatewayError::Database`] on SQL failure.
     pub async fn has_unswept_overpayment(&self, invoice_id: Uuid) -> GatewayResult<bool> {
-        self.has_unswept_inflows(invoice_id).await
+        self.has_unswept_inflows(invoice_id, MONERO_UNLOCK_CONFIRMATIONS)
+            .await
     }
 
     /// Atomically persists a classified `subaddress_transfers` entry (`UNIQUE (invoice_id, txid)`),
@@ -2483,10 +2931,10 @@ impl InvoiceRepository {
         &self,
         params: RecordSubaddressTransferParams,
     ) -> GatewayResult<Invoice> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let id_str = params.record.invoice_id.to_string();
 
-        upsert_transfer_tx(&mut tx, &id_str, &params.transfer, params.now).await?;
+        upsert_transfer_tx(&mut tx, &id_str, &params.transfer, params.now, false).await?;
 
         let rec_amt_i64 = params.record.amount_piconero.to_i64()?;
         let rec_conf_i64 = u64_to_i64(params.record.confirmations, "record.confirmations")?;
@@ -2649,6 +3097,7 @@ async fn upsert_transfer_tx(
     invoice_id: &str,
     transfer: &ObservedTransfer,
     now: DateTime<Utc>,
+    preserve_monotonic_confs: bool,
 ) -> GatewayResult<()> {
     let amount_i64 = transfer.amount_piconero.to_i64()?;
     let conf_i64 = u64_to_i64(transfer.confirmations, "transfer.confirmations")?;
@@ -2663,8 +3112,16 @@ async fn upsert_transfer_tx(
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (invoice_id, txid) DO UPDATE SET
             amount_piconero = excluded.amount_piconero,
-            confirmations = excluded.confirmations,
-            unlocked = excluded.unlocked,
+            confirmations = CASE
+                WHEN ? = 1 AND excluded.orphaned = 0 AND excluded.double_spend_seen = 0
+                THEN MAX(invoice_transfers.confirmations, excluded.confirmations)
+                ELSE excluded.confirmations
+            END,
+            unlocked = CASE
+                WHEN ? = 1 AND excluded.orphaned = 0 AND excluded.double_spend_seen = 0
+                THEN MAX(invoice_transfers.unlocked, excluded.unlocked)
+                ELSE excluded.unlocked
+            END,
             double_spend_seen = CASE
                 WHEN excluded.confirmations > 0 AND excluded.double_spend_seen = 0 THEN 0
                 ELSE MAX(invoice_transfers.double_spend_seen, excluded.double_spend_seen)
@@ -2691,9 +3148,305 @@ async fn upsert_transfer_tx(
     .bind(i64::from(initial_orphaned))
     .bind(&now_str)
     .bind(&now_str)
+    .bind(i64::from(preserve_monotonic_confs))
+    .bind(i64::from(preserve_monotonic_confs))
     .execute(&mut **tx)
     .await?;
 
+    Ok(())
+}
+
+struct InvoiceSweepAggregates {
+    live_attempt_count: usize,
+    reorged_attempt_count: usize,
+    live_tx_hashes: Vec<String>,
+    total_swept_amount: Piconero,
+    total_swept_fee: Piconero,
+    has_unswept_expected: bool,
+    latest_reorged_error: Option<String>,
+}
+
+/// Fail-closed check inside an active SQLite transaction whether `tx_hash` (case-insensitive)
+/// is already bound to another `sweep_attempts` row or another invoice (`P36-2`).
+async fn is_tx_hash_bound_to_other_sweep_attempt_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    tx_hash: &str,
+    exclude_attempt_id_str: &str,
+    invoice_id_str: &str,
+) -> GatewayResult<bool> {
+    let other_attempt_jsons: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT tx_hashes_json
+        FROM sweep_attempts
+        WHERE id != ? AND tx_hashes_json != '[]'
+        "#,
+    )
+    .bind(exclude_attempt_id_str)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    for raw in other_attempt_jsons {
+        let hashes: Vec<String> = serde_json::from_str(&raw).map_err(|e| {
+            GatewayError::Internal(format!(
+                "corrupt sweep_attempts.tx_hashes_json during uniqueness check: {e}"
+            ))
+        })?;
+        if hashes.iter().any(|h| h.eq_ignore_ascii_case(tx_hash)) {
+            return Ok(true);
+        }
+    }
+
+    let other_invoice_jsons: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT sweep_tx_hashes
+        FROM invoices
+        WHERE id != ? AND sweep_tx_hashes != '[]'
+        "#,
+    )
+    .bind(invoice_id_str)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    for raw in other_invoice_jsons {
+        let hashes: Vec<String> = serde_json::from_str(&raw).map_err(|e| {
+            GatewayError::Internal(format!(
+                "corrupt invoices.sweep_tx_hashes during uniqueness check: {e}"
+            ))
+        })?;
+        if hashes.iter().any(|h| h.eq_ignore_ascii_case(tx_hash)) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Recomputes invoice sweep aggregates exclusively from live `sweep_attempts` rows
+/// (`status IN ('SUBMITTED', 'RECONCILED', 'CONFIRMED')`) using checked arithmetic (`P36-4`/`P36-5`).
+async fn recompute_invoice_sweep_aggregates_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    invoice_id_str: &str,
+) -> GatewayResult<InvoiceSweepAggregates> {
+    type SweepAttemptAggregateRow = (String, String, Option<i64>, Option<i64>, Option<String>);
+    let rows: Vec<SweepAttemptAggregateRow> = sqlx::query_as(
+        r#"
+        SELECT status, tx_hashes_json, swept_amount_piconero, fee_piconero, error_message
+        FROM sweep_attempts
+        WHERE invoice_id = ?
+        ORDER BY created_at ASC, id ASC
+        "#,
+    )
+    .bind(invoice_id_str)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut live_attempt_count = 0_usize;
+    let mut reorged_attempt_count = 0_usize;
+    let mut live_tx_hashes: Vec<String> = Vec::new();
+    let mut total_amt_u64 = 0_u64;
+    let mut total_fee_u64 = 0_u64;
+    let mut latest_reorged_error: Option<String> = None;
+
+    for (status, tx_hashes_json, amt_opt, fee_opt, err_opt) in rows {
+        match status.as_str() {
+            "SUBMITTED" | "RECONCILED" | "CONFIRMED" => {
+                live_attempt_count += 1;
+                let hashes: Vec<String> = serde_json::from_str(&tx_hashes_json).map_err(|e| {
+                    GatewayError::Internal(format!("corrupt sweep_attempts.tx_hashes_json: {e}"))
+                })?;
+                for h in hashes {
+                    let normalized = h.trim().to_ascii_lowercase();
+                    if !normalized.is_empty() && !live_tx_hashes.contains(&normalized) {
+                        live_tx_hashes.push(normalized);
+                    }
+                }
+                if let Some(amt_i64) = amt_opt {
+                    let amt = Piconero::from_i64(amt_i64)?;
+                    total_amt_u64 = total_amt_u64.checked_add(amt.as_u64()).ok_or_else(|| {
+                        GatewayError::Internal(
+                            "overflow summing live sweep_attempts.swept_amount_piconero"
+                                .to_string(),
+                        )
+                    })?;
+                }
+                if let Some(fee_i64) = fee_opt {
+                    let fee = Piconero::from_i64(fee_i64)?;
+                    total_fee_u64 = total_fee_u64.checked_add(fee.as_u64()).ok_or_else(|| {
+                        GatewayError::Internal(
+                            "overflow summing live sweep_attempts.fee_piconero".to_string(),
+                        )
+                    })?;
+                }
+            }
+            "REORGED" => {
+                reorged_attempt_count += 1;
+                if let Some(err) = err_opt
+                    && !err.trim().is_empty()
+                {
+                    latest_reorged_error = Some(err);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let total_swept_amount = Piconero(total_amt_u64);
+    let total_swept_fee = Piconero(total_fee_u64);
+    // Validate SQLite i64 bounds eagerly so overflow never silently distorts persisted totals.
+    let _ = total_swept_amount.to_i64()?;
+    let _ = total_swept_fee.to_i64()?;
+
+    let has_unswept_expected: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM subaddress_transfers
+            WHERE invoice_id = ?
+              AND classification = 'EXPECTED'
+              AND status = 'ACTIVE'
+              AND swept = 0
+        )
+        "#,
+    )
+    .bind(invoice_id_str)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    Ok(InvoiceSweepAggregates {
+        live_attempt_count,
+        reorged_attempt_count,
+        live_tx_hashes,
+        total_swept_amount,
+        total_swept_fee,
+        has_unswept_expected,
+        latest_reorged_error,
+    })
+}
+
+/// Returns `true` if `attempt_id_str` is linked to (or snapshotted) any primary `EXPECTED`
+/// transfer in `subaddress_transfers` (`P36-4`).
+async fn attempt_touches_expected_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    invoice_id_str: &str,
+    attempt_id_str: &str,
+    snapshot_txids: &[String],
+) -> GatewayResult<bool> {
+    let linked_expected: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM subaddress_transfers
+            WHERE invoice_id = ?
+              AND classification = 'EXPECTED'
+              AND sweep_attempt_id = ?
+        )
+        "#,
+    )
+    .bind(invoice_id_str)
+    .bind(attempt_id_str)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    if linked_expected {
+        return Ok(true);
+    }
+
+    if !snapshot_txids.is_empty() {
+        let mut qb: sqlx::QueryBuilder<Sqlite> = sqlx::QueryBuilder::new(
+            "SELECT EXISTS(SELECT 1 FROM subaddress_transfers WHERE invoice_id = ",
+        );
+        qb.push_bind(invoice_id_str);
+        qb.push(" AND classification = 'EXPECTED' AND txid IN (");
+        let mut sep = qb.separated(", ");
+        for snap in snapshot_txids {
+            sep.push_bind(snap);
+        }
+        qb.push("))");
+        let snap_expected: bool = qb.build_query_scalar().fetch_one(&mut **tx).await?;
+        if snap_expected {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+async fn mark_snapshot_transfers_swept_tx(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    invoice_id_str: &str,
+    attempt_id_str: &str,
+    snapshot_txids: &[String],
+    attempt_created_at: Option<&str>,
+    _min_sweep_confs: u64,
+) -> GatewayResult<()> {
+    // Match Monero's actual unlock rule (`MONERO_UNLOCK_CONFIRMATIONS = 10` and `unlocked = 1`)
+    // so unlocked inflows spent by `sweep_all` when `SETTLEMENT_CONFIRMATIONS > 10` are marked
+    // SWEPT while locked outputs (`< 10` confs or `unlocked = 0`) remain ACTIVE (`P36-3`).
+    let unlock_confs_i64 = u64_to_i64(MONERO_UNLOCK_CONFIRMATIONS, "unlock_confs")?;
+    if !snapshot_txids.is_empty() {
+        for snap_txid in snapshot_txids {
+            sqlx::query(
+                r#"
+                UPDATE subaddress_transfers
+                SET swept = 1, status = 'SWEPT', sweep_attempt_id = ?
+                WHERE invoice_id = ?
+                  AND txid = ?
+                  AND status = 'ACTIVE'
+                  AND confirmations >= ?
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM invoice_transfers it
+                      WHERE it.invoice_id = subaddress_transfers.invoice_id
+                        AND it.txid = subaddress_transfers.txid
+                        AND (
+                            it.confirmations < ?
+                            OR it.orphaned = 1
+                            OR it.double_spend_seen = 1
+                            OR it.unlocked = 0
+                        )
+                  )
+                "#,
+            )
+            .bind(attempt_id_str)
+            .bind(invoice_id_str)
+            .bind(snap_txid)
+            .bind(unlock_confs_i64)
+            .bind(unlock_confs_i64)
+            .execute(&mut **tx)
+            .await?;
+        }
+    } else if let Some(created_cutoff) = attempt_created_at {
+        sqlx::query(
+            r#"
+            UPDATE subaddress_transfers
+            SET swept = 1, status = 'SWEPT', sweep_attempt_id = ?
+            WHERE invoice_id = ?
+              AND status = 'ACTIVE'
+              AND swept = 0
+              AND created_at <= ?
+              AND confirmations >= ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM invoice_transfers it
+                  WHERE it.invoice_id = subaddress_transfers.invoice_id
+                    AND it.txid = subaddress_transfers.txid
+                    AND (
+                        it.confirmations < ?
+                        OR it.orphaned = 1
+                        OR it.double_spend_seen = 1
+                        OR it.unlocked = 0
+                    )
+              )
+            "#,
+        )
+        .bind(attempt_id_str)
+        .bind(invoice_id_str)
+        .bind(created_cutoff)
+        .bind(unlock_confs_i64)
+        .bind(unlock_confs_i64)
+        .execute(&mut **tx)
+        .await?;
+    }
     Ok(())
 }
 

@@ -8,13 +8,14 @@
 
 use axum::{
     extract::{Request, State},
+    http::HeaderMap,
     middleware::Next,
     response::Response,
 };
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use crate::{api::AppState, error::GatewayError};
+use crate::{api::AppState, config::Config, error::GatewayError};
 
 /// Header name carrying the merchant API authentication secret.
 pub const API_KEY_HEADER: &str = "x-api-key";
@@ -97,6 +98,42 @@ pub async fn require_operator_key(
     }
 
     Ok(next.run(request).await)
+}
+
+/// Checks whether request headers carry valid credentials for full `GET /health` diagnostics
+/// (`XMR-033` / `AUDIT-002`).
+///
+/// Rules:
+/// - `X-API-Key` authorizes diagnostics if it matches `config.api_secret_key` OR (when set)
+///   `config.operator_api_key` in constant time.
+/// - `X-Operator-Key` authorizes diagnostics if it matches `config.operator_api_key` (when set),
+///   or falls back to `config.api_secret_key` ONLY in single-tenant mode (`operator_api_key` unset).
+/// - When `OPERATOR_API_KEY` is configured, presenting the merchant `API_SECRET_KEY` in
+///   `X-Operator-Key` is NOT accepted as valid operator authorization.
+#[must_use]
+pub fn is_authorized_for_health_diagnostics(headers: &HeaderMap, config: &Config) -> bool {
+    let valid_api_key = headers
+        .get(API_KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|presented| {
+            constant_time_key_match(presented, &config.api_secret_key)
+                || config
+                    .operator_api_key
+                    .as_deref()
+                    .is_some_and(|op| constant_time_key_match(presented, op))
+        });
+
+    if valid_api_key {
+        return true;
+    }
+
+    headers
+        .get(OPERATOR_API_KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|presented| match config.operator_api_key.as_deref() {
+            Some(op_key) => constant_time_key_match(presented, op_key),
+            None => constant_time_key_match(presented, &config.api_secret_key),
+        })
 }
 
 /// Compares two secret strings in constant time without leaking length via SHA-256 pre-hashing.

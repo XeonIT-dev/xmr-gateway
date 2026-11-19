@@ -124,10 +124,110 @@ pub async fn init_sqlite_pool(database_url: &str) -> GatewayResult<SqlitePool> {
         .connect_with(connect_options)
         .await?;
 
+    // Harden `.db` to `0600` before migrations write to WAL/SHM so newly created `-wal`/`-shm`
+    // files inherit owner-only permissions immediately, then re-enforce after WAL init (`AUDIT-005`).
+    enforce_sqlite_file_permissions(database_url)?;
     sqlx::migrate!("./migrations").run(&pool).await?;
+    if !is_in_memory {
+        sqlx::query("PRAGMA wal_checkpoint(PASSIVE);")
+            .execute(&pool)
+            .await?;
+    }
     enforce_sqlite_file_permissions(database_url)?;
 
     Ok(pool)
+}
+
+/// Summary returned by [`checkpoint_and_close_pool`] after running `PRAGMA wal_checkpoint(TRUNCATE)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalCheckpointSummary {
+    /// Non-zero if a concurrent connection prevented checkpointing all WAL frames (`0` = complete).
+    pub busy: i64,
+    /// Total number of frames present in the WAL file before truncation.
+    pub log_frames: i64,
+    /// Number of WAL frames copied back into the main SQLite database file.
+    pub checkpointed_frames: i64,
+}
+
+/// Flushes and truncates the SQLite WAL (`PRAGMA wal_checkpoint(TRUNCATE)`), enforces `0600`
+/// permissions on `.db`/`-wal`/`-shm`, and closes the pool cleanly (`AUDIT-005`).
+///
+/// Must be called during graceful shutdown **after** the HTTP server and background workers have
+/// stopped, and **before** dropping [`DatabaseProcessLock`]. For in-memory SQLite databases,
+/// closes the pool and returns `Ok(None)`.
+///
+/// # Errors
+/// Returns [`GatewayError::Database`] if `PRAGMA wal_checkpoint(TRUNCATE)` fails or
+/// [`GatewayError::Config`] if enforcing `0600` file permissions fails. The connection pool is
+/// always closed before returning.
+pub async fn checkpoint_and_close_pool(
+    pool: SqlitePool,
+    database_url: &str,
+) -> GatewayResult<Option<WalCheckpointSummary>> {
+    if sqlite_file_path(database_url).is_none() {
+        pool.close().await;
+        return Ok(None);
+    }
+
+    let checkpoint_res: Result<(i64, i64, i64), sqlx::Error> =
+        sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE);")
+            .fetch_one(&pool)
+            .await;
+
+    let mut summary = None;
+    let mut first_err: Option<GatewayError> = None;
+
+    match checkpoint_res {
+        Ok((busy, log_frames, checkpointed_frames)) => {
+            if busy != 0 {
+                tracing::warn!(
+                    busy,
+                    log_frames,
+                    checkpointed_frames,
+                    "SQLite WAL TRUNCATE checkpoint reported busy connections during shutdown"
+                );
+            } else {
+                tracing::info!(
+                    busy,
+                    log_frames,
+                    checkpointed_frames,
+                    "SQLite WAL TRUNCATE checkpoint completed"
+                );
+            }
+            summary = Some(WalCheckpointSummary {
+                busy,
+                log_frames,
+                checkpointed_frames,
+            });
+        }
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                "SQLite PRAGMA wal_checkpoint(TRUNCATE) failed during shutdown"
+            );
+            first_err = Some(GatewayError::Database(err));
+        }
+    }
+
+    if let Err(err) = enforce_sqlite_file_permissions(database_url)
+        && first_err.is_none()
+    {
+        first_err = Some(err);
+    }
+
+    pool.close().await;
+
+    if let Err(err) = enforce_sqlite_file_permissions(database_url)
+        && first_err.is_none()
+    {
+        first_err = Some(err);
+    }
+
+    if let Some(err) = first_err {
+        return Err(err);
+    }
+
+    Ok(summary)
 }
 
 /// Extracts the filesystem path of a file-backed SQLite URI (`None` for in-memory DBs).
@@ -289,5 +389,80 @@ mod tests {
 
         // In-memory URLs remain permitted as no-op locks
         assert!(acquire_database_lock("sqlite::memory:").is_ok());
+    }
+
+    #[tokio::test]
+    async fn wal_checkpoint_and_close_truncates_wal_and_preserves_permissions_audit_005() {
+        // In-memory DB returns Ok(None) and closes cleanly
+        let mem_pool = init_sqlite_pool("sqlite::memory:").await.unwrap();
+        assert_eq!(
+            checkpoint_and_close_pool(mem_pool, "sqlite::memory:")
+                .await
+                .unwrap(),
+            None
+        );
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let db_path = tmp_dir.path().join("wal_shutdown.db");
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+        let db_url = format!("sqlite://{}", db_path.display());
+
+        let pool = init_sqlite_pool(&db_url).await.unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO invoices (
+                id, order_id, account_index, address_index, subaddress,
+                amount_piconero, received_piconero, confirmations, unlocked,
+                double_spend_seen, reorg_epoch, status, monero_uri, qr_code_base64,
+                sweep_tx_hashes, created_at, updated_at, expires_at
+            ) VALUES (
+                '00000000-0000-4000-8000-000000000501', 'audit-005-unit', 0, 1, '8unitSubaddr',
+                1000000000000, 0, 0, 0,
+                0, 0, 'PENDING', 'monero:8unitSubaddr', '',
+                '[]', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z'
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let summary = checkpoint_and_close_pool(pool, &db_url)
+            .await
+            .unwrap()
+            .expect("file-backed DB must return WalCheckpointSummary");
+        assert_eq!(
+            summary.busy, 0,
+            "WAL TRUNCATE checkpoint must complete with busy == 0"
+        );
+
+        if wal_path.exists() {
+            assert_eq!(
+                std::fs::metadata(&wal_path).unwrap().len(),
+                0,
+                "WAL file must be truncated to 0 bytes after checkpoint_and_close_pool"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            let mode = std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "SQLite DB file must remain 0600 after close");
+        }
+
+        // Reopen and verify committed row survived WAL checkpoint & close
+        let reopened = init_sqlite_pool(&db_url).await.unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM invoices WHERE order_id = 'audit-005-unit'")
+                .fetch_one(&reopened)
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
+        let integrity: String = sqlx::query_scalar("PRAGMA integrity_check;")
+            .fetch_one(&reopened)
+            .await
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        checkpoint_and_close_pool(reopened, &db_url).await.unwrap();
     }
 }

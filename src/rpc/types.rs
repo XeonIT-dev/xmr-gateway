@@ -59,23 +59,43 @@ pub struct GetVersionResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct GetHeightResponse {
     /// Current synced blockchain height observed by the wallet.
-    pub height: u64,
+    #[serde(default)]
+    pub height: Option<u64>,
 }
 
-/// Response from `monerod` JSON-RPC method `get_info`.
+/// Response from `monerod` JSON-RPC method `get_info` (`COMMAND_RPC_GET_INFO::response_t`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct GetInfoResponse {
     /// Current tip height reported by the daemon.
-    pub height: u64,
+    #[serde(default)]
+    pub height: Option<u64>,
     /// Optional target height when daemon is still syncing.
     #[serde(default)]
     pub target_height: Option<u64>,
     /// Optional synchronization status reported by `monerod`.
     #[serde(default)]
     pub synchronized: Option<bool>,
+    /// Optional offline flag reported by `monerod`.
+    #[serde(default)]
+    pub offline: Option<bool>,
+    /// Optional untrusted daemon indicator inherited from `rpc_response_base`.
+    #[serde(default)]
+    pub untrusted: Option<bool>,
     /// Optional RPC status string (`"OK"`).
     #[serde(default)]
     pub status: Option<String>,
+    /// Optional Monero network type string (`"mainnet"`, `"stagenet"`, `"testnet"`).
+    #[serde(default)]
+    pub nettype: Option<String>,
+    /// Optional boolean indicating mainnet.
+    #[serde(default)]
+    pub mainnet: Option<bool>,
+    /// Optional boolean indicating stagenet.
+    #[serde(default)]
+    pub stagenet: Option<bool>,
+    /// Optional boolean indicating testnet.
+    #[serde(default)]
+    pub testnet: Option<bool>,
 }
 
 /// Request parameters for `query_key`.
@@ -237,8 +257,25 @@ pub struct TransferEntry {
 }
 
 impl TransferEntry {
-    /// Returns `true` if this outgoing transfer entry originated from `(account_index, address_index)`
-    /// and targets `destination_address` (when destination metadata is present in the RPC entry).
+    /// Returns `true` if this outgoing transfer entry spent funds from `(account_index, address_index)`.
+    ///
+    /// Used as a fail-closed source predicate (e.g. `ALLOW_RESWEEP` live-sweep blocking and
+    /// `PREPARED` `double_spend_seen` detection) that remains conservative even if `destinations`
+    /// metadata is empty after wallet seed recovery (`P36-1`).
+    #[must_use]
+    pub fn matches_source_subaddress(&self, account_index: u32, address_index: u32) -> bool {
+        (self.subaddr_index.major == account_index && self.subaddr_index.minor == address_index)
+            || self
+                .subaddr_indices
+                .iter()
+                .any(|idx| idx.major == account_index && idx.minor == address_index)
+    }
+
+    /// Strict fail-closed sweep match checking source subaddress and verified exclusive cold
+    /// destination (`P36-1`).
+    ///
+    /// Delegates to [`Self::verified_sweep_destination_amount`] and never trusts `entry.address`
+    /// (which `monero-wallet-rpc v0.18.5.4` populates with the sender wallet's primary address).
     #[must_use]
     pub fn matches_sweep(
         &self,
@@ -246,29 +283,48 @@ impl TransferEntry {
         address_index: u32,
         destination_address: &str,
     ) -> bool {
-        let subaddr_match = (self.subaddr_index.major == account_index
-            && self.subaddr_index.minor == address_index)
-            || self
-                .subaddr_indices
-                .iter()
-                .any(|idx| idx.major == account_index && idx.minor == address_index);
+        self.verified_sweep_destination_amount(account_index, address_index, destination_address)
+            .is_some()
+    }
 
-        if !subaddr_match {
-            return false;
+    /// Fail-closed destination verification for `MARK_RECONCILED` and `PREPARED` cold-storage
+    /// reconciliation (`AUDIT-004` / `P36-1`).
+    ///
+    /// In `monero-wallet-rpc v0.18.5.4` (`wallet_rpc_server::fill_transfer_entry`), outgoing
+    /// `out`/`pending` entries populate `entry.address` with the **sender** wallet's own primary
+    /// address (`get_subaddress_as_str({account, 0})`), NOT the recipient address. Recipient
+    /// addresses appear solely in `entry.destinations`. Therefore:
+    /// - When `self.destinations` is empty (e.g. after wallet seed restore), this method ALWAYS
+    ///   returns `None` (never falls back to `self.address`).
+    /// - Any positive destination output targeting an address other than `destination_address`
+    ///   returns `None`.
+    /// - Returns `Some(total_piconero)` sent exclusively to `destination_address` when `> 0`.
+    #[must_use]
+    pub fn verified_sweep_destination_amount(
+        &self,
+        account_index: u32,
+        address_index: u32,
+        destination_address: &str,
+    ) -> Option<u64> {
+        if !self.matches_source_subaddress(account_index, address_index) {
+            return None;
         }
 
-        if !self.destinations.is_empty() {
-            return self
-                .destinations
-                .iter()
-                .any(|dest| dest.address == destination_address);
+        if self.destinations.is_empty() {
+            return None;
         }
 
-        if !self.address.is_empty() {
-            return self.address == destination_address;
+        let mut dest_sum = 0_u64;
+        for dest in &self.destinations {
+            if dest.amount == 0 {
+                continue;
+            }
+            if dest.address != destination_address {
+                return None;
+            }
+            dest_sum = dest_sum.checked_add(dest.amount)?;
         }
-
-        true
+        (dest_sum > 0).then_some(dest_sum)
     }
     /// Determines whether this incoming output has cleared Monero's 10-block consensus lock.
     ///
@@ -354,8 +410,8 @@ pub struct SweepAllParams<'a> {
 /// outputs than fit within a single transaction's maximum weight/input limits.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct SweepAllResponse {
-    /// Transaction hashes created by the sweep operation.
-    #[serde(default)]
+    /// Transaction hashes created by the sweep operation (required field; omitting it in a 200 OK
+    /// response fails deserialization as `RpcTransport` so `PREPARED` stays fail-closed, `P36-7`).
     pub tx_hash_list: Vec<String>,
     /// Net piconero sent per transaction (after fee deduction).
     #[serde(default)]
