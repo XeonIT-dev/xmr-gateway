@@ -68,20 +68,20 @@ pub const fn is_proven_pre_broadcast_rpc_error(code: Option<i64>) -> bool {
         Some(
             -2  // WALLET_RPC_ERROR_CODE_WRONG_ADDRESS
             | -5  // WALLET_RPC_ERROR_CODE_WRONG_PAYMENT_ID
-            | -7  // WALLET_RPC_ERROR_CODE_WRONG_KEY_IMAGE
+            | -7  // WALLET_RPC_ERROR_CODE_DENIED (restricted mode)
             | -13 // WALLET_RPC_ERROR_CODE_NOT_OPEN
-            | -14 // WALLET_RPC_ERROR_CODE_WRONG_INDEX
-            | -15 // WALLET_RPC_ERROR_CODE_WRONG_SUBADDRESS_INDEX
-            | -16 // WALLET_RPC_ERROR_CODE_NOT_ENOUGH_OUTS_TO_MIX
+            | -14 // WALLET_RPC_ERROR_CODE_ACCOUNT_INDEX_OUTOFBOUNDS
+            | -15 // WALLET_RPC_ERROR_CODE_ADDRESS_INDEX_OUTOFBOUNDS
+            | -16 // WALLET_RPC_ERROR_CODE_TX_NOT_POSSIBLE
             | -17 // WALLET_RPC_ERROR_CODE_NOT_ENOUGH_MONEY
-            | -19 // WALLET_RPC_ERROR_CODE_ZERO_DESTINATION
-            | -20 // WALLET_RPC_ERROR_CODE_WALLET_ALREADY_EXISTS
+            | -19 // WALLET_RPC_ERROR_CODE_NOT_ENOUGH_OUTS_TO_MIX
+            | -20 // WALLET_RPC_ERROR_CODE_ZERO_DESTINATION
             | -37 // WALLET_RPC_ERROR_CODE_NOT_ENOUGH_UNLOCKED_MONEY
-            | -46 // WALLET_RPC_ERROR_CODE_ACCOUNT_INDEX_OUTOFBOUNDS
-            | -48 // WALLET_RPC_ERROR_CODE_ADDRESS_INDEX_OUTOFBOUNDS
-            | -50 // WALLET_RPC_ERROR_CODE_NO_TXKEY
-            | -51 // WALLET_RPC_ERROR_CODE_WRONG_TX_ID
-            | -52 // WALLET_RPC_ERROR_CODE_WRONG_SIGNATURE
+            | -46 // WALLET_RPC_ERROR_CODE_ZERO_AMOUNT
+            | -48 // WALLET_RPC_ERROR_CODE_MULTISIG_DISABLED
+            | -50 // WALLET_RPC_ERROR_CODE_NON_ZERO_UNLOCK_TIME
+            | -51 // WALLET_RPC_ERROR_CODE_BACKGROUND_WALLET_DISABLED
+            | -52 // WALLET_RPC_ERROR_CODE_BACKGROUND_SYNCING_DISABLED
             | -32700 // JSON-RPC Parse error
             | -32600 // JSON-RPC Invalid Request
             | -32601 // JSON-RPC Method not found
@@ -237,7 +237,15 @@ impl ScannerService {
                 InvoiceStatus::Swept | InvoiceStatus::Expired
             ) || (invoice.status == InvoiceStatus::Reorged && has_reorged_sweep)
             {
-                invoice.clone()
+                // Persist sticky double_spend_seen flag even when terminal status skips
+                // persist_evaluation() (`P36-6`).
+                if eval.double_spend_seen && !invoice.double_spend_seen {
+                    self.repo
+                        .mark_invoice_double_spend_seen(invoice.id, Utc::now())
+                        .await?
+                } else {
+                    invoice.clone()
+                }
             } else {
                 let res = self.persist_evaluation(&invoice, &eval).await?;
                 if res.status != invoice.status {
@@ -537,6 +545,11 @@ impl ScannerService {
             .filter(|r| r.status != SubaddressTransferStatus::Orphaned)
             .map(|r| (r.txid.as_str(), r))
             .collect();
+        let existing_inv_transfers = self.repo.list_transfers_for_invoice(invoice.id).await?;
+        let existing_unlocked_by_txid: HashMap<&str, bool> = existing_inv_transfers
+            .iter()
+            .map(|t| (t.txid.as_str(), t.unlocked))
+            .collect();
 
         let track_expected_and_overpayment = matches!(
             invoice.status,
@@ -553,7 +566,9 @@ impl ScannerService {
         for tr in confirmed_valid {
             let tx_amt = tr.amount_piconero.as_u64();
             if let Some(existing_rec) = existing_by_txid.get(tr.txid.as_str()) {
-                if existing_rec.confirmations != tr.confirmations {
+                let unlocked_changed =
+                    existing_unlocked_by_txid.get(tr.txid.as_str()).copied() != Some(tr.unlocked);
+                if existing_rec.confirmations != tr.confirmations || unlocked_changed {
                     let now = Utc::now();
                     let mut synced = (*existing_rec).clone();
                     synced.confirmations = tr.confirmations;
@@ -916,23 +931,36 @@ impl ScannerService {
         let mut double_spent_tx: Option<String> = None;
 
         for entry in out_resp.out.iter().chain(out_resp.pending.iter()) {
-            if !entry.matches_sweep(
-                invoice.account_index,
-                attempt.address_index,
-                &attempt.destination_address,
-            ) {
+            if !entry.matches_source_subaddress(invoice.account_index, attempt.address_index) {
                 continue;
             }
-            if invoice.sweep_tx_hashes.contains(&entry.txid) {
+            if invoice
+                .sweep_tx_hashes
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(&entry.txid))
+            {
                 continue;
             }
+            // Fail-closed double_spend_seen detection by source subaddress even when destinations
+            // metadata is empty (`P36-1`).
             if entry.double_spend_seen {
                 double_spent_tx = Some(entry.txid.clone());
                 break;
             }
-            if !matched_hashes.contains(&entry.txid) {
+            // Confirming funds reached cold storage requires strict destination verification (`P36-1`).
+            let Some(dest_amt) = entry.verified_sweep_destination_amount(
+                invoice.account_index,
+                attempt.address_index,
+                &attempt.destination_address,
+            ) else {
+                continue;
+            };
+            if !matched_hashes
+                .iter()
+                .any(|h: &String| h.eq_ignore_ascii_case(&entry.txid))
+            {
                 matched_hashes.push(entry.txid.clone());
-                total_amount = total_amount.checked_add(entry.amount).ok_or_else(|| {
+                total_amount = total_amount.checked_add(dest_amt).ok_or_else(|| {
                     GatewayError::Internal("overflow summing reconciled sweep amounts".to_string())
                 })?;
                 total_fee = total_fee.checked_add(entry.fee).ok_or_else(|| {
@@ -1010,14 +1038,12 @@ impl ScannerService {
         } else {
             format!("SWEEP_REORG_DETECTED: {reason}")
         };
-        let has_other_confirmed_sweep = invoice.sweep_tx_hashes.iter().any(|h| {
-            !attempt
-                .tx_hashes
-                .iter()
-                .any(|old| old.eq_ignore_ascii_case(h))
-        });
+        let preserve_swept = self
+            .repo
+            .should_preserve_swept_on_attempt_reorg(invoice.id, attempt.id)
+            .await?;
         let mut projected = invoice.clone();
-        if invoice.status == InvoiceStatus::Swept && !has_other_confirmed_sweep {
+        if invoice.status == InvoiceStatus::Swept && !preserve_swept {
             projected.status = InvoiceStatus::Reorged;
         }
         projected.reorg_epoch = invoice.reorg_epoch.saturating_add(1);
@@ -1063,25 +1089,33 @@ impl ScannerService {
         if attempt.tx_hashes.is_empty() {
             let mut matched_any = false;
             for entry in out_resp.out.iter().chain(out_resp.pending.iter()) {
-                if entry.matches_sweep(
-                    invoice.account_index,
-                    attempt.address_index,
-                    &attempt.destination_address,
-                ) {
-                    matched_any = true;
-                    if entry.double_spend_seen {
-                        double_spent_tx = Some(entry.txid.clone());
-                        break;
-                    }
+                if !entry.matches_source_subaddress(invoice.account_index, attempt.address_index) {
+                    continue;
                 }
-            }
-            for entry in &out_resp.out {
-                if !entry.double_spend_seen
-                    && entry.matches_sweep(
+                if entry.double_spend_seen {
+                    double_spent_tx = Some(entry.txid.clone());
+                    break;
+                }
+                if entry
+                    .verified_sweep_destination_amount(
                         invoice.account_index,
                         attempt.address_index,
                         &attempt.destination_address,
                     )
+                    .is_some()
+                {
+                    matched_any = true;
+                }
+            }
+            for entry in &out_resp.out {
+                if !entry.double_spend_seen
+                    && entry
+                        .verified_sweep_destination_amount(
+                            invoice.account_index,
+                            attempt.address_index,
+                            &attempt.destination_address,
+                        )
+                        .is_some()
                 {
                     mined_matches.push(entry);
                 }
@@ -1091,8 +1125,14 @@ impl ScannerService {
             }
         } else {
             for txid in &attempt.tx_hashes {
-                let mined = out_resp.out.iter().find(|entry| &entry.txid == txid);
-                let pending = out_resp.pending.iter().find(|entry| &entry.txid == txid);
+                let mined = out_resp
+                    .out
+                    .iter()
+                    .find(|entry| entry.txid.eq_ignore_ascii_case(txid));
+                let pending = out_resp
+                    .pending
+                    .iter()
+                    .find(|entry| entry.txid.eq_ignore_ascii_case(txid));
                 match (mined, pending) {
                     (Some(entry), _) | (None, Some(entry)) if entry.double_spend_seen => {
                         double_spent_tx = Some(txid.clone());
@@ -1336,13 +1376,15 @@ impl ScannerService {
         };
 
         if sweep_res.tx_hash_list.is_empty() {
+            // Fail-closed (`P36-7`): an HTTP 200 response with empty tx_hash_list does NOT prove
+            // no transaction was broadcast; retain PREPARED for out/pending reconciliation.
             let err = GatewayError::Rpc {
                 code: None,
                 message: "sweep_all returned empty tx_hash_list".to_string(),
             };
             let _ = self
                 .repo
-                .mark_sweep_attempt_failed(attempt.id, invoice_id, &err.to_string(), Utc::now())
+                .record_sweep_error(invoice_id, &err.to_string(), Utc::now())
                 .await;
             return Err(err);
         }
@@ -1380,46 +1422,6 @@ impl ScannerService {
             _ => None,
         };
 
-        let mut merged_hashes = current.sweep_tx_hashes.clone();
-        for h in &tx_hashes {
-            if !merged_hashes.contains(h) {
-                merged_hashes.push(h.clone());
-            }
-        }
-
-        let mut projected = current.clone();
-        projected.status = if current.status == InvoiceStatus::Expired {
-            InvoiceStatus::Expired
-        } else {
-            InvoiceStatus::Swept
-        };
-        projected.unlocked = true;
-        projected.sweep_tx_hashes = merged_hashes;
-        projected.sweep_amount_piconero = Some(
-            current
-                .sweep_amount_piconero
-                .unwrap_or(Piconero::ZERO)
-                .saturating_add(total_amount),
-        );
-        projected.sweep_fee_piconero = Some(
-            current
-                .sweep_fee_piconero
-                .unwrap_or(Piconero::ZERO)
-                .saturating_add(total_fee),
-        );
-        projected.swept_at = Some(current.swept_at.unwrap_or(now));
-
-        let webhook = match current.callback_url.as_deref() {
-            Some(url) => Some(build_sweep_webhook_delivery(
-                &self.config.webhook_secret,
-                &projected,
-                sweep_reason,
-                url,
-                now,
-            )?),
-            None => None,
-        };
-
         tracing::info!(
             invoice_id = %current.id,
             order_id = %current.order_id,
@@ -1432,8 +1434,9 @@ impl ScannerService {
             "subaddress sweep persisted to SQLite"
         );
 
+        let webhook_secret = self.config.webhook_secret.clone();
         self.repo
-            .complete_sweep_attempt_with_min_confs(
+            .complete_sweep_attempt_with_webhook_builder(
                 CompleteSweepAttemptParams {
                     attempt_id,
                     invoice_id: current.id,
@@ -1441,10 +1444,20 @@ impl ScannerService {
                     sweep_tx_hashes: tx_hashes,
                     sweep_amount_piconero: total_amount,
                     sweep_fee_piconero: total_fee,
-                    webhook,
+                    webhook: None,
                     now,
                 },
                 self.min_sweep_confs(),
+                move |updated_inv| match updated_inv.callback_url.as_deref() {
+                    Some(url) => Ok(Some(build_sweep_webhook_delivery(
+                        &webhook_secret,
+                        updated_inv,
+                        sweep_reason,
+                        url,
+                        now,
+                    )?)),
+                    None => Ok(None),
+                },
             )
             .await
     }
@@ -1563,15 +1576,27 @@ impl ScannerService {
                         ))
                     })?;
 
-                let prior_set: HashSet<&str> =
-                    attempt.tx_hashes.iter().map(String::as_str).collect();
-                let confirmed_other_hashes: HashSet<&str> = invoice
-                    .sweep_tx_hashes
+                let all_attempts = self
+                    .repo
+                    .list_sweep_attempts_for_invoice(invoice.id)
+                    .await?;
+                let live_other_hashes: HashSet<String> = all_attempts
                     .iter()
-                    .map(String::as_str)
-                    .filter(|h| !prior_set.contains(*h))
+                    .filter(|att| {
+                        att.id != attempt.id
+                            && matches!(
+                                att.status,
+                                SweepAttemptStatus::Submitted
+                                    | SweepAttemptStatus::Reconciled
+                                    | SweepAttemptStatus::Confirmed
+                            )
+                    })
+                    .flat_map(|att| att.tx_hashes.iter().map(|h| h.to_ascii_lowercase()))
                     .collect();
 
+                // Fail-closed live-sweep check (`P36-1`): ANY non-double-spent outgoing tx from
+                // this subaddress not belonging to another live sweep attempt blocks ALLOW_RESWEEP,
+                // even when `destinations` is empty (e.g. after wallet restore from seed).
                 let still_alive = verify_resp
                     .out
                     .iter()
@@ -1588,14 +1613,12 @@ impl ScannerService {
                         {
                             return true;
                         }
-                        let is_other_confirmed = confirmed_other_hashes
-                            .iter()
-                            .any(|h| entry.txid.eq_ignore_ascii_case(h));
-                        !is_other_confirmed
-                            && entry.matches_sweep(
+                        let is_other_live =
+                            live_other_hashes.contains(&entry.txid.to_ascii_lowercase());
+                        !is_other_live
+                            && entry.matches_source_subaddress(
                                 invoice.account_index,
                                 attempt.address_index,
-                                &attempt.destination_address,
                             )
                     });
 
@@ -1645,7 +1668,8 @@ impl ScannerService {
                     }
                 };
 
-                // Reject txid reuse across other sweep attempts or other invoices (`A4-2`).
+                // Fast-path pre-check before RPC; authoritative atomic check also runs inside
+                // `BEGIN IMMEDIATE` in `resolve_sweep_incident_mark_reconciled` (`P36-2`).
                 for target_txid in &target_tx_hashes {
                     if self
                         .repo
@@ -1676,7 +1700,7 @@ impl ScannerService {
                         ))
                     })?;
 
-                // Strict fail-closed destination & amount verification (`A4-1` / `A4-3`).
+                // Strict fail-closed destination & amount verification (`A4-1` / `P36-1` / `A4-3`).
                 let mut total_dest_amount: u64 = 0;
                 let mut total_fee: u64 = 0;
                 for target_txid in &target_tx_hashes {
@@ -1717,160 +1741,126 @@ impl ScannerService {
                 }
 
                 let min_sweep_confs = self.min_sweep_confs();
-                let has_other_confirmed_sweep = invoice.sweep_tx_hashes.iter().any(|h| {
-                    !attempt
-                        .tx_hashes
-                        .iter()
-                        .any(|old| old.eq_ignore_ascii_case(h))
-                });
+                let has_other_live_sweep = self
+                    .repo
+                    .has_other_live_sweep_attempt(invoice.id, attempt.id)
+                    .await?;
 
-                // Dust protection: ensure verified cold destination amount + fee covers the
-                // expected swept principal for this attempt (`A4-2`).
-                let transfers = self
+                // Dust protection (`A4-2` / `P36-2`): sum ACTUAL full incoming transfer amounts
+                // from `invoice_transfers.amount_piconero` (NOT `subaddress_transfers.amount_piconero`,
+                // which only stores excess delta for OVERPAYMENT rows) using checked_add.
+                let inv_transfers = self.repo.list_transfers_for_invoice(invoice.id).await?;
+                let sub_transfers = self
                     .repo
                     .list_subaddress_transfers_for_invoice(invoice.id)
                     .await?;
-                let expected_min_principal: u64 = if !attempt.snapshot_txids.is_empty() {
-                    transfers
-                        .iter()
-                        .filter(|rec| {
-                            rec.status != SubaddressTransferStatus::Orphaned
-                                && attempt
-                                    .snapshot_txids
-                                    .iter()
-                                    .any(|snap| snap.eq_ignore_ascii_case(&rec.txid))
-                        })
-                        .fold(0_u64, |acc, rec| {
-                            acc.saturating_add(rec.amount_piconero.as_u64())
-                        })
-                } else if has_other_confirmed_sweep || invoice.status == InvoiceStatus::Expired {
-                    let linked_sum = transfers
-                        .iter()
-                        .filter(|rec| {
-                            rec.sweep_attempt_id == Some(attempt.id)
-                                && rec.status != SubaddressTransferStatus::Orphaned
-                        })
-                        .fold(0_u64, |acc, rec| {
-                            acc.saturating_add(rec.amount_piconero.as_u64())
-                        });
-                    if linked_sum > 0 {
-                        linked_sum
-                    } else {
-                        let unswept_anomaly_sum = transfers
+
+                let mut expected_min_principal: u64 = 0;
+                if !attempt.snapshot_txids.is_empty() {
+                    for snap_txid in &attempt.snapshot_txids {
+                        let actual_amt = inv_transfers
                             .iter()
-                            .filter(|rec| {
-                                rec.status == SubaddressTransferStatus::Active
-                                    && !rec.swept
-                                    && rec.confirmations >= min_sweep_confs
-                                    && matches!(
-                                        rec.classification,
-                                        TransferClassification::Overpayment
-                                            | TransferClassification::LatePayment
-                                    )
-                            })
-                            .fold(0_u64, |acc, rec| {
-                                acc.saturating_add(rec.amount_piconero.as_u64())
+                            .find(|tr| !tr.orphaned && tr.txid.eq_ignore_ascii_case(snap_txid))
+                            .map(|tr| tr.amount_piconero.as_u64())
+                            .or_else(|| {
+                                sub_transfers
+                                    .iter()
+                                    .find(|rec| {
+                                        rec.status != SubaddressTransferStatus::Orphaned
+                                            && rec.txid.eq_ignore_ascii_case(snap_txid)
+                                    })
+                                    .map(|rec| rec.amount_piconero.as_u64())
                             });
-                        if unswept_anomaly_sum > 0 {
-                            unswept_anomaly_sum
+                        if let Some(amt) = actual_amt {
+                            expected_min_principal =
+                                expected_min_principal.checked_add(amt).ok_or_else(|| {
+                                    GatewayError::Internal(
+                                        "expected swept principal overflow".to_string(),
+                                    )
+                                })?;
+                        }
+                    }
+                } else if has_other_live_sweep || invoice.status == InvoiceStatus::Expired {
+                    let mut linked_sum: u64 = 0;
+                    for rec in sub_transfers.iter().filter(|rec| {
+                        rec.sweep_attempt_id == Some(attempt.id)
+                            && rec.status != SubaddressTransferStatus::Orphaned
+                    }) {
+                        let amt = inv_transfers
+                            .iter()
+                            .find(|tr| !tr.orphaned && tr.txid.eq_ignore_ascii_case(&rec.txid))
+                            .map_or(rec.amount_piconero.as_u64(), |tr| {
+                                tr.amount_piconero.as_u64()
+                            });
+                        linked_sum = linked_sum.checked_add(amt).ok_or_else(|| {
+                            GatewayError::Internal("linked swept principal overflow".to_string())
+                        })?;
+                    }
+                    if linked_sum > 0 {
+                        expected_min_principal = linked_sum;
+                    } else {
+                        let mut unswept_sum: u64 = 0;
+                        for rec in sub_transfers.iter().filter(|rec| {
+                            rec.status == SubaddressTransferStatus::Active
+                                && !rec.swept
+                                && rec.confirmations >= MONERO_UNLOCK_CONFIRMATIONS
+                                && matches!(
+                                    rec.classification,
+                                    TransferClassification::Overpayment
+                                        | TransferClassification::LatePayment
+                                )
+                        }) {
+                            let amt = inv_transfers
+                                .iter()
+                                .find(|tr| !tr.orphaned && tr.txid.eq_ignore_ascii_case(&rec.txid))
+                                .map_or(rec.amount_piconero.as_u64(), |tr| {
+                                    tr.amount_piconero.as_u64()
+                                });
+                            unswept_sum = unswept_sum.checked_add(amt).ok_or_else(|| {
+                                GatewayError::Internal(
+                                    "unswept anomaly principal overflow".to_string(),
+                                )
+                            })?;
+                        }
+                        if unswept_sum > 0 {
+                            expected_min_principal = unswept_sum;
                         } else if let Some(prev_swept) = attempt.swept_amount_piconero {
-                            prev_swept
+                            expected_min_principal = prev_swept
                                 .as_u64()
-                                .saturating_add(attempt.fee_piconero.map_or(0, Piconero::as_u64))
+                                .checked_add(attempt.fee_piconero.map_or(0, Piconero::as_u64))
+                                .ok_or_else(|| {
+                                    GatewayError::Internal(
+                                        "previous swept principal overflow".to_string(),
+                                    )
+                                })?;
                         } else {
-                            invoice.amount_piconero.as_u64()
+                            expected_min_principal = invoice.amount_piconero.as_u64();
                         }
                     }
                 } else {
-                    invoice.amount_piconero.as_u64()
-                };
+                    expected_min_principal = invoice.amount_piconero.as_u64();
+                }
 
-                let effective_min_principal = if expected_min_principal > 0 {
-                    expected_min_principal
-                } else {
-                    invoice.amount_piconero.as_u64()
-                };
+                // For primary sweeps (no other live sweep attempt and not EXPIRED), always enforce
+                // invoice.amount_piconero as a lower bound (`P36-2`).
+                let effective_min_principal =
+                    if !has_other_live_sweep && invoice.status != InvoiceStatus::Expired {
+                        expected_min_principal.max(invoice.amount_piconero.as_u64())
+                    } else if expected_min_principal > 0 {
+                        expected_min_principal
+                    } else {
+                        invoice.amount_piconero.as_u64()
+                    };
 
-                if total_dest_amount == 0
-                    || total_dest_amount.saturating_add(total_fee) < effective_min_principal
-                {
+                let verified_gross = total_dest_amount.checked_add(total_fee).ok_or_else(|| {
+                    GatewayError::Internal("verified sweep gross total overflow".to_string())
+                })?;
+
+                if total_dest_amount == 0 || verified_gross < effective_min_principal {
                     return Err(GatewayError::Conflict(format!(
                         "tx_hashes {target_tx_hashes:?} verified cold destination amount ({total_dest_amount}) + fee ({total_fee}) is below expected swept principal ({effective_min_principal} piconero)"
                     )));
                 }
-
-                let mut next_hashes: Vec<String> = invoice
-                    .sweep_tx_hashes
-                    .iter()
-                    .filter(|h| {
-                        !attempt
-                            .tx_hashes
-                            .iter()
-                            .any(|old| old.eq_ignore_ascii_case(h))
-                    })
-                    .cloned()
-                    .collect();
-                for h in &target_tx_hashes {
-                    if !next_hashes
-                        .iter()
-                        .any(|existing| existing.eq_ignore_ascii_case(h))
-                    {
-                        next_hashes.push(h.clone());
-                    }
-                }
-
-                // Compute exact aggregate swept amount & fee for the SWEPT webhook projection
-                // matching the DB recomputation across all non-FAILED / non-REORGED attempts (`A4-3`).
-                let other_attempts = self
-                    .repo
-                    .list_sweep_attempts_for_invoice(invoice.id)
-                    .await?;
-                let (other_amt, other_fee) = other_attempts
-                    .iter()
-                    .filter(|att| {
-                        att.id != attempt.id
-                            && !matches!(
-                                att.status,
-                                SweepAttemptStatus::Failed | SweepAttemptStatus::Reorged
-                            )
-                    })
-                    .fold((0_u64, 0_u64), |(acc_a, acc_f), att| {
-                        (
-                            acc_a.saturating_add(
-                                att.swept_amount_piconero.map_or(0, Piconero::as_u64),
-                            ),
-                            acc_f.saturating_add(att.fee_piconero.map_or(0, Piconero::as_u64)),
-                        )
-                    });
-                let projected_total_amount = other_amt.saturating_add(total_dest_amount);
-                let projected_total_fee = other_fee.saturating_add(total_fee);
-
-                let webhook = if invoice.status == InvoiceStatus::Expired {
-                    None
-                } else if let Some(url) = invoice.callback_url.as_deref() {
-                    let mut projected = invoice.clone();
-                    projected.status = InvoiceStatus::Swept;
-                    projected.unlocked = true;
-                    projected.sweep_tx_hashes = next_hashes;
-                    projected.sweep_amount_piconero = Some(Piconero(projected_total_amount));
-                    projected.sweep_fee_piconero = Some(Piconero(projected_total_fee));
-                    projected.last_sweep_error = None;
-                    projected.swept_at = Some(invoice.swept_at.unwrap_or(now));
-                    let sweep_reason = if has_other_confirmed_sweep {
-                        Some("OVERPAYMENT")
-                    } else {
-                        None
-                    };
-                    Some(build_sweep_webhook_delivery(
-                        &self.config.webhook_secret,
-                        &projected,
-                        sweep_reason,
-                        url,
-                        now,
-                    )?)
-                } else {
-                    None
-                };
 
                 tracing::warn!(
                     invoice_id = %invoice_id,
@@ -1883,6 +1873,13 @@ impl ScannerService {
                     "operator resolved SWEEP_REORG_DETECTED via MARK_RECONCILED"
                 );
 
+                let webhook_secret = self.config.webhook_secret.clone();
+                let sweep_reason = if has_other_live_sweep {
+                    Some("OVERPAYMENT")
+                } else {
+                    None
+                };
+
                 self.repo
                     .resolve_sweep_incident_mark_reconciled(
                         attempt.id,
@@ -1892,7 +1889,21 @@ impl ScannerService {
                         Piconero(total_fee),
                         min_sweep_confs,
                         operator_note,
-                        webhook,
+                        move |updated_inv| {
+                            if updated_inv.status == InvoiceStatus::Expired {
+                                return Ok(None);
+                            }
+                            match updated_inv.callback_url.as_deref() {
+                                Some(url) => Ok(Some(build_sweep_webhook_delivery(
+                                    &webhook_secret,
+                                    updated_inv,
+                                    sweep_reason,
+                                    url,
+                                    now,
+                                )?)),
+                                None => Ok(None),
+                            }
+                        },
                         now,
                     )
                     .await
