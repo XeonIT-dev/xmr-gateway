@@ -10,24 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/common.sh"
 
 usage() {
-    cat <<'EOF'
-Usage: ./admin.sh invoices <command> [options]
-
-Commands:
-  create --order-id ID (--amount-xmr XMR | --amount-piconero PICO)
-         [--callback-url URL] [--ttl SECONDS] [--qr-out PATH]
-                                           Create invoice via POST /api/v1/invoices (X-API-Key)
-  get <invoice_id>                         Fetch invoice via GET /api/v1/invoices/{id} (X-API-Key)
-  list [--status STATUS] [--order-id ID] [--limit N]
-                                           List invoices from SQLite (read-only)
-  inspect <invoice_id>                     Full SQLite forensic view (invoice, transfers,
-                                           subaddress_transfers, sweep_attempts, webhooks)
-  sweep <invoice_id>                       Manual sweep via POST /api/v1/invoices/{id}/sweep (operator)
-  resolve <invoice_id> <allow_resweep|mark_reconciled> --note TEXT
-          [--attempt-id UUID] [--tx-hash 64HEX] [--confirm-absent]
-                                           Resolve REORGED sweep incident via /sweep/resolve (operator)
-  help                                     Show this help message
-EOF
+    t invoices.usage
 }
 
 cmd_create() {
@@ -102,7 +85,7 @@ if b64:
         f.write(base64.b64decode(b64))
     os.chmod(sys.argv[1], 0o600)
 PYEOF
-        log_info "Saved QR PNG to $qr_out"
+        log_info "$(t invoices.qr_saved "$qr_out")"
     fi
 
     if [[ "$ADMIN_JSON" -eq 1 ]]; then
@@ -332,7 +315,7 @@ cmd_sweep() {
     local invoice_id="${1:-}"
     [[ -n "$invoice_id" ]] || die "Usage: ./admin.sh invoices sweep <invoice_id>"
 
-    confirm_dangerous_action "Trigger manual sweep POST /api/v1/invoices/${invoice_id}/sweep" 1
+    confirm_dangerous_action "$(t invoices.confirm_sweep "$invoice_id")" 1
 
     gateway_api_call POST "/api/v1/invoices/${invoice_id}/sweep" operator || die "HTTP request failed."
     if [[ "$API_LAST_HTTP_CODE" != "200" ]]; then
@@ -383,7 +366,7 @@ cmd_resolve() {
     [[ -n "${note// /}" ]] || die "--note (operator_note) is required and must be non-empty."
     if [[ "$action" == "allow_resweep" ]]; then
         if [[ -z "${MONERO_DAEMON_RPC_URL:-}" ]]; then
-            log_warn "MONERO_DAEMON_RPC_URL is unset in $ACTIVE_ENV_FILE; server-side allow_resweep requires MONERO_DAEMON_RPC_URL for fail-closed wallet/daemon sync verification (AUDIT-001) and will return 503 if not configured on the running gateway."
+            log_warn "$(t invoices.daemon_rpc_warn "$ACTIVE_ENV_FILE")"
         fi
         if [[ "$confirm_absent" -ne 1 ]]; then
             die "action=allow_resweep requires --confirm-absent (sets confirm_absent_on_chain=true) after verifying no prior sweep tx exists on-chain."
@@ -393,7 +376,7 @@ cmd_resolve() {
         die "--tx-hash must be exactly 64 hex characters."
     fi
 
-    confirm_dangerous_action "Resolve sweep incident on invoice ${invoice_id} with action=${action}" 1
+    confirm_dangerous_action "$(t invoices.confirm_resolve "$invoice_id" "$action")" 1
 
     local payload
     payload="$(python3 - "$action" "$attempt_id" "$tx_hash" "$confirm_absent" "$note" <<'PYEOF'
@@ -452,7 +435,7 @@ main() {
         sweep)   cmd_sweep "$@" ;;
         resolve) cmd_resolve "$@" ;;
         help|-h|--help) usage ;;
-        *)       die "Unknown invoices command: '$cmd'. Run './admin.sh invoices help'." ;;
+        *)       die "$(t invoices.unknown_cmd "$cmd")" ;;
     esac
 }
 

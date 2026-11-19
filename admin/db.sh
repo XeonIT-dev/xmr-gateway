@@ -10,19 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/common.sh"
 
 usage() {
-    cat <<'EOF'
-Usage: ./admin.sh db <command> [options]
-
-Commands:
-  stats                     Summary of invoices by status, XMR totals, webhooks, open sweep
-                            incidents, and SQLite .db/-wal/-shm sizes (read-only, --json)
-  audit-invariants          Fail-closed SQLite audit: PRAGMA integrity_check, foreign_key_check,
-                            AUDIT-005 overpayment balance conservation, stuck/reorged sweeps (--json)
-  backup [dest_dir]         Safe hot online backup via Python sqlite3.Connection.backup()
-                            with chmod 600 and PRAGMA integrity_check verification (--json)
-  shell [--rw]              Interactive SQLite console (strictly read-only by default)
-  help                      Show this help message
-EOF
+    t db.usage
 }
 
 cmd_stats() {
@@ -104,26 +92,41 @@ if as_json:
     print(json.dumps(out, indent=2))
     sys.exit(0)
 
-print(f"=== SQLite Database Stats ({db_path}) ===")
-print(f"  Files (bytes)    : db={files['db']} | wal={files['wal']} | shm={files['shm']} | lock={files['lock']}")
-print(f"  Total Invoices   : {out['invoices']['total']}")
-if inv_by_status:
-    print("  By Status        : " + ", ".join(f"{k}={v}" for k, v in inv_by_status.items()))
-print(f"  Expected Total   : {out['invoices']['expected_xmr']} XMR")
-print(f"  Received Total   : {out['invoices']['received_xmr']} XMR (overpaid={out['invoices']['overpaid_xmr']} XMR)")
-print(f"  Swept Total      : {out['invoices']['swept_xmr']} XMR (fees={out['invoices']['sweep_fees_xmr']} XMR)")
-print("  Webhooks         : " + (", ".join(f"{k}={v}" for k, v in wh_by_status.items()) or "none"))
-print("  Sweep Attempts   : " + (", ".join(f"{k}={v}" for k, v in sw_by_status.items()) or "none"))
+lang = os.environ.get("ADMIN_ACTIVE_LANG", "en")
 open_incidents = sw_by_status.get("REORGED", 0) + sw_by_status.get("PREPARED", 0)
-if open_incidents > 0:
-    print(f"  [!] Open/In-Flight Sweep Incidents: REORGED={sw_by_status.get('REORGED', 0)}, PREPARED={sw_by_status.get('PREPARED', 0)}")
+if lang == "ru":
+    print(f"=== Статистика БД SQLite ({db_path}) ===")
+    print(f"  Файлы (байт)     : db={files['db']} | wal={files['wal']} | shm={files['shm']} | lock={files['lock']}")
+    print(f"  Всего инвойсов   : {out['invoices']['total']}")
+    if inv_by_status:
+        print("  По статусам      : " + ", ".join(f"{k}={v}" for k, v in inv_by_status.items()))
+    print(f"  Ожидалось всего  : {out['invoices']['expected_xmr']} XMR")
+    print(f"  Получено всего   : {out['invoices']['received_xmr']} XMR (переплата={out['invoices']['overpaid_xmr']} XMR)")
+    print(f"  Выведено (swept) : {out['invoices']['swept_xmr']} XMR (комиссии={out['invoices']['sweep_fees_xmr']} XMR)")
+    print("  Вебхуки          : " + (", ".join(f"{k}={v}" for k, v in wh_by_status.items()) or "нет"))
+    print("  Попытки свипа    : " + (", ".join(f"{k}={v}" for k, v in sw_by_status.items()) or "нет"))
+    if open_incidents > 0:
+        print(f"  [!] Открытые/незавершённые свипы: REORGED={sw_by_status.get('REORGED', 0)}, PREPARED={sw_by_status.get('PREPARED', 0)}")
+else:
+    print(f"=== SQLite Database Stats ({db_path}) ===")
+    print(f"  Files (bytes)    : db={files['db']} | wal={files['wal']} | shm={files['shm']} | lock={files['lock']}")
+    print(f"  Total Invoices   : {out['invoices']['total']}")
+    if inv_by_status:
+        print("  By Status        : " + ", ".join(f"{k}={v}" for k, v in inv_by_status.items()))
+    print(f"  Expected Total   : {out['invoices']['expected_xmr']} XMR")
+    print(f"  Received Total   : {out['invoices']['received_xmr']} XMR (overpaid={out['invoices']['overpaid_xmr']} XMR)")
+    print(f"  Swept Total      : {out['invoices']['swept_xmr']} XMR (fees={out['invoices']['sweep_fees_xmr']} XMR)")
+    print("  Webhooks         : " + (", ".join(f"{k}={v}" for k, v in wh_by_status.items()) or "none"))
+    print("  Sweep Attempts   : " + (", ".join(f"{k}={v}" for k, v in sw_by_status.items()) or "none"))
+    if open_incidents > 0:
+        print(f"  [!] Open/In-Flight Sweep Incidents: REORGED={sw_by_status.get('REORGED', 0)}, PREPARED={sw_by_status.get('PREPARED', 0)}")
 PYEOF
 }
 
 cmd_audit_invariants() {
     load_env
     sqlite_ro_python "$ADMIN_JSON" "$REQUIRED_CONFIRMATIONS" <<'PYEOF'
-import json, sqlite3, sys
+import json, os, sqlite3, sys
 from datetime import datetime, timezone, timedelta
 
 db_path = sys.argv[1]
@@ -262,12 +265,30 @@ if as_json:
         "warnings": warnings,
     }, indent=2))
 else:
-    print(f"=== SQLite Invariants Audit ({db_path}) ===")
-    for c in checks:
-        print(f"  [{c['status']:4s}] {c['check']:<40s} {c['detail']}")
-    for w in warnings:
-        print(f"  [WARN] {w['check']:<40s} {w['detail']}")
-    print(f"\nResult: {'OK' if ok else 'FAILED'} ({len(violations)} violation(s), {len(warnings)} warning(s))")
+    lang = os.environ.get("ADMIN_ACTIVE_LANG", "en")
+    ru_checks = {
+        "pragma_integrity_check": "Целостность PRAGMA integrity_check",
+        "pragma_foreign_key_check": "Внешние ключи PRAGMA foreign_key_check",
+        "audit_005_row_amount_conservation": "Совпадение сумм subaddress/invoice (AUDIT-005)",
+        "audit_005_invoice_balance_conservation": "Сохранение баланса по инвойсам (AUDIT-005)",
+        "unresolved_reorged_sweeps": "Неразрешённые REORGED свипы",
+        "stale_prepared_sweeps": "Зависшие PREPARED свипы (>10 мин)",
+    }
+    if lang == "ru":
+        print(f"=== Аудит инвариантов SQLite ({db_path}) ===")
+        for c in checks:
+            lbl = ru_checks.get(c["check"], c["check"])
+            print(f"  [{c['status']:4s}] {lbl:<48s} ({c['check']}) — {c['detail']}")
+        for w in warnings:
+            print(f"  [WARN] {w['check']:<40s} {w['detail']}")
+        print(f"\nИтог: {'OK' if ok else 'НАРУШЕНИЯ ОБНАРУЖЕНЫ'} (нарушений: {len(violations)}, предупреждений: {len(warnings)})")
+    else:
+        print(f"=== SQLite Invariants Audit ({db_path}) ===")
+        for c in checks:
+            print(f"  [{c['status']:4s}] {c['check']:<40s} {c['detail']}")
+        for w in warnings:
+            print(f"  [WARN] {w['check']:<40s} {w['detail']}")
+        print(f"\nResult: {'OK' if ok else 'FAILED'} ({len(violations)} violation(s), {len(warnings)} warning(s))")
 
 sys.exit(0 if ok else 1)
 PYEOF
@@ -343,8 +364,8 @@ cmd_shell() {
     [[ -f "$DB_PATH" ]] || die "SQLite database not found: $DB_PATH"
 
     if [[ "$rw" -eq 1 ]]; then
-        log_warn "Opening SQLite in READ-WRITE mode! Direct manual writes can violate financial ledger invariants."
-        confirm_dangerous_action "Open READ-WRITE SQLite shell on $DB_PATH" 1
+        log_warn "$(t db.shell_rw_warn)"
+        confirm_dangerous_action "$(t db.shell_rw_confirm "$DB_PATH")" 1
         if command -v sqlite3 >/dev/null 2>&1; then
             exec sqlite3 -header -column "$DB_PATH"
         else
@@ -352,7 +373,7 @@ cmd_shell() {
         fi
     fi
 
-    log_info "Opening strictly READ-ONLY SQLite shell on $DB_PATH..."
+    log_info "$(t db.shell_ro_info "$DB_PATH")"
     if command -v sqlite3 >/dev/null 2>&1; then
         exec sqlite3 -header -column -readonly "$DB_PATH"
     else
@@ -398,7 +419,7 @@ main() {
         backup)           cmd_backup "$@" ;;
         shell)            cmd_shell "$@" ;;
         help|-h|--help)   usage ;;
-        *)                die "Unknown db command: '$cmd'. Run './admin.sh db help'." ;;
+        *)                die "$(t db.unknown_cmd "$cmd")" ;;
     esac
 }
 

@@ -422,7 +422,10 @@ pub fn verify_webhook(secret: &str, raw_body: &[u8], signature_hex: &str) -> boo
 
 ## Unified Admin CLI (`./admin.sh` & `admin/`)
 
-Run `./admin.sh` without arguments for an interactive menu, or invoke scriptable subcommands (`./admin.sh [--env FILE] [--json] [--yes] <module> <command> [args...]`):
+Run `./admin.sh` without arguments for an interactive bilingual (**EN / RU**) menu, or invoke scriptable subcommands (`./admin.sh [--env FILE] [--lang en|ru] [--json] [--yes] <module> <command> [args...]`):
+
+- **Full Operational Guides:** [admin/GUIDE_EN.md](admin/GUIDE_EN.md) (English) | [admin/GUIDE_RU.md](admin/GUIDE_RU.md) (Русский) — or run `./admin.sh guide [--path]` directly from the CLI.
+- **Language Switching:** use `--lang <en|ru>`, `ADMIN_LANG=<en|ru>`, `./admin.sh lang [show|en|ru]` (persisted to `data/.admin_lang`, mode `0600`), or press **`L`** in the interactive menu. `--json` output is strictly language-invariant.
 
 | Module | Key Commands | Purpose |
 | :--- | :--- | :--- |
@@ -433,6 +436,7 @@ Run `./admin.sh` without arguments for an interactive menu, or invoke scriptable
 | `webhooks` | `list`, `inspect`, `retry`, `retry-invoice`, `verify-sig`, `test-receiver` | Webhook outbox inspection, operator `FAILED`-only retry, HMAC-SHA256 verification, and local test receiver |
 | `db` | `stats`, `audit-invariants`, `backup`, `shell` | Read-only SQLite analytics, `AUDIT-005` balance-conservation audit, WAL-safe hot online backup (`0600`), RO/RW shell |
 | `dev` | `check`, `health-rbac`, `demo` | Rust fmt/clippy/test runner, live `GET /health` `AUDIT-002` RBAC verifier, Stagenet demo launcher |
+| `lang` / `guide` | `lang [show\|en\|ru]`, `guide [--path]` | Show/save interface language (`EN`/`RU`) and open the built-in operational guide |
 
 All secrets are passed to `curl` exclusively via stdin (`--config -`, never in process `argv`), SQLite inspection runs strictly read-only (`mode=ro`), and financial/destructive operations display a `[MAINNET]` confirmation banner when `MONERO_NETWORK=mainnet`.
 
@@ -444,7 +448,7 @@ All secrets are passed to `curl` exclusively via stdin (`--config -`, never in p
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets
-bash -n admin.sh admin/*.sh admin/lib/*.sh && ./admin/test_admin.sh
+bash -n admin.sh admin/*.sh admin/lib/*.sh admin/i18n/*.sh && ./admin/test_admin.sh
 ```
 
 Licensed under the [MIT License](LICENSE).

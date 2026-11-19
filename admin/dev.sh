@@ -10,26 +10,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/common.sh"
 
 usage() {
-    cat <<'EOF'
-Usage: ./admin.sh dev <command> [options]
-
-Commands:
-  check          Run cargo fmt --check, cargo clippy -D warnings, and cargo test --locked --all-targets
-  health-rbac    Verify live GET /health RBAC & telemetry-hiding matrix (AUDIT-002) (--json)
-  demo           Launch ./demo-stagenet.sh interactive Stagenet demo
-  help           Show this help message
-EOF
+    t dev.usage
 }
 
 cmd_check() {
     require_cmd cargo
-    log_step "1/3 Running cargo fmt --all -- --check..."
+    log_step "$(t dev.check_step1)"
     (cd "$REPO_ROOT" && cargo fmt --all -- --check)
-    log_step "2/3 Running cargo clippy --locked --all-targets --all-features -- -D warnings..."
+    log_step "$(t dev.check_step2)"
     (cd "$REPO_ROOT" && cargo clippy --locked --all-targets --all-features -- -D warnings)
-    log_step "3/3 Running cargo test --locked --all-targets..."
+    log_step "$(t dev.check_step3)"
     (cd "$REPO_ROOT" && cargo test --locked --all-targets)
-    log_info "All Rust fmt, clippy, and test checks passed."
+    log_info "$(t dev.check_done)"
 }
 
 # Helper calling /health with an arbitrary header name/value via curl --config - (zero argv leak)
@@ -129,7 +121,11 @@ else:
 if os.environ.get("HRBAC_JSON") == "1":
     print(json.dumps({"ok": failed == 0, "operator_key_configured": has_op, "results": results}, indent=2))
 else:
-    print(f"=== Live GET /health RBAC Matrix (OPERATOR_API_KEY={'set' if has_op else 'unset'}) ===")
+    lang = os.environ.get("ADMIN_ACTIVE_LANG", "en")
+    if lang == "ru":
+        print(f"=== Живая RBAC-матрица GET /health (OPERATOR_API_KEY={'задан' if has_op else 'не задан'}) ===")
+    else:
+        print(f"=== Live GET /health RBAC Matrix (OPERATOR_API_KEY={'set' if has_op else 'unset'}) ===")
     for r in results:
         tag = "PASS" if r["ok"] else "FAIL"
         print(f"  [{tag}] {r['case']:<38s} {r['detail']}")
@@ -139,7 +135,7 @@ PYEOF
 }
 
 cmd_demo() {
-    log_step "Launching ./demo-stagenet.sh..."
+    log_step "$(t dev.launching_demo)"
     exec "$REPO_ROOT/demo-stagenet.sh" "$@"
 }
 
@@ -154,7 +150,7 @@ main() {
         health-rbac) cmd_health_rbac "$@" ;;
         demo)        cmd_demo "$@" ;;
         help|-h|--help) usage ;;
-        *)           die "Unknown dev command: '$cmd'. Run './admin.sh dev help'." ;;
+        *)           die "$(t dev.unknown_cmd "$cmd")" ;;
     esac
 }
 

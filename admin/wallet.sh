@@ -10,39 +10,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/common.sh"
 
 usage() {
-    cat <<'EOF'
-Usage: ./admin.sh wallet <command> [options]
-
-Commands:
-  info | balance                     Show primary address, total/unlocked & subaddress balances,
-                                     wallet vs daemon height (--json)
-  transfers [in|out|pool|pending|all]
-                                     List wallet transfers via monero-wallet-rpc (--json)
-  refresh                            Trigger wallet RPC refresh
-  set-height <height>                Refresh wallet from explicit block height
-  rescan                             Full rescan_blockchain via wallet RPC
-  create-hot [--restore-height H]    Create a new hot wallet + 0600 password file
-  create-view-only [--address A] [--view-key K] [--restore-height H]
-                                     Create a zero-trust view-only wallet (no private spend key)
-  export-view-keys                   Safely export primary address + private view key (never spend key)
-  transfer <addr> <amount_xmr> [priority]
-                                     Send XMR (fail-closed in view_only mode; exact Decimal piconero)
-  sweep-all <addr> [subaddr_idx] [priority]
-                                     Sweep unlocked balance to address (fail-closed in view_only mode)
-  cli [-- extra_args...]             Launch monero-wallet-cli with network/daemon/wallet flags from .env
-  help                               Show this help message
-EOF
+    t wallet.usage
 }
 
 require_hot_wallet_for_spend() {
     if [[ "$WALLET_MODE" == "view_only" ]]; then
-        cat >&2 <<'EOF'
-[ERR ] Operation refused (fail-closed): WALLET_MODE=view_only has NO private spend key.
-       To spend funds from a view-only setup:
-         1. Export outputs from the view-only wallet (export_outputs).
-         2. Sign the unsigned transaction offline on your air-gapped cold wallet (sign_transfer).
-         3. Broadcast the signed_monero_tx from an online node (submit_transfer).
-EOF
+        t wallet.view_only_refused >&2
         exit 1
     fi
 }
@@ -84,7 +57,7 @@ cmd_info() {
     fi
 
     python3 - "$ADMIN_JSON" "$MONERO_NETWORK" "$WALLET_MODE" "$bal_json" "$addr_json" "$height_json" "$daemon_json" <<'PYEOF'
-import json, sys
+import json, os, sys
 
 as_json = sys.argv[1] == "1"
 net, mode = sys.argv[2], sys.argv[3]
@@ -135,23 +108,43 @@ out = {
 if as_json:
     print(json.dumps(out, indent=2))
 else:
-    print("=== Monero Wallet Info & Balance ===")
-    print(f"  Network / Mode   : {net} / {mode}")
-    print(f"  Primary Address  : {out['primary_address']}")
-    print(f"  Total Balance    : {out['balance_xmr']} XMR ({out['balance_piconero']} piconero)")
-    print(f"  Unlocked Balance : {out['unlocked_balance_xmr']} XMR ({out['unlocked_balance_piconero']} piconero)")
-    print(f"  Blocks to Unlock : {out['blocks_to_unlock']}")
-    print(f"  Subaddresses     : {out['total_subaddresses']} total")
-    if out["daemon_height"] is not None:
-        lag = out["daemon_height"] - w_h
-        print(f"  Height (W / D)   : {w_h} / {out['daemon_height']} (lag={lag}, synced={out['daemon_synchronized']})")
+    lang = os.environ.get("ADMIN_ACTIVE_LANG", "en")
+    if lang == "ru":
+        print("=== Информация и баланс кошелька Monero ===")
+        print(f"  Сеть / Режим       : {net} / {mode}")
+        print(f"  Основной адрес     : {out['primary_address']}")
+        print(f"  Общий баланс       : {out['balance_xmr']} XMR ({out['balance_piconero']} piconero)")
+        print(f"  Разблокировано     : {out['unlocked_balance_xmr']} XMR ({out['unlocked_balance_piconero']} piconero)")
+        print(f"  Блоков до разблок. : {out['blocks_to_unlock']}")
+        print(f"  Субадресов всего   : {out['total_subaddresses']}")
+        if out["daemon_height"] is not None:
+            lag = out["daemon_height"] - w_h
+            print(f"  Высота (Кош./Дем.) : {w_h} / {out['daemon_height']} (отставание={lag}, synced={out['daemon_synchronized']})")
+        else:
+            print(f"  Высота кошелька    : {w_h} (высота демона недоступна)")
+        if subaddrs:
+            print("\nАктивные / ненулевые субадреса:")
+            print(f"  {'IDX':>5s}  {'БАЛАНС (XMR)':>18s}  {'РАЗБЛОК. (XMR)':>18s}  {'ВЫХ.':>4s}  {'МЕТКА'}")
+            for s in subaddrs:
+                print(f"  {s['address_index']:5d}  {s['balance_xmr']:>18s}  {s['unlocked_xmr']:>18s}  {s['num_unspent_outputs']:4d}  {s['label']}")
     else:
-        print(f"  Wallet Height    : {w_h} (daemon height unavailable)")
-    if subaddrs:
-        print("\nNon-zero / active subaddresses:")
-        print(f"  {'IDX':>5s}  {'BALANCE (XMR)':>18s}  {'UNLOCKED (XMR)':>18s}  {'OUTS':>4s}  {'LABEL'}")
-        for s in subaddrs:
-            print(f"  {s['address_index']:5d}  {s['balance_xmr']:>18s}  {s['unlocked_xmr']:>18s}  {s['num_unspent_outputs']:4d}  {s['label']}")
+        print("=== Monero Wallet Info & Balance ===")
+        print(f"  Network / Mode   : {net} / {mode}")
+        print(f"  Primary Address  : {out['primary_address']}")
+        print(f"  Total Balance    : {out['balance_xmr']} XMR ({out['balance_piconero']} piconero)")
+        print(f"  Unlocked Balance : {out['unlocked_balance_xmr']} XMR ({out['unlocked_balance_piconero']} piconero)")
+        print(f"  Blocks to Unlock : {out['blocks_to_unlock']}")
+        print(f"  Subaddresses     : {out['total_subaddresses']} total")
+        if out["daemon_height"] is not None:
+            lag = out["daemon_height"] - w_h
+            print(f"  Height (W / D)   : {w_h} / {out['daemon_height']} (lag={lag}, synced={out['daemon_synchronized']})")
+        else:
+            print(f"  Wallet Height    : {w_h} (daemon height unavailable)")
+        if subaddrs:
+            print("\nNon-zero / active subaddresses:")
+            print(f"  {'IDX':>5s}  {'BALANCE (XMR)':>18s}  {'UNLOCKED (XMR)':>18s}  {'OUTS':>4s}  {'LABEL'}")
+            for s in subaddrs:
+                print(f"  {s['address_index']:5d}  {s['balance_xmr']:>18s}  {s['unlocked_xmr']:>18s}  {s['num_unspent_outputs']:4d}  {s['label']}")
 PYEOF
 }
 
@@ -219,7 +212,7 @@ cmd_refresh() {
     if [[ "$ADMIN_JSON" -eq 1 ]]; then
         printf '%s\n' "$res_json" | pretty_print_json
     else
-        log_info "Wallet refresh complete: $res_json"
+        log_info "$(t wallet.refresh_done "$res_json")"
     fi
 }
 
@@ -234,21 +227,21 @@ cmd_set_height() {
     if [[ "$ADMIN_JSON" -eq 1 ]]; then
         printf '%s\n' "$res_json" | pretty_print_json
     else
-        log_info "Wallet refreshed from height $height: $res_json"
-        log_info "Tip: to persist WALLET_RESTORE_HEIGHT=$height in $ACTIVE_ENV_FILE for future recreations, update it in your .env."
+        log_info "$(t wallet.set_height_done "$height" "$res_json")"
+        log_info "$(t wallet.set_height_tip "$height" "$ACTIVE_ENV_FILE")"
     fi
 }
 
 cmd_rescan() {
     load_env
-    confirm_dangerous_action "Run full rescan_blockchain on $MONERO_NETWORK wallet"
+    confirm_dangerous_action "$(t wallet.confirm_rescan "$MONERO_NETWORK")"
     wallet_rpc_call "rescan_blockchain" '{}' || die "rescan_blockchain RPC failed"
     local res_json
     res_json="$(rpc_extract_result_or_die "rescan_blockchain")"
     if [[ "$ADMIN_JSON" -eq 1 ]]; then
         printf '%s\n' "$res_json" | pretty_print_json
     else
-        log_info "rescan_blockchain completed."
+        log_info "$(t wallet.rescan_done)"
     fi
 }
 
@@ -269,7 +262,7 @@ cmd_create_hot() {
     [[ "$restore_height" =~ ^[0-9]+$ ]] || die "Invalid restore height: $restore_height"
     [[ ! -f "${WALLET_FILE}.keys" ]] || die "Wallet already exists at ${WALLET_FILE}.keys. Refusing to overwrite."
 
-    confirm_dangerous_action "Generate NEW hot wallet (with private spend key) at $WALLET_FILE" 1
+    confirm_dangerous_action "$(t wallet.confirm_create_hot "$WALLET_FILE")" 1
 
     local wallet_cli
     wallet_cli="$(find_monero_bin monero-wallet-cli)" || die "monero-wallet-cli not found. Run './admin.sh service setup-rpc'."
@@ -286,7 +279,7 @@ cmd_create_hot() {
     [[ "$MONERO_NETWORK" == "stagenet" ]] && net_args+=(--stagenet)
     [[ "$MONERO_NETWORK" == "testnet" ]] && net_args+=(--testnet)
 
-    log_warn "Generating hot wallet ($MONERO_NETWORK). BACK UP THE 25-WORD SEED PHRASE OFFLINE!"
+    log_warn "$(t wallet.seed_warn "$MONERO_NETWORK")"
     printf 'N\n' | "$wallet_cli" \
         --offline \
         "${net_args[@]}" \
@@ -298,7 +291,7 @@ cmd_create_hot() {
         --command address
 
     chmod 600 "${WALLET_FILE}"* 2>/dev/null || true
-    log_info "Hot wallet created at $WALLET_FILE (0600)."
+    log_info "$(t wallet.hot_created "$WALLET_FILE")"
 }
 
 cmd_create_view_only() {
@@ -347,7 +340,7 @@ cmd_create_view_only() {
     [[ "$MONERO_NETWORK" == "stagenet" ]] && net_args+=(--stagenet)
     [[ "$MONERO_NETWORK" == "testnet" ]] && net_args+=(--testnet)
 
-    log_step "Creating zero-trust View-Only wallet at $WALLET_FILE (height $restore_height)..."
+    log_step "$(t wallet.vo_creating "$WALLET_FILE" "$restore_height")"
     printf '%s\n%s\n%s\nN\n' "$addr" "$view_key" "$restore_height" | "$wallet_cli" \
         --offline \
         "${net_args[@]}" \
@@ -358,7 +351,7 @@ cmd_create_view_only() {
         --command address
 
     chmod 600 "${WALLET_FILE}"* 2>/dev/null || true
-    log_info "View-Only wallet created at $WALLET_FILE (0600, no private spend key)."
+    log_info "$(t wallet.vo_created "$WALLET_FILE")"
 }
 
 cmd_export_view_keys() {
@@ -436,7 +429,7 @@ cmd_transfer() {
     is_valid="$(python3 -c 'import json,sys; print("1" if json.loads(sys.argv[1]).get("valid") else "0")' "$val_res")"
     [[ "$is_valid" == "1" ]] || die "Destination address failed monero-wallet-rpc validate_address: $dest"
 
-    confirm_dangerous_action "Transfer ${formatted_xmr} XMR (${amount_pico} piconero) -> ${dest} (priority=${priority})" 1
+    confirm_dangerous_action "$(t wallet.confirm_transfer "$formatted_xmr" "$amount_pico" "$dest" "$priority")" 1
 
     local tx_params
     tx_params="$(python3 - "$dest" "$amount_pico" "$priority" <<'PYEOF'
@@ -490,7 +483,7 @@ cmd_sweep_all() {
     is_valid="$(python3 -c 'import json,sys; print("1" if json.loads(sys.argv[1]).get("valid") else "0")' "$val_res")"
     [[ "$is_valid" == "1" ]] || die "Destination address failed monero-wallet-rpc validate_address: $dest"
 
-    confirm_dangerous_action "sweep_all (account 0, subaddress=${subaddr_idx:-ALL}, priority=${priority}) -> ${dest}" 1
+    confirm_dangerous_action "$(t wallet.confirm_sweep_all "${subaddr_idx:-ALL}" "$priority" "$dest")" 1
 
     local sweep_params
     sweep_params="$(python3 - "$dest" "$subaddr_idx" "$priority" <<'PYEOF'
@@ -554,7 +547,7 @@ cmd_cli() {
         cli_args+=(--proxy "$MONERO_RPC_PROXY")
     fi
 
-    log_info "Launching monero-wallet-cli ($MONERO_NETWORK -> $MONERO_REMOTE_NODE)..."
+    log_info "$(t wallet.launching_cli "$MONERO_NETWORK" "$MONERO_REMOTE_NODE")"
     exec "$wallet_cli" "${cli_args[@]}" "$@"
 }
 
@@ -577,7 +570,7 @@ main() {
         sweep-all)        cmd_sweep_all "$@" ;;
         cli)              cmd_cli "$@" ;;
         help|-h|--help)   usage ;;
-        *)                die "Unknown wallet command: '$cmd'. Run './admin.sh wallet help'." ;;
+        *)                die "$(t wallet.unknown_cmd "$cmd")" ;;
     esac
 }
 
