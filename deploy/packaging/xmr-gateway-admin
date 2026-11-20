@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# System-wide wrapper installed to /usr/bin/xmr-gateway-admin
+# ==============================================================================
+set -euo pipefail
+
+if [[ -x "/usr/share/xmr-gateway/admin.sh" ]]; then
+    exec /usr/share/xmr-gateway/admin.sh "$@"
+elif [[ -x "/opt/xmr-gateway/admin.sh" ]]; then
+    exec /opt/xmr-gateway/admin.sh "$@"
+else
+    echo "ERROR: xmr-gateway admin.sh not found in /usr/share/xmr-gateway or /opt/xmr-gateway." >&2
+    exit 1
+fi

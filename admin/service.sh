@@ -331,28 +331,43 @@ cmd_setup_rpc() {
 
 cmd_systemd() {
     local action="${1:-status}"
+    local systemd_src="$REPO_ROOT/deploy/systemd"
+    if [[ ! -d "$systemd_src" && -d "/usr/lib/systemd/system" ]]; then
+        systemd_src="/usr/lib/systemd/system"
+    fi
     case "$action" in
         status)
             require_cmd systemctl
-            systemctl status --no-pager monero-wallet-rpc.service xmr-gateway.service || true
+            systemctl status --no-pager \
+                monero-wallet-rpc.service \
+                xmr-gateway.service \
+                xmr-gateway-backup.timer || true
             ;;
         install-dry-run)
             cat <<EOF
 === Systemd Production Installation Plan (Dry-Run) ===
-Unit sources:
-  - $REPO_ROOT/deploy/systemd/monero-wallet-rpc.service
-  - $REPO_ROOT/deploy/systemd/xmr-gateway.service
+Unit sources (${systemd_src}):
+  - monero-wallet-rpc.service  (User=xmr-gateway, UMask=0077, RuntimeDirectory=xmr-gateway, KillSignal=SIGTERM, TimeoutStopSec=30)
+  - xmr-gateway.service        (User=xmr-gateway, UMask=0077, EnvironmentFile=/etc/xmr-gateway/.env, KillSignal=SIGTERM, TimeoutStopSec=30)
+  - xmr-gateway-backup.service (daily online SQLite hot backup via xmr-gateway-admin, 0600 + integrity_check)
+  - xmr-gateway-backup.timer   (OnCalendar=daily, RandomizedDelaySec=15m, Persistent=true)
 
 Recommended commands (review before executing as root):
-  sudo useradd --system --home /var/lib/xmr-gateway --shell /usr/sbin/nologin xmr-gateway
-  sudo install -d -m 0700 -o xmr-gateway -g xmr-gateway /var/lib/xmr-gateway /var/lib/xmr-gateway/wallet
+  sudo groupadd --system xmr-gateway || true
+  sudo useradd --system --gid xmr-gateway --home-dir /var/lib/xmr-gateway --shell /usr/sbin/nologin xmr-gateway || true
+  sudo install -d -m 0700 -o xmr-gateway -g xmr-gateway /var/lib/xmr-gateway /var/lib/xmr-gateway/wallet /var/lib/xmr-gateway/backups
   sudo install -d -m 0750 -o root -g xmr-gateway /etc/xmr-gateway
-  sudo install -m 0640 -o root -g xmr-gateway .env /etc/xmr-gateway/xmr-gateway.env
-  sudo install -m 0755 target/release/xmr-gateway /usr/local/bin/xmr-gateway
+  sudo install -m 0600 -o xmr-gateway -g xmr-gateway .env.example /etc/xmr-gateway/.env
+  sudo install -m 0755 target/release/xmr-gateway /usr/bin/xmr-gateway
+  sudo install -m 0755 deploy/packaging/xmr-gateway-admin /usr/bin/xmr-gateway-admin
   sudo install -m 0755 bin/monero-wallet-rpc /usr/local/bin/monero-wallet-rpc
-  sudo cp deploy/systemd/monero-wallet-rpc.service deploy/systemd/xmr-gateway.service /etc/systemd/system/
+  sudo cp "${systemd_src}"/monero-wallet-rpc.service \
+          "${systemd_src}"/xmr-gateway.service \
+          "${systemd_src}"/xmr-gateway-backup.service \
+          "${systemd_src}"/xmr-gateway-backup.timer \
+          /etc/systemd/system/
   sudo systemctl daemon-reload
-  sudo systemctl enable --now monero-wallet-rpc.service xmr-gateway.service
+  sudo systemctl enable --now monero-wallet-rpc.service xmr-gateway.service xmr-gateway-backup.timer
 EOF
             ;;
         restart)

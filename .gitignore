@@ -1,12 +1,19 @@
-# Rust build artifacts & backups
+# Rust build artifacts, packages & backups
 /target/
 **/*.rs.bk
+*.deb
+*.rpm
+*.tar.gz
+*.tar.bz2
+SHA256SUMS
+SHA256SUMS.asc
 # Note: Cargo.lock is intentionally tracked for reproducible binary builds
-# Environment files & local overrides (keep .env.example tracked)
+# Environment files & local overrides (keep tracked example templates only)
 .env
 .env.*
 *.env
 !.env.example
+!deploy/docker/.env.docker.example
 
 # SQLite databases, lockfiles & WAL journals
 *.db

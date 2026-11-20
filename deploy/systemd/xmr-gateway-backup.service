@@ -1,0 +1,37 @@
+[Unit]
+Description=xmr-gateway Online SQLite Hot Backup (0600 + PRAGMA integrity_check)
+Documentation=https://github.com/XeonIT-dev/xmr-gateway
+After=xmr-gateway.service
+
+[Service]
+Type=oneshot
+User=xmr-gateway
+Group=xmr-gateway
+WorkingDirectory=/var/lib/xmr-gateway
+UMask=0077
+
+# Uses SQLite Online Backup API (never raw `cp` on an active WAL DB), enforces 0600,
+# and verifies PRAGMA integrity_check before succeeding.
+ExecStart=/usr/bin/xmr-gateway-admin --env /etc/xmr-gateway/.env db backup /var/lib/xmr-gateway/backups
+
+# Systemd Sandboxing & Least-Privilege Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/xmr-gateway

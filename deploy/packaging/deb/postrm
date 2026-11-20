@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+#DEBHELPER#
+
+case "${1:-}" in
+    remove|purge|upgrade)
+        if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+            systemctl daemon-reload || true
+        fi
+        if [ "${1:-}" = "remove" ] || [ "${1:-}" = "purge" ]; then
+            echo "NOTE: Preserved /var/lib/xmr-gateway (SQLite DB & wallet keys) and /etc/xmr-gateway/.env." >&2
+            echo "      Remove them manually only after backing up funds and mnemonic seeds." >&2
+        fi
+        ;;
+esac
+
+exit 0

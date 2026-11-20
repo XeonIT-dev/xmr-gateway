@@ -296,23 +296,27 @@ curl -s -X POST http://127.0.0.1:8080/api/v1/invoices/3c8e0f18-7d66-4c31-97a0-6e
 
 ---
 
-## Hardened Production Systemd Deployment (`XMR-037`)
+## Production Deployment, Packages & Releases (`XMR-037`)
 
-Production service profiles are provided under `deploy/systemd/`:
+> For complete instructions across all deployment modes, cryptographic release verification (`SHA256SUMS`, GPG, GitHub Build Provenance Attestations), and reverse proxy hardening, see **[DEPLOY_EN.md](DEPLOY_EN.md)** (English) / **[DEPLOY_RU.md](DEPLOY_RU.md)** (Русский).
 
-- `deploy/systemd/monero-wallet-rpc.service`
-- `deploy/systemd/xmr-gateway.service`
+### Quick One-Line Installer (Linux `x86_64` & `aarch64`)
+
+Automatically selects `.deb` (Debian/Ubuntu), `.rpm` (Fedora/RHEL), or binary `.tar.gz`, enforcing fail-closed `SHA256SUMS` verification (and optional GPG verification via `--require-gpg`):
 
 ```bash
-sudo useradd --system --home-dir /var/lib/xmr-gateway --shell /usr/sbin/nologin xmr-gateway
-sudo install -d -o xmr-gateway -g xmr-gateway -m 0700 /var/lib/xmr-gateway /var/lib/xmr-gateway/wallet
-sudo install -d -m 0750 -o root -g xmr-gateway /etc/xmr-gateway
-sudo install -m 0640 -o root -g xmr-gateway .env /etc/xmr-gateway/xmr-gateway.env
-sudo install -m 0755 target/release/xmr-gateway /usr/local/bin/xmr-gateway
-sudo cp deploy/systemd/*.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now monero-wallet-rpc xmr-gateway
+curl -fsSL https://raw.githubusercontent.com/XeonIT-dev/xmr-gateway/main/scripts/install.sh -o install.sh
+bash install.sh --dry-run
+sudo bash install.sh
 ```
+
+### Deployment Artifacts Included
+
+- **GitHub Releases (`.deb`, `.rpm`, `.tar.gz`):** Prebuilt native Linux `x86_64` & `aarch64` packages installing `/usr/bin/xmr-gateway`, `/usr/bin/xmr-gateway-admin`, and hardened `systemd` units (never overwriting `/etc/xmr-gateway/.env` or deleting `/var/lib/xmr-gateway`).
+- **Systemd Units (`deploy/systemd/`):** `monero-wallet-rpc.service` (RAM-only `0600` `/run/xmr-gateway/wallet-rpc.conf` preventing password leaks in `ps`), `xmr-gateway.service` (`KillSignal=SIGTERM`, `TimeoutStopSec=30`), and daily hot SQLite backup timer (`xmr-gateway-backup.service` + `xmr-gateway-backup.timer`).
+- **Reverse Proxy (`deploy/reverse-proxy/`):** Ready-to-use `Caddyfile` (automatic Let's Encrypt HTTPS) and `nginx-xmr-gateway.conf` (TLS 1.2/1.3 + operator route IP allowlist examples).
+- **Docker Compose (`Containerfile`, `deploy/docker/`):** Multi-stage rootless-UID (`10001`) gateway image + SHA256-verified `Containerfile.monero-rpc`, isolated `xmr_internal` network (port `18082` never published), loopback-only `127.0.0.1:8080`, `read_only: true`, `cap_drop: [ALL]`, optional `--profile caddy`.
+- **Rootless Podman Quadlet (`deploy/podman/quadlet/`):** Native `systemd --user` Quadlet units with `UserNS=keep-id:uid=10001,gid=10001` and Fedora/RHEL SELinux `:Z` volume relabeling.
 
 ---
 

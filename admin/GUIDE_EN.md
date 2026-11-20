@@ -43,20 +43,22 @@ Inside the main interactive menu, press **`L`** to toggle `EN ↔ RU` instantane
 - **`[MAINNET]` Safety Guard:** when `MONERO_NETWORK=mainnet`, all financial or destructive actions (`transfer`, `sweep`, `sweep-all`, `resolve`, `rotate-keys`, `stop`, `set-mode`, `db shell --rw`) display a red `[MAINNET]` warning banner and require typing **`yes`** explicitly (or passing `--yes`). Non-interactive calls without `--yes` fail closed.
 - **Zero-Argv-Leak Secret Passing:** `API_SECRET_KEY`, `OPERATOR_API_KEY`, `MONERO_RPC_PASS`, and `MONERO_DAEMON_RPC_PASS` are passed to `curl` strictly via stdin (`curl --config -`) so secrets never appear in `ps aux`.
 
+- **System-Wide Package Installs (`.deb` / `.rpm` / tarball):** once installed from a system package, invoke **`xmr-gateway-admin`** (`/usr/bin/xmr-gateway-admin` → `/usr/share/xmr-gateway/admin.sh`). When `--env` is omitted and no local `.env` exists, it automatically uses `/etc/xmr-gateway/.env` and stores `.admin_lang` in `/var/lib/xmr-gateway` or `~/.local/state/xmr-gateway/` (never attempting writes into read-only `/usr/share/xmr-gateway`). See [DEPLOY_EN.md](../DEPLOY_EN.md) for full `systemd`, Docker Compose, Podman Quadlet, and package instructions.
+
 ---
 
 ## 2. Service Lifecycle (`service`)
 
 | Command | Description |
 |---|---|
-| `./admin.sh service start` | Starts `monero-wallet-rpc` (waits for `get_version`), then `target/release/xmr-gateway` (waits for `GET /health`), writing `0600` PID files to `data/pids/`. |
+| `./admin.sh service start` | Starts `monero-wallet-rpc` (waits for `get_version`), then `xmr-gateway` (`target/release` or system `/usr/bin/xmr-gateway`), writing `0600` PID files to `data/pids/`. |
 | `./admin.sh service stop` | Sends `SIGTERM` to `xmr-gateway` first (up to 25s wait so workers exit and `PRAGMA wal_checkpoint(TRUNCATE)` finishes before `.lock` drops), then stops `monero-wallet-rpc`. |
 | `./admin.sh service restart` | Clean `stop` followed by `start`. |
 | `./admin.sh service status [--json]` | Shows PIDs, endpoints, `/health` status, and `monero-wallet-rpc` version. |
 | `./admin.sh service logs [gateway\|rpc\|cli] [-f] [-n N]` | Shows last `N` lines (default `gateway`, `50`) or live-tails (`-f`). |
 | `./admin.sh service build` | Builds the locked release binary (`cargo build --release --locked`). |
 | `./admin.sh service setup-rpc` | Installs and SHA256-verifies official Monero CLI tools via `./start.sh --setup-rpc`. |
-| `./admin.sh service systemd [status\|install-dry-run\|restart]` | Inspects or restarts units from `deploy/systemd/` (`install-dry-run` prints the installation plan without modifying the host). |
+| `./admin.sh service systemd [status\|install-dry-run\|restart]` | Inspects or restarts all `deploy/systemd/` units (`monero-wallet-rpc.service`, `xmr-gateway.service`, `xmr-gateway-backup.service` + `.timer`, aligned with `/etc/xmr-gateway/.env`, `UMask=0077`, `KillSignal=SIGTERM`). |
 
 ---
 

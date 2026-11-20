@@ -1,0 +1,48 @@
+# ==============================================================================
+# Rootless Podman Quadlet — xmr-gateway Container
+# ==============================================================================
+# Install to: ~/.config/containers/systemd/xmr-gateway.container
+# Prerequisites:
+#   podman build -t localhost/xmr-gateway:latest -f Containerfile .
+#   systemctl --user daemon-reload && systemctl --user enable --now monero-wallet-rpc xmr-gateway
+# ==============================================================================
+
+[Unit]
+Description=xmr-gateway Payment Gateway Container (rootless Podman Quadlet)
+After=network-online.target monero-wallet-rpc.service
+Wants=network-online.target monero-wallet-rpc.service
+
+[Container]
+Image=localhost/xmr-gateway:latest
+ContainerName=xmr-gateway
+EnvironmentFile=%h/.config/xmr-gateway/gateway.env
+Environment=HOST=0.0.0.0
+Environment=PORT=8080
+Environment=DATABASE_URL=sqlite:///data/xmr_gateway.db
+Environment=MONERO_RPC_URL=http://xmr-gateway-wallet-rpc:18082/json_rpc
+
+# Bind strictly to host loopback; expose externally only behind Caddy/Nginx TLS
+PublishPort=127.0.0.1:8080:8080
+
+# Map host user UID directly to container UID 10001 (0600/0700 DB & WAL permissions preserved)
+UserNS=keep-id:uid=10001,gid=10001
+
+# Private SELinux relabel (:Z) for Fedora/RHEL
+Volume=%h/.local/share/xmr-gateway:/data:Z
+Tmpfs=/tmp:rw,noexec,nosuid,size=64m
+
+Network=xmr-gateway-internal.network
+Network=pasta
+
+ReadOnly=true
+DropCapability=ALL
+NoNewPrivileges=true
+SecurityLabelDisable=false
+
+[Service]
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

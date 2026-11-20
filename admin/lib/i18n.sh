@@ -47,8 +47,30 @@ i18n_normalize_lang() {
 }
 
 i18n_state_file() {
-    local state_dir="${ADMIN_STATE_DIR:-$_I18N_REPO_ROOT/data}"
-    printf '%s/.admin_lang\n' "${state_dir%/}"
+    if [[ -n "${ADMIN_STATE_DIR:-}" ]]; then
+        printf '%s/.admin_lang\n' "${ADMIN_STATE_DIR%/}"
+        return 0
+    fi
+
+    # Local git checkout / writable installation directory
+    if [[ -d "$_I18N_REPO_ROOT/data" && -w "$_I18N_REPO_ROOT/data" ]]; then
+        printf '%s/data/.admin_lang\n' "$_I18N_REPO_ROOT"
+        return 0
+    fi
+    if [[ -w "$_I18N_REPO_ROOT" ]]; then
+        printf '%s/data/.admin_lang\n' "$_I18N_REPO_ROOT"
+        return 0
+    fi
+
+    # Read-only system install (e.g. /usr/share/xmr-gateway): use /var/lib/xmr-gateway
+    # when writable (xmr-gateway user or root), else XDG user state directory.
+    if [[ -d "/var/lib/xmr-gateway" && -w "/var/lib/xmr-gateway" ]]; then
+        printf '/var/lib/xmr-gateway/.admin_lang\n'
+        return 0
+    fi
+
+    local xdg_state="${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/xmr-gateway"
+    printf '%s/.admin_lang\n' "${xdg_state%/}"
 }
 
 i18n_detect_locale_lang() {
