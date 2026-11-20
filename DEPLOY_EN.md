@@ -29,12 +29,15 @@ sudo bash install.sh
 Common options:
 ```bash
 # Pin method and release version:
-sudo bash install.sh --method deb --version v0.1.0
-sudo bash install.sh --method rpm --version v0.1.0
-sudo bash install.sh --method tarball --prefix /opt/xmr-gateway --version v0.1.0
+sudo bash install.sh --method deb --version v0.1.1
+sudo bash install.sh --method rpm --version v0.1.1
+sudo bash install.sh --method tarball --prefix /opt/xmr-gateway --version v0.1.1
+
+# Unprivileged tarball install into your home directory (no sudo required):
+bash install.sh --method tarball --prefix "$HOME/xmr-gateway" --version v0.1.1
 
 # Enforce fail-closed GPG verification of SHA256SUMS.asc:
-sudo bash install.sh --version v0.1.0 --gpg-key ./RELEASE_SIGNING_KEY.asc --require-gpg
+sudo bash install.sh --version v0.1.1 --gpg-key ./RELEASE_SIGNING_KEY.asc --require-gpg
 ```
 
 ### 2.2. Manual Cryptographic Release Verification
@@ -48,7 +51,7 @@ gpg --import RELEASE_SIGNING_KEY.asc
 gpg --verify SHA256SUMS.asc SHA256SUMS
 
 # 3. Verify GitHub Build Provenance Attestation (requires GitHub CLI `gh`)
-gh attestation verify xmr-gateway_0.1.0_amd64.deb --owner XeonIT-dev
+gh attestation verify xmr-gateway_0.1.1_amd64.deb --owner XeonIT-dev
 ```
 
 ---
@@ -58,37 +61,44 @@ gh attestation verify xmr-gateway_0.1.0_amd64.deb --owner XeonIT-dev
 ### 3.1. Installing `.deb` or `.rpm`
 ```bash
 # Debian / Ubuntu:
-sudo apt-get install -y ./xmr-gateway_0.1.0_amd64.deb
+sudo apt-get install -y ./xmr-gateway_0.1.1_amd64.deb
 
 # Fedora / RHEL / Rocky:
-sudo dnf install -y ./xmr-gateway-0.1.0-1.x86_64.rpm
+sudo dnf install -y ./xmr-gateway-0.1.1-1.x86_64.rpm
 ```
 The package automatically:
 - creates system group & user `xmr-gateway` (`/usr/sbin/nologin`);
 - creates `/var/lib/xmr-gateway`, `/var/lib/xmr-gateway/wallet`, `/var/lib/xmr-gateway/backups` (`0700`, `xmr-gateway:xmr-gateway`) and `/etc/xmr-gateway` (`0750`, `root:xmr-gateway`);
 - seeds `/etc/xmr-gateway/.env` (`0600`) from `/etc/xmr-gateway/env.example` **only if it does not already exist** (upgrades never overwrite your `.env`!);
-- installs `/usr/bin/xmr-gateway`, `/usr/bin/xmr-gateway-admin` (`/usr/share/xmr-gateway/`), and hardened units in `/usr/lib/systemd/system/`.
+- installs `/usr/bin/xmr-gateway`, `/usr/bin/xmr-gateway-admin` (`/usr/share/xmr-gateway/`, including `start.sh`), and hardened units in `/usr/lib/systemd/system/`.
 
-### 3.2. Configuring `/etc/xmr-gateway/.env` & View-Only Wallet
-1. Generate fresh distinct secrets (`API_SECRET_KEY != OPERATOR_API_KEY`, `WEBHOOK_SECRET`, `MONERO_RPC_PASS`):
+### 3.2. Configuring `/etc/xmr-gateway/.env` & Wallet Initialization
+1. Generate all 4 fresh distinct secrets (`API_SECRET_KEY`, `OPERATOR_API_KEY`, `WEBHOOK_SECRET`, `MONERO_RPC_PASS`):
    ```bash
-   sudo -u xmr-gateway xmr-gateway-admin --env /etc/xmr-gateway/.env config rotate-keys all
-   sudo -u xmr-gateway xmr-gateway-admin --env /etc/xmr-gateway/.env config rotate-keys operator
+   sudo xmr-gateway-admin --env /etc/xmr-gateway/.env config rotate-keys all
    ```
 2. Edit `/etc/xmr-gateway/.env` (keep `0600`):
    - `DATABASE_URL=sqlite:///var/lib/xmr-gateway/xmr_gateway.db`
-   - `MONERO_NETWORK=mainnet`, `WALLET_MODE=view_only`, `ENABLE_AUTO_SWEEP=false`
+   - `MONERO_NETWORK=mainnet` (or `stagenet` / `testnet`; leaving `MONERO_REMOTE_NODE=` empty auto-selects a network-appropriate default node)
+   - `WALLET_MODE=view_only`, `ENABLE_AUTO_SWEEP=false` (or `WALLET_MODE=hot_wallet` + `ENABLE_AUTO_SWEEP=true` + `COLD_WALLET_ADDRESS=...`)
    - `ALLOW_PRIVATE_WEBHOOKS=false`, `REQUIRE_HTTPS_WEBHOOKS=true`
    - `REQUIRED_CONFIRMATIONS=10`, `SETTLEMENT_CONFIRMATIONS=15`
    - `MONERO_VIEW_ONLY_ADDRESS=...`, `MONERO_VIEW_ONLY_KEY=...`, `WALLET_RESTORE_HEIGHT=...`
    - configure `MONERO_DAEMON_RPC_URL` if you plan to use `allow_resweep` incident resolution (`AUDIT-001`).
-3. Install SHA256-verified official `monero-wallet-rpc` & `monero-wallet-cli` into `/usr/local/bin/` and initialize the watch-only wallet:
+3. Install SHA256-verified official `monero-wallet-rpc` & `monero-wallet-cli` into `/usr/local/bin/`:
    ```bash
-   sudo -u xmr-gateway xmr-gateway-admin --env /etc/xmr-gateway/.env wallet create-view-only
+   sudo xmr-gateway-admin service setup-rpc
    ```
-4. Validate permissions, RBAC, and custody invariants (fail-closed):
+4. Initialize the wallet (automatically generates `0600` `/var/lib/xmr-gateway/wallet/gateway_wallet.password` required by `monero-wallet-rpc.service` and fixes `xmr-gateway:xmr-gateway` ownership when run via `sudo`):
    ```bash
-   sudo -u xmr-gateway xmr-gateway-admin --env /etc/xmr-gateway/.env config doctor
+   # View-Only Zero-Trust (recommended):
+   sudo xmr-gateway-admin --env /etc/xmr-gateway/.env wallet create-view-only
+   # Or Hot Auto-Sweep wallet:
+   sudo xmr-gateway-admin --env /etc/xmr-gateway/.env wallet create-hot
+   ```
+5. Validate permissions, RBAC, remote-node alignment, and custody invariants (fail-closed):
+   ```bash
+   sudo xmr-gateway-admin --env /etc/xmr-gateway/.env config doctor
    ```
 
 ### 3.3. Starting `systemd` & Daily Hot Backup Timer
@@ -120,49 +130,102 @@ Production templates live in `deploy/reverse-proxy/` (and `/usr/share/xmr-gatewa
 
 ## 4. Containers (Docker Compose & Rootless Podman Quadlet)
 
-### 4.1. Docker Compose (`deploy/docker/`)
-1. Prepare UID/GID `10001` host directories (`0700`) containing your `0600` wallet files:
+### 4.1. Docker Compose & Podman Compose (`deploy/docker/`)
+Keep `DATA_HOST_DIR` (`data/gateway`) and `WALLET_HOST_DIR` (`data/wallet`) as **non-overlapping sibling directories** so `xmr-gateway` never sees wallet key files and SELinux labels never collide.
+
+1. Prepare isolated sibling directories (`0700`) and configure environment:
    ```bash
-   mkdir -p data/wallet
-   sudo chown -R 10001:10001 data
-   chmod 700 data data/wallet
-   ```
-2. Configure environment:
-   ```bash
+   mkdir -p data/gateway data/wallet
+   chmod 700 data data/gateway data/wallet
    cp deploy/docker/.env.docker.example deploy/docker/.env.docker
    chmod 600 deploy/docker/.env.docker
    # Edit deploy/docker/.env.docker and replace all placeholder secrets!
    ```
-3. Build reproducible images (`Containerfile` + `deploy/docker/Containerfile.monero-rpc` with fail-closed SHA256 verification of official Monero CLI) and launch:
+   - **On Docker Engine:**
+     ```bash
+     sudo chown -R 10001:10001 data/gateway data/wallet
+     ```
+   - **On Rootless Podman + SELinux `Enforcing` (Fedora / RHEL):**
+     ```bash
+     chcon -Rt container_file_t data/gateway data/wallet
+     podman unshare chown -R 10001:10001 data/gateway data/wallet
+     ```
+2. Build images and initialize the wallet inside `data/wallet` (creates `gateway_wallet`, `gateway_wallet.keys`, and `0600` `gateway_wallet.password`) before starting the stack:
    ```bash
-   docker compose -f deploy/docker/docker-compose.yml --env-file deploy/docker/.env.docker up -d --build
+   # Build reproducible images (official Monero CLI verified via SHA256):
+   docker compose -f deploy/docker/docker-compose.yml --env-file deploy/docker/.env.docker build
+   # (Or with podman-compose: podman-compose -f deploy/docker/docker-compose.yml --env-file deploy/docker/.env.docker build)
+
+   # One-shot wallet initialization example (replace --stagenet / --generate-from-view-key as needed):
+   podman run --rm -it --entrypoint /bin/sh \
+     --user 10001:10001 -v "$PWD/data/wallet:/wallet:rw" \
+     localhost/docker_monero-wallet-rpc:latest -c '
+       umask 077
+       head -c 24 /dev/urandom | od -An -tx1 | tr -d " \n" > /wallet/gateway_wallet.password
+       chmod 600 /wallet/gateway_wallet.password
+       printf "N\n" | /usr/local/bin/monero-wallet-cli --offline --stagenet \
+         --generate-new-wallet /wallet/gateway_wallet \
+         --password-file /wallet/gateway_wallet.password \
+         --restore-height 1600000 --mnemonic-language English --command address
+       chmod 600 /wallet/gateway_wallet*
+     '
+   ```
+3. Launch the stack:
+   ```bash
+   docker compose -f deploy/docker/docker-compose.yml --env-file deploy/docker/.env.docker up -d
 
    # Optional automatic HTTPS via bundled Caddy profile:
    docker compose -f deploy/docker/docker-compose.yml --env-file deploy/docker/.env.docker --profile caddy up -d
    ```
 - `monero-wallet-rpc` port `18082` is **never** published to the host (internal-only `xmr_internal` network).
-- `xmr-gateway` binds strictly to `127.0.0.1:8080:8080`.
-- Both containers enforce non-root `10001:10001`, `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges:true`, and `stop_grace_period: 30s` for clean WAL truncation.
+- `xmr-gateway` binds strictly to `127.0.0.1:8080:8080` and includes a native Compose `healthcheck:`.
+- Both containers enforce non-root `10001:10001`, `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges:true`, and `stop_grace_period: 30s` for clean WAL truncation and wallet flush.
 
-### 4.2. Rootless Podman Quadlet (`deploy/podman/quadlet/`) — Fedora / RHEL
+### 4.2. Rootless Podman Quadlet (`deploy/podman/quadlet/`) — Fedora / RHEL (SELinux `Enforcing`)
+Quadlet maps your unprivileged user directly to UID `10001` (`UserNS=keep-id:uid=10001,gid=10001`), applies private SELinux `:Z` labels on **non-overlapping** `data/` and `wallet/` sibling directories, uses two bridge networks (`xmr-gateway-internal.network` + `xmr-gateway-egress.network`, avoiding Podman 5 `pasta`/bridge conflicts), and configures native OCI `HealthCmd=` and `StopTimeout=30`.
+
 ```bash
 # 1. Build both images as your regular unprivileged user:
 podman build -t localhost/xmr-gateway:latest -f Containerfile .
 podman build -t localhost/xmr-gateway-wallet-rpc:latest -f deploy/docker/Containerfile.monero-rpc .
 
-# 2. Prepare state/config directories (0700 / 0600):
-mkdir -p ~/.local/share/xmr-gateway/wallet ~/.config/xmr-gateway ~/.config/containers/systemd
-chmod 700 ~/.local/share/xmr-gateway ~/.local/share/xmr-gateway/wallet ~/.config/xmr-gateway
+# 2. Prepare isolated sibling directories (0700) and 0600 env file:
+mkdir -p ~/.local/share/xmr-gateway/data ~/.local/share/xmr-gateway/wallet ~/.config/xmr-gateway ~/.config/containers/systemd
+chmod 700 ~/.local/share/xmr-gateway ~/.local/share/xmr-gateway/data ~/.local/share/xmr-gateway/wallet ~/.config/xmr-gateway
 cp deploy/docker/.env.docker.example ~/.config/xmr-gateway/gateway.env
 chmod 600 ~/.config/xmr-gateway/gateway.env
-# Populate secrets in ~/.config/xmr-gateway/gateway.env and place wallet files in ~/.local/share/xmr-gateway/wallet/
+# Edit ~/.config/xmr-gateway/gateway.env and replace all placeholder secrets!
 
-# 3. Install Quadlet units (SELinux :Z labels and UserNS=keep-id:uid=10001,gid=10001 included):
-cp deploy/podman/quadlet/* ~/.config/containers/systemd/
+# 3. Initialize the wallet in ~/.local/share/xmr-gateway/wallet/ using a one-shot container
+#    (creates gateway_wallet* and 0600 gateway_wallet.password; use --generate-from-view-key for view_only):
+podman run --rm -it --entrypoint /bin/sh \
+  --userns=keep-id:uid=10001,gid=10001 --user 10001:10001 \
+  -v "$HOME/.local/share/xmr-gateway/wallet:/wallet:Z" \
+  localhost/xmr-gateway-wallet-rpc:latest -c '
+    umask 077
+    head -c 24 /dev/urandom | od -An -tx1 | tr -d " \n" > /wallet/gateway_wallet.password
+    chmod 600 /wallet/gateway_wallet.password
+    printf "N\n" | /usr/local/bin/monero-wallet-cli --offline \
+      --generate-new-wallet /wallet/gateway_wallet \
+      --password-file /wallet/gateway_wallet.password \
+      --restore-height 3280000 --mnemonic-language English --command address
+    chmod 600 /wallet/gateway_wallet*
+  '
+
+# 4. Install ALL 4 Quadlet units (internal + egress networks + both containers):
+cp deploy/podman/quadlet/xmr-gateway-internal.network \
+   deploy/podman/quadlet/xmr-gateway-egress.network \
+   deploy/podman/quadlet/monero-wallet-rpc.container \
+   deploy/podman/quadlet/xmr-gateway.container \
+   ~/.config/containers/systemd/
+
+# 5. Reload and start (Quadlet units are generated dynamically — do NOT run `systemctl --user enable`;
+#    boot autostart is already wired via `[Install] WantedBy=default.target` + linger):
 systemctl --user daemon-reload
-systemctl --user enable --now monero-wallet-rpc.service xmr-gateway.service
+systemctl --user start monero-wallet-rpc.service xmr-gateway.service
+systemctl --user status monero-wallet-rpc.service xmr-gateway.service
 
-# 4. Enable lingering so rootless services persist across logouts:
+# 6. Enable lingering so rootless services persist across logouts and reboots:
 loginctl enable-linger "$USER"
 ```
 
@@ -196,13 +259,13 @@ Configure repository secrets:
 
 ### Cutting a New Release (3 Commands)
 ```bash
-# 1. Confirm Cargo.toml version matches the tag (e.g. 0.1.0) on up-to-date main:
+# 1. Confirm Cargo.toml version matches the tag (e.g. 0.1.1) on up-to-date main:
 git checkout main && git pull --ff-only
 
 # 2. Create a (signed) annotated tag:
-git tag -s v0.1.0 -m "Release v0.1.0"
+git tag -s v0.1.1 -m "Release v0.1.1"
 
 # 3. Push the tag to trigger the automated Release workflow:
-git push origin v0.1.0
+git push origin v0.1.1
 ```
 To test packaging end-to-end without publishing a release, trigger **Actions → Release → Run workflow** with `dry_run: true`.

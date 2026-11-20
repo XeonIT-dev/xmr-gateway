@@ -221,9 +221,9 @@ load_env() {
     : "${MONERO_DAEMON_RPC_PASS:=}"
     : "${ALLOW_UNAUTHENTICATED_RPC:=false}"
     : "${ALLOW_INSECURE_REMOTE_RPC:=false}"
-    : "${MONERO_REMOTE_NODE:=xmr-node.cakewallet.com:18081}"
+    : "${MONERO_REMOTE_NODE:=}"
     : "${MONERO_TRUSTED_DAEMON:=false}"
-    : "${WALLET_RESTORE_HEIGHT:=3280000}"
+    : "${WALLET_RESTORE_HEIGHT:=}"
     : "${MONERO_RPC_PROXY:=}"
     : "${ENABLE_AUTO_SWEEP:=false}"
     : "${ALLOW_HOT_WALLET_WITHOUT_SWEEP:=false}"
@@ -241,6 +241,12 @@ load_env() {
     : "${LOG_FORMAT:=json}"
 
     MONERO_NETWORK="${MONERO_NETWORK,,}"
+    if [[ -z "${MONERO_REMOTE_NODE:-}" ]]; then
+        MONERO_REMOTE_NODE="$(default_remote_node_for_network "$MONERO_NETWORK")"
+    fi
+    if [[ -z "${WALLET_RESTORE_HEIGHT:-}" ]]; then
+        WALLET_RESTORE_HEIGHT="$(default_restore_height_for_network "$MONERO_NETWORK")"
+    fi
     if [[ -z "${WALLET_MODE:-}" ]]; then
         if is_truthy "$ENABLE_AUTO_SWEEP"; then
             WALLET_MODE="hot_wallet"
@@ -278,7 +284,23 @@ load_env() {
     ADMIN_ENV_LOADED=1
     export ACTIVE_ENV_FILE GATEWAY_BASE_URL DB_PATH DATA_DIR WALLET_DIR WALLET_FILE WALLET_PASS_FILE
     export RPC_LOG_FILE CLI_LOG_FILE GATEWAY_LOG_FILE PID_DIR RPC_PID_FILE GATEWAY_PID_FILE
-    export GATEWAY_BIN BIN_DIR WALLET_MODE MONERO_NETWORK
+    export GATEWAY_BIN BIN_DIR WALLET_MODE MONERO_NETWORK MONERO_REMOTE_NODE WALLET_RESTORE_HEIGHT
+}
+
+default_remote_node_for_network() {
+    case "${1:-mainnet}" in
+        stagenet) printf 'node.monerodevs.org:38089\n' ;;
+        testnet)  printf 'testnet.xmr-tw.org:28081\n' ;;
+        *)        printf 'xmr-node.cakewallet.com:18081\n' ;;
+    esac
+}
+
+default_restore_height_for_network() {
+    case "${1:-mainnet}" in
+        stagenet) printf '1600000\n' ;;
+        testnet)  printf '2600000\n' ;;
+        *)        printf '3280000\n' ;;
+    esac
 }
 
 is_truthy() {

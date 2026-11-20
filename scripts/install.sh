@@ -111,7 +111,7 @@ validate_version() {
         return 0
     fi
     if [[ ! "$v" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-        die "$(msg "Invalid --version '${v}': must be 'latest' or semantic tag like 'v0.1.0'." "Некорректная версия --version '${v}': ожидается 'latest' или тег вида 'v0.1.0'.")"
+        die "$(msg "Invalid --version '${v}': must be 'latest' or semantic tag like 'v0.1.1'." "Некорректная версия --version '${v}': ожидается 'latest' или тег вида 'v0.1.1'.")"
     fi
 }
 
@@ -243,29 +243,101 @@ install_tarball() {
     top_dir="$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
     [[ -n "$top_dir" && -x "$top_dir/xmr-gateway" ]] || die "Invalid tarball layout: missing xmr-gateway binary."
 
-    run_as_root install -d -m 0755 "$PREFIX" "$PREFIX/admin" "$PREFIX/admin/lib" "$PREFIX/admin/i18n"
-    run_as_root cp -a "$top_dir/." "$PREFIX/"
-    run_as_root chmod 0755 "$PREFIX/xmr-gateway" "$PREFIX/admin.sh"
-    run_as_root ln -sfn "$PREFIX/xmr-gateway" /usr/local/bin/xmr-gateway
-    run_as_root ln -sfn "$PREFIX/admin.sh" /usr/local/bin/xmr-gateway-admin
-    log_info "$(msg "Installed tarball into ${PREFIX} and linked /usr/local/bin/xmr-gateway{,-admin}." "Архив установлен в ${PREFIX}, созданы ссылки /usr/local/bin/xmr-gateway{,-admin}.")"
+    local parent_dir
+    parent_dir="$(dirname "$PREFIX")"
+    if [[ "$(id -u)" -ne 0 ]] && { [[ -d "$PREFIX" && -w "$PREFIX" ]] || [[ -d "$parent_dir" && -w "$parent_dir" ]]; }; then
+        install -d -m 0755 "$PREFIX" "$PREFIX/admin" "$PREFIX/admin/lib" "$PREFIX/admin/i18n"
+        cp -a "$top_dir/." "$PREFIX/"
+        chmod 0755 "$PREFIX/xmr-gateway" "$PREFIX/admin.sh"
+        if [[ -f "$PREFIX/start.sh" ]]; then
+            chmod 0755 "$PREFIX/start.sh"
+        fi
+        if [[ -w /usr/local/bin ]]; then
+            ln -sfn "$PREFIX/xmr-gateway" /usr/local/bin/xmr-gateway
+            ln -sfn "$PREFIX/admin.sh" /usr/local/bin/xmr-gateway-admin
+        fi
+        log_info "$(msg "Installed tarball into ${PREFIX}." "Архив установлен в ${PREFIX}.")"
+    else
+        run_as_root install -d -m 0755 "$PREFIX" "$PREFIX/admin" "$PREFIX/admin/lib" "$PREFIX/admin/i18n"
+        run_as_root cp -a "$top_dir/." "$PREFIX/"
+        run_as_root chmod 0755 "$PREFIX/xmr-gateway" "$PREFIX/admin.sh"
+        if [[ -f "$PREFIX/start.sh" ]]; then
+            run_as_root chmod 0755 "$PREFIX/start.sh"
+        fi
+        run_as_root ln -sfn "$PREFIX/xmr-gateway" /usr/local/bin/xmr-gateway
+        run_as_root ln -sfn "$PREFIX/admin.sh" /usr/local/bin/xmr-gateway-admin
+        log_info "$(msg "Installed tarball into ${PREFIX} and linked /usr/local/bin/xmr-gateway{,-admin}." "Архив установлен в ${PREFIX}, созданы ссылки /usr/local/bin/xmr-gateway{,-admin}.")"
+    fi
 }
 
 print_next_steps() {
+    if [[ "$METHOD" == "tarball" ]]; then
+        if [[ "$INSTALL_LANG" == "ru" ]]; then
+            cat <<EOF
+
+==============================================================================
+Установка xmr-gateway (tarball -> ${PREFIX}) завершена! Что сделать дальше:
+  1. Создайте 0600 конфигурацию из шаблона:
+       cd "${PREFIX}" && cp .env.example .env && chmod 600 .env
+  2. Сгенерируйте сильные раздельные секреты (включая OPERATOR_API_KEY):
+       "${PREFIX}/admin.sh" --env "${PREFIX}/.env" config rotate-keys all
+  3. Отредактируйте ${PREFIX}/.env (WALLET_MODE, MONERO_NETWORK, MONERO_VIEW_ONLY_ADDRESS/KEY
+     либо COLD_WALLET_ADDRESS для hot_wallet; MONERO_REMOTE_NODE подберётся по сети автоматически).
+  4. Установите официальный Monero CLI с SHA256-проверкой:
+       "${PREFIX}/admin.sh" service setup-rpc
+  5. Создайте кошелёк (и 0600 файл пароля gateway_wallet.password):
+       "${PREFIX}/admin.sh" --env "${PREFIX}/.env" wallet create-view-only
+       # или для hot auto-sweep режима:
+       "${PREFIX}/admin.sh" --env "${PREFIX}/.env" wallet create-hot
+  6. Проверьте конфигурацию и запустите сервисы:
+       "${PREFIX}/admin.sh" --env "${PREFIX}/.env" config doctor
+       "${PREFIX}/admin.sh" --env "${PREFIX}/.env" service start
+==============================================================================
+EOF
+        else
+            cat <<EOF
+
+==============================================================================
+xmr-gateway tarball installation (${PREFIX}) complete! Next steps:
+  1. Create a 0600 environment file from the template:
+       cd "${PREFIX}" && cp .env.example .env && chmod 600 .env
+  2. Generate fresh distinct secrets (including OPERATOR_API_KEY):
+       "${PREFIX}/admin.sh" --env "${PREFIX}/.env" config rotate-keys all
+  3. Edit ${PREFIX}/.env (WALLET_MODE, MONERO_NETWORK, MONERO_VIEW_ONLY_ADDRESS/KEY
+     or COLD_WALLET_ADDRESS for hot_wallet; MONERO_REMOTE_NODE auto-selects per network).
+  4. Install SHA256-verified official Monero CLI binaries:
+       "${PREFIX}/admin.sh" service setup-rpc
+  5. Initialize the wallet (automatically creates 0600 gateway_wallet.password):
+       "${PREFIX}/admin.sh" --env "${PREFIX}/.env" wallet create-view-only
+       # or for hot auto-sweep mode:
+       "${PREFIX}/admin.sh" --env "${PREFIX}/.env" wallet create-hot
+  6. Run fail-closed diagnostics and start services:
+       "${PREFIX}/admin.sh" --env "${PREFIX}/.env" config doctor
+       "${PREFIX}/admin.sh" --env "${PREFIX}/.env" service start
+==============================================================================
+EOF
+        fi
+        return 0
+    fi
+
     if [[ "$INSTALL_LANG" == "ru" ]]; then
         cat <<'EOF'
 
 ==============================================================================
-Установка xmr-gateway завершена! Что сделать дальше:
+Установка xmr-gateway (systemd-пакет) завершена! Что сделать дальше:
   1. Сгенерируйте сильные раздельные секреты (API_SECRET_KEY != OPERATOR_API_KEY):
        sudo xmr-gateway-admin --env /etc/xmr-gateway/.env config rotate-keys all
   2. Отредактируйте /etc/xmr-gateway/.env (WALLET_MODE=view_only, MONERO_NETWORK,
-     OPERATOR_API_KEY, MONERO_REMOTE_NODE, MONERO_VIEW_ONLY_ADDRESS/KEY).
-  3. Установите monero-wallet-rpc в /usr/local/bin/monero-wallet-rpc и создайте
-     кошелёк в /var/lib/xmr-gateway/wallet/ (см. DEPLOY_RU.md).
-  4. Проверьте безопасность и права:
+     MONERO_VIEW_ONLY_ADDRESS/KEY; MONERO_REMOTE_NODE подберётся по сети автоматически).
+  3. Установите SHA256-проверенный monero-wallet-rpc в /usr/local/bin/:
+       sudo xmr-gateway-admin service setup-rpc
+  4. Создайте кошелёк и 0600 файл пароля gateway_wallet.password в /var/lib/xmr-gateway/wallet/:
+       sudo xmr-gateway-admin --env /etc/xmr-gateway/.env wallet create-view-only
+       # или для hot_wallet режима:
+       sudo xmr-gateway-admin --env /etc/xmr-gateway/.env wallet create-hot
+  5. Проверьте безопасность и права:
        sudo xmr-gateway-admin --env /etc/xmr-gateway/.env config doctor
-  5. Включите и запустите сервисы:
+  6. Включите и запустите сервисы:
        sudo systemctl enable --now monero-wallet-rpc.service xmr-gateway.service
        sudo systemctl enable --now xmr-gateway-backup.timer   # ежедневный горячий бэкап
 ==============================================================================
@@ -274,16 +346,20 @@ EOF
         cat <<'EOF'
 
 ==============================================================================
-xmr-gateway installation complete! Next steps:
+xmr-gateway systemd package installation complete! Next steps:
   1. Generate fresh distinct secrets (API_SECRET_KEY != OPERATOR_API_KEY):
        sudo xmr-gateway-admin --env /etc/xmr-gateway/.env config rotate-keys all
   2. Configure /etc/xmr-gateway/.env (WALLET_MODE=view_only, MONERO_NETWORK,
-     OPERATOR_API_KEY, MONERO_REMOTE_NODE, MONERO_VIEW_ONLY_ADDRESS/KEY).
-  3. Install monero-wallet-rpc into /usr/local/bin/monero-wallet-rpc and create
-     the wallet in /var/lib/xmr-gateway/wallet/ (see DEPLOY_EN.md).
-  4. Run the fail-closed security check:
+     MONERO_VIEW_ONLY_ADDRESS/KEY; MONERO_REMOTE_NODE auto-selects per network).
+  3. Install SHA256-verified official monero-wallet-rpc into /usr/local/bin/:
+       sudo xmr-gateway-admin service setup-rpc
+  4. Initialize the wallet and 0600 gateway_wallet.password in /var/lib/xmr-gateway/wallet/:
+       sudo xmr-gateway-admin --env /etc/xmr-gateway/.env wallet create-view-only
+       # or for hot_wallet mode:
+       sudo xmr-gateway-admin --env /etc/xmr-gateway/.env wallet create-hot
+  5. Run the fail-closed security check:
        sudo xmr-gateway-admin --env /etc/xmr-gateway/.env config doctor
-  5. Enable and start services:
+  6. Enable and start services:
        sudo systemctl enable --now monero-wallet-rpc.service xmr-gateway.service
        sudo systemctl enable --now xmr-gateway-backup.timer   # daily hot SQLite backup
 ==============================================================================
@@ -333,7 +409,11 @@ main() {
         printf '  Artifact URL    : %s/%s\n' "$base_url" "$sample_artifact"
         printf '  Checksums URL   : %s/SHA256SUMS\n' "$base_url"
         printf '  SHA256 Check    : MANDATORY (fail-closed)\n'
-        printf '  GPG Check       : %s%s\n' "$([[ "$REQUIRE_GPG" -eq 1 ]] && echo "REQUIRED (SHA256SUMS.asc)" || echo "optional (enable via --require-gpg / --gpg-key)")" "${GPG_KEY:+ [key=$GPG_KEY]}"
+        local gpg_status="optional (enable via --require-gpg / --gpg-key)"
+        if [[ "$REQUIRE_GPG" -eq 1 ]]; then
+            gpg_status="REQUIRED (SHA256SUMS.asc)"
+        fi
+        printf '  GPG Check       : %s%s\n' "$gpg_status" "${GPG_KEY:+ [key=$GPG_KEY]}"
         if [[ "$METHOD" == "tarball" ]]; then
             printf '  Install Prefix  : %s\n' "$PREFIX"
         elif [[ "$METHOD" == "deb" ]]; then

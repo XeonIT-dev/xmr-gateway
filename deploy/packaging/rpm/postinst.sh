@@ -34,12 +34,17 @@ xmr-gateway installed! Services are NOT auto-started until secrets are set.
 Next steps:
   1. Generate strong secrets:
        sudo xmr-gateway-admin --env /etc/xmr-gateway/.env config rotate-keys all
-  2. Configure /etc/xmr-gateway/.env (WALLET_MODE, MONERO_NETWORK, OPERATOR_API_KEY, etc.).
-  3. Install monero-wallet-rpc into /usr/local/bin/monero-wallet-rpc and create
-     the wallet in /var/lib/xmr-gateway/wallet/ (see DEPLOY_EN.md / DEPLOY_RU.md).
-  4. Verify configuration:
+  2. Configure /etc/xmr-gateway/.env (WALLET_MODE, MONERO_NETWORK, MONERO_VIEW_ONLY_ADDRESS/KEY;
+     MONERO_REMOTE_NODE auto-selects per network if left empty).
+  3. Install SHA256-verified monero-wallet-rpc into /usr/local/bin/:
+       sudo xmr-gateway-admin service setup-rpc
+  4. Initialize the wallet and 0600 gateway_wallet.password in /var/lib/xmr-gateway/wallet/:
+       sudo xmr-gateway-admin --env /etc/xmr-gateway/.env wallet create-view-only
+       # or for hot_wallet mode:
+       sudo xmr-gateway-admin --env /etc/xmr-gateway/.env wallet create-hot
+  5. Verify configuration:
        sudo xmr-gateway-admin --env /etc/xmr-gateway/.env config doctor
-  5. Enable and start services:
+  6. Enable and start services:
        sudo systemctl enable --now monero-wallet-rpc.service xmr-gateway.service
        sudo systemctl enable --now xmr-gateway-backup.timer   # optional daily hot backup
 ==============================================================================

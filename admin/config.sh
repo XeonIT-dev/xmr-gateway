@@ -214,6 +214,7 @@ rpc_pass = os.environ.get("MONERO_RPC_PASS", "")
 daemon_url = os.environ.get("MONERO_DAEMON_RPC_URL", "").strip()
 daemon_user = os.environ.get("MONERO_DAEMON_RPC_USER", "").strip()
 daemon_pass = os.environ.get("MONERO_DAEMON_RPC_PASS", "")
+remote_node = os.environ.get("MONERO_REMOTE_NODE", "").strip()
 db_path = os.environ.get("DB_PATH", "").strip()
 wallet_file = os.environ.get("WALLET_FILE", "").strip()
 wallet_pass_file = os.environ.get("WALLET_PASS_FILE", "").strip()
@@ -329,6 +330,18 @@ elif daemon_user or daemon_pass:
 else:
     add("WARN", "daemon_rpc_security", "MONERO_DAEMON_RPC_URL unset (required for allow_resweep incident resolution, AUDIT-001)")
 
+if remote_node:
+    rn_low = remote_node.lower()
+    if net in ("stagenet", "testnet") and (
+        "xmr-node.cakewallet.com" in rn_low
+        or (rn_low.endswith(":18081") and "stagenet" not in rn_low and "testnet" not in rn_low)
+    ):
+        add("WARN", "remote_node_network", f"MONERO_NETWORK={net} but MONERO_REMOTE_NODE='{remote_node}' appears to target a mainnet daemon port/host")
+    elif net == "mainnet" and (rn_low.endswith(":38089") or rn_low.endswith(":38081") or rn_low.endswith(":28081")):
+        add("WARN", "remote_node_network", f"MONERO_NETWORK=mainnet but MONERO_REMOTE_NODE='{remote_node}' uses a stagenet/testnet daemon port")
+    else:
+        add("PASS", "remote_node_network", f"MONERO_REMOTE_NODE={remote_node} ({net})")
+
 # 6) SQLite DB / WAL / lock inventory
 if db_path:
     if os.path.exists(db_path):
@@ -426,6 +439,7 @@ else:
         "ssrf_policy": "Политика SSRF вебхуков",
         "rpc_auth": "Аутентификация RPC",
         "daemon_rpc_security": "Безопасность MONERO_DAEMON_RPC_URL",
+        "remote_node_network": "Соответствие MONERO_REMOTE_NODE сети",
         "sqlite_files": "Файлы SQLite / WAL / lock",
         "health_anon_privacy": "Скрытие телеметрии /health",
         "health_auth_api": "Диагностика /health (X-API-Key)",
@@ -475,7 +489,7 @@ cmd_rotate_keys() {
         API_SECRET_KEY="$new_api"
         rotated+=("API_SECRET_KEY")
     fi
-    if [[ "$scope" == "operator" || ( "$scope" == "all" && -n "${OPERATOR_API_KEY:-}" ) ]]; then
+    if [[ "$scope" == "operator" || "$scope" == "all" ]]; then
         local new_op
         new_op="$(openssl rand -hex 32)"
         while [[ "$new_op" == "${API_SECRET_KEY:-}" ]]; do

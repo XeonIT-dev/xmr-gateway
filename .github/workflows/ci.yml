@@ -63,9 +63,9 @@ jobs:
 
       - name: Validate installer dry-run across methods
         run: |
-          ./scripts/install.sh --dry-run --method deb --version v0.1.0
-          ./scripts/install.sh --dry-run --method rpm --version v0.1.0
-          ./scripts/install.sh --dry-run --method tarball --version v0.1.0
+          ./scripts/install.sh --dry-run --method deb --version v0.1.1
+          ./scripts/install.sh --dry-run --method rpm --version v0.1.1
+          ./scripts/install.sh --dry-run --method tarball --version v0.1.1
 
       - name: Validate workflow and Compose YAML syntax
         run: |

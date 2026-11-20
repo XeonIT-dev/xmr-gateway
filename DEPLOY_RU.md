@@ -29,12 +29,15 @@ sudo bash install.sh
 Дополнительные опции:
 ```bash
 # Явный метод и версия:
-sudo bash install.sh --method deb --version v0.1.0
-sudo bash install.sh --method rpm --version v0.1.0
-sudo bash install.sh --method tarball --prefix /opt/xmr-gateway --version v0.1.0
+sudo bash install.sh --method deb --version v0.1.1
+sudo bash install.sh --method rpm --version v0.1.1
+sudo bash install.sh --method tarball --prefix /opt/xmr-gateway --version v0.1.1
+
+# Непривилегированная установка tarball в домашний каталог (без sudo):
+bash install.sh --method tarball --prefix "$HOME/xmr-gateway" --version v0.1.1
 
 # Fail-closed проверка GPG-подписи SHA256SUMS.asc:
-sudo bash install.sh --version v0.1.0 --gpg-key ./RELEASE_SIGNING_KEY.asc --require-gpg
+sudo bash install.sh --version v0.1.1 --gpg-key ./RELEASE_SIGNING_KEY.asc --require-gpg
 ```
 
 ### 2.2. Ручная криптографическая верификация релиза
@@ -48,7 +51,7 @@ gpg --import RELEASE_SIGNING_KEY.asc
 gpg --verify SHA256SUMS.asc SHA256SUMS
 
 # 3. Проверка GitHub Build Provenance Attestation (требует GitHub CLI `gh`)
-gh attestation verify xmr-gateway_0.1.0_amd64.deb --owner XeonIT-dev
+gh attestation verify xmr-gateway_0.1.1_amd64.deb --owner XeonIT-dev
 ```
 
 ---
@@ -58,37 +61,44 @@ gh attestation verify xmr-gateway_0.1.0_amd64.deb --owner XeonIT-dev
 ### 3.1. Установка пакета `.deb` или `.rpm`
 ```bash
 # Debian / Ubuntu:
-sudo apt-get install -y ./xmr-gateway_0.1.0_amd64.deb
+sudo apt-get install -y ./xmr-gateway_0.1.1_amd64.deb
 
 # Fedora / RHEL / Rocky:
-sudo dnf install -y ./xmr-gateway-0.1.0-1.x86_64.rpm
+sudo dnf install -y ./xmr-gateway-0.1.1-1.x86_64.rpm
 ```
 Пакет автоматически:
 - создаёт системного пользователя и группу `xmr-gateway` (`/usr/sbin/nologin`);
 - создаёт каталоги `/var/lib/xmr-gateway`, `/var/lib/xmr-gateway/wallet`, `/var/lib/xmr-gateway/backups` (`0700`, `xmr-gateway:xmr-gateway`) и `/etc/xmr-gateway` (`0750`, `root:xmr-gateway`);
 - копирует шаблон в `/etc/xmr-gateway/.env` (`0600`) **только если файл ещё не существует** (при обновлениях существующий `.env` никогда не перезаписывается);
-- устанавливает бинарник `/usr/bin/xmr-gateway`, системную админ-панель `/usr/bin/xmr-gateway-admin` (`/usr/share/xmr-gateway/`) и юниты в `/usr/lib/systemd/system/`.
+- устанавливает бинарник `/usr/bin/xmr-gateway`, системную админ-панель `/usr/bin/xmr-gateway-admin` (`/usr/share/xmr-gateway/`, включая `start.sh`) и юниты в `/usr/lib/systemd/system/`.
 
-### 3.2. Настройка `/etc/xmr-gateway/.env` и View-Only кошелька
-1. Сгенерируйте сильные раздельные секреты (`API_SECRET_KEY != OPERATOR_API_KEY`, `WEBHOOK_SECRET`, `MONERO_RPC_PASS`):
+### 3.2. Настройка `/etc/xmr-gateway/.env` и инициализация кошелька
+1. Сгенерируйте все 4 свежих раздельных секрета (`API_SECRET_KEY`, `OPERATOR_API_KEY`, `WEBHOOK_SECRET`, `MONERO_RPC_PASS`):
    ```bash
-   sudo -u xmr-gateway xmr-gateway-admin --env /etc/xmr-gateway/.env config rotate-keys all
-   sudo -u xmr-gateway xmr-gateway-admin --env /etc/xmr-gateway/.env config rotate-keys operator
+   sudo xmr-gateway-admin --env /etc/xmr-gateway/.env config rotate-keys all
    ```
 2. Отредактируйте `/etc/xmr-gateway/.env` (права `0600`):
    - `DATABASE_URL=sqlite:///var/lib/xmr-gateway/xmr_gateway.db`
-   - `MONERO_NETWORK=mainnet`, `WALLET_MODE=view_only`, `ENABLE_AUTO_SWEEP=false`
+   - `MONERO_NETWORK=mainnet` (либо `stagenet` / `testnet`; при пустом `MONERO_REMOTE_NODE=` нода подбирается автоматически под выбранную сеть)
+   - `WALLET_MODE=view_only`, `ENABLE_AUTO_SWEEP=false` (или `WALLET_MODE=hot_wallet` + `ENABLE_AUTO_SWEEP=true` + `COLD_WALLET_ADDRESS=...`)
    - `ALLOW_PRIVATE_WEBHOOKS=false`, `REQUIRE_HTTPS_WEBHOOKS=true`
    - `REQUIRED_CONFIRMATIONS=10`, `SETTLEMENT_CONFIRMATIONS=15`
    - `MONERO_VIEW_ONLY_ADDRESS=...`, `MONERO_VIEW_ONLY_KEY=...`, `WALLET_RESTORE_HEIGHT=...`
    - при использовании `allow_resweep` — задайте `MONERO_DAEMON_RPC_URL` (`AUDIT-001`).
-3. Установите официальные бинарники Monero CLI (`monero-wallet-rpc` и `monero-wallet-cli`) с проверкой SHA256 в `/usr/local/bin/` и создайте watch-only кошелёк от пользователя `xmr-gateway`:
+3. Установите официальные бинарники Monero CLI (`monero-wallet-rpc` и `monero-wallet-cli`) с проверкой SHA256 в `/usr/local/bin/`:
    ```bash
-   sudo -u xmr-gateway xmr-gateway-admin --env /etc/xmr-gateway/.env wallet create-view-only
+   sudo xmr-gateway-admin service setup-rpc
    ```
-4. Проверьте конфигурацию и права (fail-closed):
+4. Инициализируйте кошелёк (команда автоматически создаёт `0600`-файл `/var/lib/xmr-gateway/wallet/gateway_wallet.password`, требуемый `monero-wallet-rpc.service`, и выставляет владельца `xmr-gateway:xmr-gateway` при запуске через `sudo`):
    ```bash
-   sudo -u xmr-gateway xmr-gateway-admin --env /etc/xmr-gateway/.env config doctor
+   # View-Only Zero-Trust (рекомендуется):
+   sudo xmr-gateway-admin --env /etc/xmr-gateway/.env wallet create-view-only
+   # Или Hot Auto-Sweep кошелёк:
+   sudo xmr-gateway-admin --env /etc/xmr-gateway/.env wallet create-hot
+   ```
+5. Проверьте конфигурацию, права, соответствие ноды сети и RBAC (fail-closed):
+   ```bash
+   sudo xmr-gateway-admin --env /etc/xmr-gateway/.env config doctor
    ```
 
 ### 3.3. Запуск `systemd` и ежедневный горячий бэкап
@@ -120,49 +130,102 @@ sudo -u xmr-gateway xmr-gateway-admin --env /etc/xmr-gateway/.env dev health-rba
 
 ## 4. Контейнеризация (Docker Compose и Rootless Podman Quadlet)
 
-### 4.1. Docker Compose (`deploy/docker/`)
-1. Подготовьте каталоги с владельцем UID/GID `10001` и правами `0700` (и поместите туда инициализированный кошелёк `gateway_wallet*` с правами `0600`):
+### 4.1. Docker Compose и Podman Compose (`deploy/docker/`)
+Храните `DATA_HOST_DIR` (`data/gateway`) и `WALLET_HOST_DIR` (`data/wallet`) в **непересекающихся соседних каталогах**, чтобы контейнер `xmr-gateway` физически не видел ключи кошелька, а метки SELinux не конфликтовали.
+
+1. Подготовьте изолированные соседние каталоги (`0700`) и файл окружения:
    ```bash
-   mkdir -p data/wallet
-   sudo chown -R 10001:10001 data
-   chmod 700 data data/wallet
-   ```
-2. Подготовьте окружение:
-   ```bash
+   mkdir -p data/gateway data/wallet
+   chmod 700 data data/gateway data/wallet
    cp deploy/docker/.env.docker.example deploy/docker/.env.docker
    chmod 600 deploy/docker/.env.docker
    # Отредактируйте deploy/docker/.env.docker: замените все placeholder-секреты!
    ```
-3. Соберите воспроизводимые образы (`Containerfile` + `deploy/docker/Containerfile.monero-rpc` с обязательной SHA256-проверкой официального Monero CLI) и запустите стек:
+   - **Для Docker Engine:**
+     ```bash
+     sudo chown -R 10001:10001 data/gateway data/wallet
+     ```
+   - **Для Rootless Podman + SELinux `Enforcing` (Fedora / RHEL):**
+     ```bash
+     chcon -Rt container_file_t data/gateway data/wallet
+     podman unshare chown -R 10001:10001 data/gateway data/wallet
+     ```
+2. Соберите образы и инициализируйте кошелёк в `data/wallet` (`gateway_wallet`, `gateway_wallet.keys` и `0600` `gateway_wallet.password`) одноразовым контейнером до `up -d`:
    ```bash
-   docker compose -f deploy/docker/docker-compose.yml --env-file deploy/docker/.env.docker up -d --build
+   # Сборка воспроизводимых образов (официальный Monero CLI проверяется по SHA256):
+   docker compose -f deploy/docker/docker-compose.yml --env-file deploy/docker/.env.docker build
+   # (Или через podman-compose: podman-compose -f deploy/docker/docker-compose.yml --env-file deploy/docker/.env.docker build)
+
+   # Пример инициализации кошелька одноразовым контейнером (для view_only используйте --generate-from-view-key):
+   podman run --rm -it --entrypoint /bin/sh \
+     --user 10001:10001 -v "$PWD/data/wallet:/wallet:rw" \
+     localhost/docker_monero-wallet-rpc:latest -c '
+       umask 077
+       head -c 24 /dev/urandom | od -An -tx1 | tr -d " \n" > /wallet/gateway_wallet.password
+       chmod 600 /wallet/gateway_wallet.password
+       printf "N\n" | /usr/local/bin/monero-wallet-cli --offline --stagenet \
+         --generate-new-wallet /wallet/gateway_wallet \
+         --password-file /wallet/gateway_wallet.password \
+         --restore-height 1600000 --mnemonic-language English --command address
+       chmod 600 /wallet/gateway_wallet*
+     '
+   ```
+3. Запустите стек:
+   ```bash
+   docker compose -f deploy/docker/docker-compose.yml --env-file deploy/docker/.env.docker up -d
 
    # Опционально с встроенным Caddy (автоматический HTTPS):
    docker compose -f deploy/docker/docker-compose.yml --env-file deploy/docker/.env.docker --profile caddy up -d
    ```
 - Порт `18082` `monero-wallet-rpc` **никогда не публикуется на хост** (общение идёт по изолированной сети `xmr_internal` с `internal: true`).
-- Порт `8080` шлюза привязан строго к `127.0.0.1:8080:8080`.
-- Оба контейнера работают от непривилегированного `10001:10001`, с `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges:true` и `stop_grace_period: 30s` для чистого `WAL TRUNCATE`.
+- Порт `8080` шлюза привязан строго к `127.0.0.1:8080:8080` и снабжён нативным Compose `healthcheck:`.
+- Оба контейнера работают от непривилегированного `10001:10001`, с `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges:true` и `stop_grace_period: 30s` для чистого `WAL TRUNCATE` и сохранения кошелька.
 
-### 4.2. Rootless Podman Quadlet (`deploy/podman/quadlet/`) — Fedora / RHEL
+### 4.2. Rootless Podman Quadlet (`deploy/podman/quadlet/`) — Fedora / RHEL (SELinux `Enforcing`)
+Quadlet пробрасывает вашего непривилегированного пользователя в UID `10001` (`UserNS=keep-id:uid=10001,gid=10001`), применяет приватные SELinux-метки `:Z` к **непересекающимся** соседним каталогам `data/` и `wallet/`, использует две bridge-сети (`xmr-gateway-internal.network` + `xmr-gateway-egress.network`, исключая конфликт `pasta`/bridge в Podman 5) и задаёт нативные `HealthCmd=` и `StopTimeout=30`.
+
 ```bash
 # 1. Соберите оба локальных образа от непривилегированного пользователя:
 podman build -t localhost/xmr-gateway:latest -f Containerfile .
 podman build -t localhost/xmr-gateway-wallet-rpc:latest -f deploy/docker/Containerfile.monero-rpc .
 
-# 2. Создайте каталоги данных и 0600 конфиг:
-mkdir -p ~/.local/share/xmr-gateway/wallet ~/.config/xmr-gateway ~/.config/containers/systemd
-chmod 700 ~/.local/share/xmr-gateway ~/.local/share/xmr-gateway/wallet ~/.config/xmr-gateway
+# 2. Создайте изолированные соседние каталоги (0700) и 0600 конфиг:
+mkdir -p ~/.local/share/xmr-gateway/data ~/.local/share/xmr-gateway/wallet ~/.config/xmr-gateway ~/.config/containers/systemd
+chmod 700 ~/.local/share/xmr-gateway ~/.local/share/xmr-gateway/data ~/.local/share/xmr-gateway/wallet ~/.config/xmr-gateway
 cp deploy/docker/.env.docker.example ~/.config/xmr-gateway/gateway.env
 chmod 600 ~/.config/xmr-gateway/gateway.env
-# Заполните секреты в ~/.config/xmr-gateway/gateway.env и создайте кошелёк в ~/.local/share/xmr-gateway/wallet/
+# Отредактируйте ~/.config/xmr-gateway/gateway.env и замените все placeholder-секреты!
 
-# 3. Скопируйте Quadlet-файлы (SELinux-метки :Z и UserNS=keep-id:uid=10001,gid=10001 уже настроены):
-cp deploy/podman/quadlet/* ~/.config/containers/systemd/
+# 3. Инициализируйте кошелёк в ~/.local/share/xmr-gateway/wallet/ одноразовым контейнером
+#    (создаёт gateway_wallet* и 0600 gateway_wallet.password; для view_only используйте --generate-from-view-key):
+podman run --rm -it --entrypoint /bin/sh \
+  --userns=keep-id:uid=10001,gid=10001 --user 10001:10001 \
+  -v "$HOME/.local/share/xmr-gateway/wallet:/wallet:Z" \
+  localhost/xmr-gateway-wallet-rpc:latest -c '
+    umask 077
+    head -c 24 /dev/urandom | od -An -tx1 | tr -d " \n" > /wallet/gateway_wallet.password
+    chmod 600 /wallet/gateway_wallet.password
+    printf "N\n" | /usr/local/bin/monero-wallet-cli --offline \
+      --generate-new-wallet /wallet/gateway_wallet \
+      --password-file /wallet/gateway_wallet.password \
+      --restore-height 3280000 --mnemonic-language English --command address
+    chmod 600 /wallet/gateway_wallet*
+  '
+
+# 4. Скопируйте ВСЕ 4 Quadlet-файла (internal + egress сети + оба контейнера):
+cp deploy/podman/quadlet/xmr-gateway-internal.network \
+   deploy/podman/quadlet/xmr-gateway-egress.network \
+   deploy/podman/quadlet/monero-wallet-rpc.container \
+   deploy/podman/quadlet/xmr-gateway.container \
+   ~/.config/containers/systemd/
+
+# 5. Перечитайте генератор и запустите (динамические Quadlet-юниты НЕ поддерживают `systemctl --user enable`;
+#    автозапуск уже задан секцией `[Install] WantedBy=default.target` + linger):
 systemctl --user daemon-reload
-systemctl --user enable --now monero-wallet-rpc.service xmr-gateway.service
+systemctl --user start monero-wallet-rpc.service xmr-gateway.service
+systemctl --user status monero-wallet-rpc.service xmr-gateway.service
 
-# 4. Включите linger, чтобы сервисы работали после выхода из SSH-сессии:
+# 6. Включите linger, чтобы сервисы работали после выхода из SSH и перезагрузки:
 loginctl enable-linger "$USER"
 ```
 
@@ -196,13 +259,13 @@ gpg --armor --export-secret-keys <KEY_FINGERPRINT>
 
 ### Выпуск релиза (3 шага)
 ```bash
-# 1. Убедитесь, что version в Cargo.toml совпадает с тегом (например, 0.1.0), и main актуален:
+# 1. Убедитесь, что version в Cargo.toml совпадает с тегом (например, 0.1.1), и main актуален:
 git checkout main && git pull --ff-only
 
 # 2. Создайте (подписанный) аннотированный тег:
-git tag -s v0.1.0 -m "Release v0.1.0"
+git tag -s v0.1.1 -m "Release v0.1.1"
 
 # 3. Запушьте тег — GitHub Actions автоматически соберёт и опубликует релиз:
-git push origin v0.1.0
+git push origin v0.1.1
 ```
 Для пробного прогона без публикации релиза запустите **Actions → Release → Run workflow** с параметром `dry_run: true`.

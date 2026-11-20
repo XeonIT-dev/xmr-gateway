@@ -1,0 +1,13 @@
+# ==============================================================================
+# Rootless Podman Quadlet — Outbound Egress Bridge Network
+# ==============================================================================
+# Install to: ~/.config/containers/systemd/xmr-gateway-egress.network
+# Used alongside xmr-gateway-internal.network so containers can reach remote
+# Monero daemons and outbound merchant webhooks without conflicting with pasta.
+# ==============================================================================
+
+[Unit]
+Description=Outbound egress bridge network for xmr-gateway and monero-wallet-rpc
+
+[Network]
+NetworkName=xmr-gateway-egress

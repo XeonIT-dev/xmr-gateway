@@ -280,7 +280,7 @@ class MockHandler(BaseHTTPRequestHandler):
                 self._send(200, {
                     "status": "ok",
                     "service": "xmr-gateway",
-                    "version": "0.1.0",
+                    "version": "0.1.1",
                     "database": "connected",
                     "monero_rpc": {"connected": True, "version": 196619, "error": None},
                     "auto_sweep_enabled": False,
@@ -876,15 +876,15 @@ else
     fail "install.sh --help failed"
 fi
 
-DRY_DEB="$("$INSTALL_SH" --dry-run --method deb --version v0.1.0)"
-assert_contains "$DRY_DEB" "xmr-gateway_0.1.0_" "install.sh --dry-run --method deb computes .deb artifact"
+DRY_DEB="$("$INSTALL_SH" --dry-run --method deb --version v0.1.1)"
+assert_contains "$DRY_DEB" "xmr-gateway_0.1.1_" "install.sh --dry-run --method deb computes .deb artifact"
 assert_contains "$DRY_DEB" "SHA256SUMS" "install.sh --dry-run includes SHA256SUMS check"
 
-DRY_RPM="$("$INSTALL_SH" --dry-run --method rpm --version v0.1.0)"
-assert_contains "$DRY_RPM" "xmr-gateway-0.1.0-1." "install.sh --dry-run --method rpm computes .rpm artifact"
+DRY_RPM="$("$INSTALL_SH" --dry-run --method rpm --version v0.1.1)"
+assert_contains "$DRY_RPM" "xmr-gateway-0.1.1-1." "install.sh --dry-run --method rpm computes .rpm artifact"
 
-DRY_TAR="$("$INSTALL_SH" --dry-run --method tarball --version v0.1.0 --prefix /opt/xmr-custom --require-gpg)"
-assert_contains "$DRY_TAR" "xmr-gateway-v0.1.0-linux-" "install.sh --dry-run --method tarball computes tarball artifact"
+DRY_TAR="$("$INSTALL_SH" --dry-run --method tarball --version v0.1.1 --prefix /opt/xmr-custom --require-gpg)"
+assert_contains "$DRY_TAR" "xmr-gateway-v0.1.1-linux-" "install.sh --dry-run --method tarball computes tarball artifact"
 assert_contains "$DRY_TAR" "/opt/xmr-custom" "install.sh --dry-run --prefix applied"
 assert_contains "$DRY_TAR" "REQUIRED (SHA256SUMS.asc)" "install.sh --require-gpg reflected in plan"
 
@@ -1118,6 +1118,135 @@ for bad in (
     assert run_check("hot_wallet", bad) != 0, f"hot_wallet MUST fail closed on {bad!r}"
 PYEOF
 pass "XMR-AUDIT-003: start.sh fail-closed query_key JSON verifier passed all positive & adversarial cases"
+
+# ==============================================================================
+# 11. v0.1.1 Packaging, Systemd, Quadlet, Key Rotation & Network Node Checks
+# ==============================================================================
+printf '\n=== 11. v0.1.1 Packaging, Systemd, Quadlet, Rotation & Network Checks ===\n'
+
+# 11a) Verify systemd units have zero unescaped printf %s/%d specifiers & Quadlet/Compose isolation
+python3 - "$REPO_ROOT" <<'PYEOF'
+import glob, os, re, sys, tomllib
+
+repo = sys.argv[1]
+
+# 1) No unescaped printf-style %s/%d specifiers in deploy/systemd/*.service
+for svc in sorted(glob.glob(os.path.join(repo, "deploy/systemd/*.service"))):
+    raw = open(svc, encoding="utf-8").read()
+    # Replace escaped %% first; any remaining %s inside Exec* lines is a systemd specifier bug!
+    cleaned = raw.replace("%%", "")
+    for idx, line in enumerate(cleaned.splitlines(), 1):
+        if line.strip().startswith("#"):
+            continue
+        assert "%s" not in line, f"Unescaped %s specifier in {svc}:{idx}: {line}"
+
+# 2) Packaging includes start.sh, CHANGELOG.md, and all 4 Quadlet units
+with open(os.path.join(repo, "Cargo.toml"), "rb") as f:
+    cargo = tomllib.load(f)
+deb_sources = {e[0] for e in cargo["package"]["metadata"]["deb"]["assets"]}
+rpm_sources = {e["source"] for e in cargo["package"]["metadata"]["generate-rpm"]["assets"]}
+required_assets = {
+    "start.sh",
+    "CHANGELOG.md",
+    "deploy/podman/quadlet/xmr-gateway-internal.network",
+    "deploy/podman/quadlet/xmr-gateway-egress.network",
+    "deploy/podman/quadlet/monero-wallet-rpc.container",
+    "deploy/podman/quadlet/xmr-gateway.container",
+}
+for req in required_assets:
+    assert req in deb_sources, f"Missing {req} in deb assets"
+    assert req in rpm_sources, f"Missing {req} in rpm assets"
+    assert os.path.isfile(os.path.join(repo, req)), f"Required packaged file missing on disk: {req}"
+
+rel_yml = open(os.path.join(repo, ".github/workflows/release.yml"), encoding="utf-8").read()
+assert "start.sh" in rel_yml, "release.yml tarball stage must include start.sh"
+
+# 3) Quadlet networking, volume isolation, stop timeout, and healthcheck
+rpc_q = open(os.path.join(repo, "deploy/podman/quadlet/monero-wallet-rpc.container"), encoding="utf-8").read()
+gw_q = open(os.path.join(repo, "deploy/podman/quadlet/xmr-gateway.container"), encoding="utf-8").read()
+for name, content in (("monero-wallet-rpc.container", rpc_q), ("xmr-gateway.container", gw_q)):
+    assert "Network=pasta" not in content, f"{name} must not mix Network=pasta with bridge networks"
+    assert "Network=xmr-gateway-egress.network" in content, f"{name} must attach to xmr-gateway-egress.network"
+    assert "StopSignal=SIGTERM" in content and "StopTimeout=30" in content, f"{name} missing StopSignal/StopTimeout"
+assert "Volume=%h/.local/share/xmr-gateway/data:/data:Z" in gw_q, "xmr-gateway.container must isolate /data sibling dir"
+assert "HealthCmd=" in gw_q and "HealthInterval=30s" in gw_q, "xmr-gateway.container missing native Quadlet healthcheck"
+
+# 4) Docker Compose isolation & healthcheck + OCI-clean Containerfile
+compose_raw = open(os.path.join(repo, "deploy/docker/docker-compose.yml"), encoding="utf-8").read()
+assert "../../data/gateway" in compose_raw, "docker-compose.yml must isolate DATA_HOST_DIR to ../../data/gateway"
+assert "healthcheck:" in compose_raw, "docker-compose.yml must define healthcheck for xmr-gateway"
+cfile_raw = open(os.path.join(repo, "Containerfile"), encoding="utf-8").read()
+assert not re.search(r"^\s*HEALTHCHECK\b", cfile_raw, re.M), "Containerfile must not emit OCI HEALTHCHECK warning"
+
+# 5) .env.example includes uncommented OPERATOR_API_KEY=
+env_ex = open(os.path.join(repo, ".env.example"), encoding="utf-8").read()
+assert re.search(r"^OPERATOR_API_KEY=", env_ex, re.M), ".env.example must contain uncommented OPERATOR_API_KEY="
+PYEOF
+pass "v0.1.1 systemd escaping, packaging manifests, Quadlet/Compose isolation, OCI healthcheck & .env.example verified"
+
+# 11b) Verify Podman Quadlet generator dry-run cleanly accepts all 4 units (if installed)
+if [[ -x /usr/libexec/podman/quadlet ]]; then
+    if QUADLET_UNIT_DIRS="$REPO_ROOT/deploy/podman/quadlet" /usr/libexec/podman/quadlet -dryrun -user >/dev/null 2>&1; then
+        pass "podman quadlet -dryrun -user validated all 4 Quadlet units cleanly"
+    else
+        fail "podman quadlet -dryrun -user failed on deploy/podman/quadlet"
+    fi
+fi
+
+# 11c) Bug #5: config rotate-keys all creates distinct OPERATOR_API_KEY even when absent from .env
+ROT_ALL_ENV="$TMP_DIR/rotate_all_missing_op.env"
+cat > "$ROT_ALL_ENV" <<EOF
+HOST=127.0.0.1
+PORT=${MOCK_PORT}
+DATABASE_URL=sqlite://${DB_FILE}
+API_SECRET_KEY=${API_KEY}
+WEBHOOK_SECRET=${WH_SECRET}
+MONERO_NETWORK=stagenet
+WALLET_MODE=view_only
+MONERO_RPC_USER=rpc_user
+MONERO_RPC_PASS=${RPC_PASS}
+EOF
+chmod 600 "$ROT_ALL_ENV"
+ROT_ALL_JSON="$("$ADMIN_SH" --env "$ROT_ALL_ENV" --yes --json config rotate-keys all)"
+assert_contains "$ROT_ALL_JSON" '"OPERATOR_API_KEY"' "config rotate-keys all includes OPERATOR_API_KEY even when missing from .env"
+ROT_ALL_API="$(grep '^API_SECRET_KEY=' "$ROT_ALL_ENV" | cut -d= -f2-)"
+ROT_ALL_OP="$(grep '^OPERATOR_API_KEY=' "$ROT_ALL_ENV" | cut -d= -f2-)"
+if [[ "${#ROT_ALL_OP}" -eq 64 && "$ROT_ALL_OP" != "$ROT_ALL_API" ]]; then
+    pass "config rotate-keys all generated fresh 64-hex OPERATOR_API_KEY distinct from API_SECRET_KEY"
+else
+    fail "config rotate-keys all produced invalid or colliding OPERATOR_API_KEY"
+fi
+
+# 11d) Bug #12: network-aware default MONERO_REMOTE_NODE (stagenet/testnet) + config doctor mismatch WARN
+STAGE_NODE_ENV="$TMP_DIR/stage_default_node.env"
+cat > "$STAGE_NODE_ENV" <<EOF
+HOST=127.0.0.1
+PORT=${MOCK_PORT}
+DATABASE_URL=sqlite://${DB_FILE}
+API_SECRET_KEY=${API_KEY}
+OPERATOR_API_KEY=${OP_KEY}
+WEBHOOK_SECRET=${WH_SECRET}
+MONERO_NETWORK=stagenet
+MONERO_REMOTE_NODE=
+WALLET_MODE=view_only
+MONERO_RPC_USER=rpc_user
+MONERO_RPC_PASS=${RPC_PASS}
+EOF
+chmod 600 "$STAGE_NODE_ENV"
+STAGE_SHOW_JSON="$("$ADMIN_SH" --env "$STAGE_NODE_ENV" --json config show)"
+assert_contains "$STAGE_SHOW_JSON" '"monero_remote_node": "node.monerodevs.org:38089"' "stagenet auto-selects stagenet default MONERO_REMOTE_NODE"
+
+STAGE_BAD_NODE_ENV="$TMP_DIR/stage_bad_node.env"
+cp "$STAGE_NODE_ENV" "$STAGE_BAD_NODE_ENV"
+chmod 600 "$STAGE_BAD_NODE_ENV"
+sed -i 's/^MONERO_REMOTE_NODE=$/MONERO_REMOTE_NODE=xmr-node.cakewallet.com:18081/' "$STAGE_BAD_NODE_ENV"
+STAGE_BAD_DOC="$("$ADMIN_SH" --env "$STAGE_BAD_NODE_ENV" --json config doctor)"
+assert_contains "$STAGE_BAD_DOC" "remote_node_network" "config doctor warns when stagenet explicitly uses mainnet remote node"
+
+# 11e) Bug #10: scripts/install.sh tarball post-install instructions reference $PREFIX and admin.sh (not /etc/xmr-gateway)
+TAR_NEXT_STEPS="$(bash -c 'source <(sed "/^main \"\$@\"$/d" "$1"); INSTALL_LANG=en; METHOD=tarball; PREFIX=/home/tester/xmr-app; print_next_steps' _ "$INSTALL_SH")"
+assert_contains "$TAR_NEXT_STEPS" "/home/tester/xmr-app/admin.sh" "install.sh tarball next-steps uses actual PREFIX and admin.sh"
+assert_not_contains "$TAR_NEXT_STEPS" "/etc/xmr-gateway/.env" "install.sh tarball next-steps does not print systemd /etc/xmr-gateway path"
 
 printf '\n====================================================================\n'
 printf 'Admin Test Summary: %d PASSED, %d FAILED\n' "$PASS_COUNT" "$FAIL_COUNT"

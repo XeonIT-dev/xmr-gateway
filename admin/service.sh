@@ -165,7 +165,7 @@ cmd_start() {
                 tail -n 20 "$RPC_LOG_FILE" >&2 || true
                 exit 1
             fi
-            if wallet_rpc_call "get_version" && [[ "$RPC_LAST_BODY" == *'"result"'* ]]; then
+            if wallet_rpc_call "get_version" 2>/dev/null && [[ "$RPC_LAST_BODY" == *'"result"'* ]]; then
                 log_info "$(t service.rpc_ready "$rpc_pid")"
                 break
             fi
@@ -200,7 +200,7 @@ cmd_start() {
                 tail -n 25 "$GATEWAY_LOG_FILE" >&2 || true
                 exit 1
             fi
-            if gateway_api_call GET "/health" none && [[ "$API_LAST_HTTP_CODE" == "200" ]]; then
+            if gateway_api_call GET "/health" none 2>/dev/null && [[ "$API_LAST_HTTP_CODE" == "200" ]]; then
                 log_info "$(t service.gw_healthy "$gw_pid" "$GATEWAY_BASE_URL")"
                 return 0
             fi
@@ -353,13 +353,34 @@ cmd_build() {
 
 cmd_setup_rpc() {
     log_step "$(t service.setup_rpc_run)"
-    (cd "$REPO_ROOT" && ./start.sh --setup-rpc)
+
+    local start_sh=""
+    if [[ -f "$REPO_ROOT/start.sh" ]]; then
+        start_sh="$REPO_ROOT/start.sh"
+    elif [[ -f "/usr/share/xmr-gateway/start.sh" ]]; then
+        start_sh="/usr/share/xmr-gateway/start.sh"
+    else
+        die "start.sh not found in '$REPO_ROOT' or '/usr/share/xmr-gateway'."
+    fi
+
+    local target_bin_dir="${XMR_BIN_DIR:-}"
+    if [[ -z "$target_bin_dir" ]]; then
+        if [[ -w "$REPO_ROOT" ]]; then
+            target_bin_dir="$REPO_ROOT/bin"
+        elif [[ -w "/usr/local/bin" ]]; then
+            target_bin_dir="/usr/local/bin"
+        else
+            die "Neither '$REPO_ROOT' nor '/usr/local/bin' is writable. Run with sudo (for /usr/local/bin) or set XMR_BIN_DIR."
+        fi
+    fi
+
+    XMR_BIN_DIR="$target_bin_dir" bash "$start_sh" --setup-rpc
     for b in monero-wallet-rpc monero-wallet-cli; do
-        if [[ -x "$REPO_ROOT/bin/$b" ]]; then
+        if [[ -x "$target_bin_dir/$b" ]]; then
             local sha ver
-            sha="$(sha256sum "$REPO_ROOT/bin/$b" | awk '{print $1}')"
-            ver="$("$REPO_ROOT/bin/$b" --version 2>/dev/null | head -n 1 || true)"
-            log_info "$b: $ver (sha256=$sha)"
+            sha="$(sha256sum "$target_bin_dir/$b" | awk '{print $1}')"
+            ver="$("$target_bin_dir/$b" --version 2>/dev/null | head -n 1 || true)"
+            log_info "$b ($target_bin_dir/$b): $ver (sha256=$sha)"
         fi
     done
 }

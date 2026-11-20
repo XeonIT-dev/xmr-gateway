@@ -245,6 +245,29 @@ cmd_rescan() {
     fi
 }
 
+fix_system_wallet_ownership() {
+    if [[ "$(id -u)" -eq 0 ]] \
+        && [[ "$ACTIVE_ENV_FILE" == "/etc/xmr-gateway/.env" || "$DATA_DIR" == /var/lib/xmr-gateway* ]] \
+        && id xmr-gateway >/dev/null 2>&1; then
+        chown xmr-gateway:xmr-gateway "$DATA_DIR" "$WALLET_DIR"
+        if [[ -f "$WALLET_PASS_FILE" ]]; then
+            chown xmr-gateway:xmr-gateway "$WALLET_PASS_FILE"
+            chmod 600 "$WALLET_PASS_FILE"
+        fi
+        local wf
+        for wf in "${WALLET_FILE}"*; do
+            if [[ -e "$wf" ]]; then
+                chown xmr-gateway:xmr-gateway "$wf"
+                chmod 600 "$wf"
+            fi
+        done
+        if [[ -f "$CLI_LOG_FILE" ]]; then
+            chown xmr-gateway:xmr-gateway "$CLI_LOG_FILE"
+            chmod 600 "$CLI_LOG_FILE"
+        fi
+    fi
+}
+
 cmd_create_hot() {
     load_env
     require_cmd openssl
@@ -273,6 +296,8 @@ cmd_create_hot() {
         printf '%s' "$(openssl rand -hex 24)" > "$WALLET_PASS_FILE"
         chmod 600 "$WALLET_PASS_FILE"
         log_info "Created 0600 wallet password file: $WALLET_PASS_FILE"
+    else
+        chmod 600 "$WALLET_PASS_FILE"
     fi
 
     local net_args=()
@@ -291,6 +316,7 @@ cmd_create_hot() {
         --command address
 
     chmod 600 "${WALLET_FILE}"* 2>/dev/null || true
+    fix_system_wallet_ownership
     log_info "$(t wallet.hot_created "$WALLET_FILE")"
 }
 
@@ -334,6 +360,8 @@ cmd_create_view_only() {
         printf '%s' "$(openssl rand -hex 24)" > "$WALLET_PASS_FILE"
         chmod 600 "$WALLET_PASS_FILE"
         log_info "Created 0600 wallet password file: $WALLET_PASS_FILE"
+    else
+        chmod 600 "$WALLET_PASS_FILE"
     fi
 
     local net_args=()
@@ -351,6 +379,7 @@ cmd_create_view_only() {
         --command address
 
     chmod 600 "${WALLET_FILE}"* 2>/dev/null || true
+    fix_system_wallet_ownership
     log_info "$(t wallet.vo_created "$WALLET_FILE")"
 }
 

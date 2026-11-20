@@ -153,7 +153,7 @@ PENDING ----------+-----------------------------> MEMPOOL (0-conf, не исте
 | Заголовок | Значение |
 |---|---|
 | `Content-Type` | `application/json` |
-| `User-Agent` | `xmr-gateway/0.1.0` |
+| `User-Agent` | `xmr-gateway/0.1.1` |
 | `X-Signature-256` | Lowercase hex `HMAC-SHA256(WEBHOOK_SECRET, raw_body_bytes)` |
 | `X-Webhook-Event` | Имя события (`MEMPOOL`, `CONFIRMED`, `SETTLED`, `SWEPT`, `REORGED`, `EXPIRED`, `UNDERPAID`, `LATE_PAYMENT`, `OVERPAYMENT`) |
 | `X-Delivery-Id` | UUID конкретной доставки (`webhook_deliveries.id`) |
@@ -557,7 +557,7 @@ RUST_LOG=info,xmr_gateway=debug
    {
      "status": "ok",
      "service": "xmr-gateway",
-     "version": "0.1.0",
+     "version": "0.1.1",
      "database": "connected",
      "monero_rpc": {
        "connected": true,

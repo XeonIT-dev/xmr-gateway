@@ -50,8 +50,6 @@ ENV HOST=0.0.0.0 \
 EXPOSE 8080
 STOPSIGNAL SIGTERM
 
-# Anonymous /health probe only (zero secrets; returns {"status":"ok"})
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -fsS "http://127.0.0.1:${PORT:-8080}/health" | grep -q '"status":"ok"' || exit 1
-
+# Note: Healthchecks are defined natively in deploy/docker/docker-compose.yml (healthcheck:)
+# and deploy/podman/quadlet/xmr-gateway.container (HealthCmd=...) to stay clean under OCI format.
 ENTRYPOINT ["/usr/local/bin/xmr-gateway"]

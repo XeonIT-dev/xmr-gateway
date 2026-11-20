@@ -2,9 +2,14 @@
 # Rootless Podman Quadlet — xmr-gateway Container
 # ==============================================================================
 # Install to: ~/.config/containers/systemd/xmr-gateway.container
+# Also copy: xmr-gateway-internal.network, xmr-gateway-egress.network, monero-wallet-rpc.container
 # Prerequisites:
+#   mkdir -p ~/.local/share/xmr-gateway/data ~/.local/share/xmr-gateway/wallet ~/.config/xmr-gateway
+#   chmod 700 ~/.local/share/xmr-gateway ~/.local/share/xmr-gateway/data ~/.local/share/xmr-gateway/wallet ~/.config/xmr-gateway
 #   podman build -t localhost/xmr-gateway:latest -f Containerfile .
-#   systemctl --user daemon-reload && systemctl --user enable --now monero-wallet-rpc xmr-gateway
+#   # Quadlet units are generated dynamically (do NOT use `systemctl --user enable`):
+#   systemctl --user daemon-reload && systemctl --user start monero-wallet-rpc xmr-gateway
+#   loginctl enable-linger "$USER"
 # ==============================================================================
 
 [Unit]
@@ -27,12 +32,23 @@ PublishPort=127.0.0.1:8080:8080
 # Map host user UID directly to container UID 10001 (0600/0700 DB & WAL permissions preserved)
 UserNS=keep-id:uid=10001,gid=10001
 
-# Private SELinux relabel (:Z) for Fedora/RHEL
-Volume=%h/.local/share/xmr-gateway:/data:Z
+# Isolated gateway data dir ONLY (sibling of wallet/ — never mounts wallet keys & avoids :Z conflict)
+Volume=%h/.local/share/xmr-gateway/data:/data:Z
 Tmpfs=/tmp:rw,noexec,nosuid,size=64m
 
+# Attach to isolated internal RPC bridge + egress bridge (avoids Podman 5 pasta/bridge conflict)
 Network=xmr-gateway-internal.network
-Network=pasta
+Network=xmr-gateway-egress.network
+
+# Native Podman OCI healthcheck (anonymous /health probe, zero secrets)
+HealthCmd=curl -fsS http://127.0.0.1:8080/health | grep -q '"status":"ok"'
+HealthInterval=30s
+HealthTimeout=5s
+HealthStartPeriod=10s
+HealthRetries=3
+
+StopSignal=SIGTERM
+StopTimeout=30
 
 ReadOnly=true
 DropCapability=ALL
@@ -42,7 +58,7 @@ SecurityLabelDisable=false
 [Service]
 Restart=on-failure
 RestartSec=5
-TimeoutStopSec=30
+TimeoutStopSec=40
 
 [Install]
 WantedBy=default.target

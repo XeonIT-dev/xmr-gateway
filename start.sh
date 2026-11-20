@@ -16,7 +16,7 @@ cd "$SCRIPT_DIR"
 
 ENV_FILE="$SCRIPT_DIR/.env"
 ENV_EXAMPLE="$SCRIPT_DIR/.env.example"
-BIN_DIR="$SCRIPT_DIR/bin"
+BIN_DIR="${XMR_BIN_DIR:-$SCRIPT_DIR/bin}"
 DATA_DIR="$SCRIPT_DIR/data"
 WALLET_DIR="$DATA_DIR/wallet"
 WALLET_FILE="$WALLET_DIR/gateway_wallet"
@@ -26,7 +26,8 @@ CLI_LOG_FILE="$DATA_DIR/monero-wallet-cli.log"
 GATEWAY_BIN="$SCRIPT_DIR/target/release/xmr-gateway"
 
 MONERO_CLI_VERSION="${MONERO_CLI_VERSION:-v0.18.5.4}"
-MONERO_CLI_SHA256="${MONERO_CLI_SHA256:-ba2928962c101b609434bf8c1b43ad59ebe96c5525977284ca599d8bf0f02d10}"
+MONERO_CLI_SHA256_X64="${MONERO_CLI_SHA256:-ba2928962c101b609434bf8c1b43ad59ebe96c5525977284ca599d8bf0f02d10}"
+MONERO_CLI_SHA256_ARM64="${MONERO_CLI_SHA256_ARM64:-d20d71e6522b41eb8e549c3425f7f4622c9c9a448fc7147525393fd0a6b59703}"
 MONERO_CLI_BASE_URL="https://downloads.getmonero.org/cli"
 MONERO_HASHES_URL="https://www.getmonero.org/downloads/hashes.txt"
 MONERO_SIGNING_KEY_FPR="81AC591FE9C4B65C5806AFC3F0AF4D462A0BDF92"
@@ -170,13 +171,38 @@ ensure_env_file() {
     : "${HOST:=127.0.0.1}"
     : "${PORT:=8080}"
     : "${MONERO_NETWORK:=mainnet}"
+    MONERO_NETWORK="${MONERO_NETWORK,,}"
     : "${MONERO_RPC_URL:=http://127.0.0.1:18082/json_rpc}"
     : "${MONERO_RPC_USER:=xmr_gateway_user}"
-    : "${MONERO_REMOTE_NODE:=xmr-node.cakewallet.com:18081}"
-    : "${WALLET_RESTORE_HEIGHT:=3280000}"
+    : "${MONERO_REMOTE_NODE:=}"
+    : "${WALLET_RESTORE_HEIGHT:=}"
     : "${ENABLE_AUTO_SWEEP:=false}"
     : "${MONERO_TRUSTED_DAEMON:=false}"
     : "${ALLOW_HOT_WALLET_WITHOUT_SWEEP:=false}"
+
+    case "$MONERO_NETWORK" in
+        mainnet|stagenet|testnet) ;;
+        *)
+            log_err "Invalid MONERO_NETWORK='$MONERO_NETWORK': expected 'mainnet', 'stagenet', or 'testnet'."
+            exit 1
+            ;;
+    esac
+
+    if [[ -z "${MONERO_REMOTE_NODE:-}" ]]; then
+        case "$MONERO_NETWORK" in
+            stagenet) MONERO_REMOTE_NODE="node.monerodevs.org:38089" ;;
+            testnet)  MONERO_REMOTE_NODE="testnet.xmr-tw.org:28081" ;;
+            *)        MONERO_REMOTE_NODE="xmr-node.cakewallet.com:18081" ;;
+        esac
+    fi
+    if [[ -z "${WALLET_RESTORE_HEIGHT:-}" ]]; then
+        case "$MONERO_NETWORK" in
+            stagenet) WALLET_RESTORE_HEIGHT="1600000" ;;
+            testnet)  WALLET_RESTORE_HEIGHT="2600000" ;;
+            *)        WALLET_RESTORE_HEIGHT="3280000" ;;
+        esac
+    fi
+    export MONERO_NETWORK MONERO_REMOTE_NODE WALLET_RESTORE_HEIGHT
 
     if [[ -z "${WALLET_MODE:-}" ]]; then
         if [[ "${ENABLE_AUTO_SWEEP,,}" == "true" || "${ENABLE_AUTO_SWEEP}" == "1" ]]; then
@@ -210,28 +236,23 @@ ensure_env_file() {
         exit 1
     fi
 
-    if [[ "$WALLET_MODE" == "hot_wallet" || "${ENABLE_AUTO_SWEEP,,}" == "true" || "${ENABLE_AUTO_SWEEP}" == "1" ]]; then
-        if is_placeholder_secret "${OPERATOR_API_KEY:-}"; then
-            require_cmd openssl
-            local generated_op_key
+    # Replace placeholder OPERATOR_API_KEY in any mode; require non-empty distinct key in hot_wallet
+    if [[ "${OPERATOR_API_KEY:-}" == replace-with-* || "${OPERATOR_API_KEY:-}" == changeme* ]] \
+        || { [[ "$WALLET_MODE" == "hot_wallet" || "${ENABLE_AUTO_SWEEP,,}" == "true" || "${ENABLE_AUTO_SWEEP}" == "1" ]] && is_placeholder_secret "${OPERATOR_API_KEY:-}"; }; then
+        require_cmd openssl
+        local generated_op_key
+        generated_op_key="$(openssl rand -hex 32)"
+        while [[ "$generated_op_key" == "${API_SECRET_KEY}" ]]; do
             generated_op_key="$(openssl rand -hex 32)"
-            set_env_kv "OPERATOR_API_KEY" "$generated_op_key"
-            chmod 600 "$ENV_FILE"
-            export OPERATOR_API_KEY="$generated_op_key"
-            log_info "Generated fresh OPERATOR_API_KEY in .env (required for hot_wallet mode)"
-        elif [[ "${OPERATOR_API_KEY}" == "${API_SECRET_KEY}" ]]; then
-            log_err "OPERATOR_API_KEY must differ from API_SECRET_KEY."
-            exit 1
-        fi
+        done
+        set_env_kv "OPERATOR_API_KEY" "$generated_op_key"
+        chmod 600 "$ENV_FILE"
+        export OPERATOR_API_KEY="$generated_op_key"
+        log_info "Generated fresh OPERATOR_API_KEY in .env"
+    elif [[ -n "${OPERATOR_API_KEY:-}" && "${OPERATOR_API_KEY}" == "${API_SECRET_KEY}" ]]; then
+        log_err "OPERATOR_API_KEY must differ from API_SECRET_KEY."
+        exit 1
     fi
-
-    case "$MONERO_NETWORK" in
-        mainnet|stagenet) ;;
-        *)
-            log_err "Invalid MONERO_NETWORK='$MONERO_NETWORK': expected 'mainnet' or 'stagenet'."
-            exit 1
-            ;;
-    esac
 }
 
 validate_wallet_bootstrap_policy() {
@@ -246,9 +267,10 @@ validate_wallet_bootstrap_policy() {
 }
 
 network_flags() {
-    if [[ "$MONERO_NETWORK" == "stagenet" ]]; then
-        printf '%s\n' "--stagenet"
-    fi
+    case "$MONERO_NETWORK" in
+        stagenet) printf '%s\n' "--stagenet" ;;
+        testnet)  printf '%s\n' "--testnet" ;;
+    esac
 }
 
 find_monero_bin() {
@@ -270,26 +292,41 @@ download_and_verify_monero_cli() {
     require_cmd bzip2
     require_cmd sha256sum
 
-    local arch os
+    local arch os monero_arch pinned_sha=""
     arch="$(uname -m)"
     os="$(uname -s)"
-    if [[ "$os" != "Linux" || "$arch" != "x86_64" ]]; then
-        log_err "Automatic binary download supports Linux x86_64 only (detected $os/$arch)."
-        log_err "Please install monero-wallet-rpc and monero-wallet-cli manually into PATH or ./bin/."
+    if [[ "$os" != "Linux" ]]; then
+        log_err "Automatic binary download supports Linux only (detected $os/$arch)."
+        log_err "Please install monero-wallet-rpc and monero-wallet-cli manually into PATH or $BIN_DIR."
         exit 1
     fi
+    case "$arch" in
+        x86_64|amd64)
+            monero_arch="x64"
+            pinned_sha="$MONERO_CLI_SHA256_X64"
+            ;;
+        aarch64|arm64)
+            monero_arch="armv8"
+            pinned_sha="$MONERO_CLI_SHA256_ARM64"
+            ;;
+        *)
+            log_err "Automatic binary download supports Linux x86_64 and aarch64 only (detected $os/$arch)."
+            log_err "Please install monero-wallet-rpc and monero-wallet-cli manually into PATH or $BIN_DIR."
+            exit 1
+            ;;
+    esac
 
     local tmp_dir
     tmp_dir="$(mktemp -d)"
     trap "rm -rf '$tmp_dir'" RETURN
 
     local tarball_name download_url expected_sha256
-    tarball_name="monero-linux-x64-${MONERO_CLI_VERSION}.tar.bz2"
+    tarball_name="monero-linux-${monero_arch}-${MONERO_CLI_VERSION}.tar.bz2"
     download_url="${MONERO_CLI_BASE_URL}/${tarball_name}"
 
-    if [[ "$MONERO_CLI_VERSION" == "v0.18.5.4" && -n "${MONERO_CLI_SHA256:-}" ]]; then
-        expected_sha256="$MONERO_CLI_SHA256"
-        log_info "Using pinned Monero CLI release ${MONERO_CLI_VERSION} (SHA256: ${expected_sha256})."
+    if [[ "$MONERO_CLI_VERSION" == "v0.18.5.4" && -n "${pinned_sha:-}" ]]; then
+        expected_sha256="$pinned_sha"
+        log_info "Using pinned Monero CLI release ${MONERO_CLI_VERSION} (${monero_arch}, SHA256: ${expected_sha256})."
     elif [[ -n "${MONERO_CLI_SHA256:-}" ]]; then
         expected_sha256="$MONERO_CLI_SHA256"
         log_info "Using operator-pinned Monero CLI ${MONERO_CLI_VERSION} (SHA256: ${expected_sha256})."
@@ -332,7 +369,7 @@ download_and_verify_monero_cli() {
     fi
 
     mkdir -p "$BIN_DIR"
-    log_info "Extracting monero-wallet-rpc and monero-wallet-cli into ./bin/..."
+    log_info "Extracting monero-wallet-rpc and monero-wallet-cli into ${BIN_DIR}..."
     tar -xjf "$tmp_dir/$tarball_name" -C "$BIN_DIR" --strip-components=1 \
         --wildcards '*/monero-wallet-rpc' '*/monero-wallet-cli'
     chmod 755 "$BIN_DIR/monero-wallet-rpc" "$BIN_DIR/monero-wallet-cli"
@@ -527,9 +564,10 @@ start_monero_wallet_rpc() {
         rpc_args+=(--untrusted-daemon)
     fi
 
-    if [[ "$MONERO_NETWORK" == "stagenet" ]]; then
-        rpc_args+=(--stagenet)
-    fi
+    case "$MONERO_NETWORK" in
+        stagenet) rpc_args+=(--stagenet) ;;
+        testnet)  rpc_args+=(--testnet) ;;
+    esac
 
     if [[ -n "${MONERO_RPC_PROXY:-}" ]]; then
         log_info "Routing monero-wallet-rpc daemon traffic via SOCKS5 proxy: $MONERO_RPC_PROXY"

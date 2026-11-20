@@ -1,6 +1,6 @@
 [package]
 name = "xmr-gateway"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.94"
 authors = ["xmr-gateway contributors"]
@@ -81,6 +81,7 @@ assets = [
     ["target/release/xmr-gateway", "usr/bin/xmr-gateway", "755"],
     ["deploy/packaging/xmr-gateway-admin", "usr/bin/xmr-gateway-admin", "755"],
     ["admin.sh", "usr/share/xmr-gateway/admin.sh", "755"],
+    ["start.sh", "usr/share/xmr-gateway/start.sh", "755"],
     ["admin/service.sh", "usr/share/xmr-gateway/admin/service.sh", "755"],
     ["admin/config.sh", "usr/share/xmr-gateway/admin/config.sh", "755"],
     ["admin/wallet.sh", "usr/share/xmr-gateway/admin/wallet.sh", "755"],
@@ -96,6 +97,11 @@ assets = [
     ["admin/GUIDE_RU.md", "usr/share/xmr-gateway/admin/GUIDE_RU.md", "644"],
     ["deploy/reverse-proxy/Caddyfile", "usr/share/xmr-gateway/reverse-proxy/Caddyfile", "644"],
     ["deploy/reverse-proxy/nginx-xmr-gateway.conf", "usr/share/xmr-gateway/reverse-proxy/nginx-xmr-gateway.conf", "644"],
+    ["deploy/podman/quadlet/xmr-gateway-internal.network", "usr/share/xmr-gateway/podman/quadlet/xmr-gateway-internal.network", "644"],
+    ["deploy/podman/quadlet/xmr-gateway-egress.network", "usr/share/xmr-gateway/podman/quadlet/xmr-gateway-egress.network", "644"],
+    ["deploy/podman/quadlet/monero-wallet-rpc.container", "usr/share/xmr-gateway/podman/quadlet/monero-wallet-rpc.container", "644"],
+    ["deploy/podman/quadlet/xmr-gateway.container", "usr/share/xmr-gateway/podman/quadlet/xmr-gateway.container", "644"],
+    ["CHANGELOG.md", "usr/share/doc/xmr-gateway/CHANGELOG.md", "644"],
     ["README.md", "usr/share/doc/xmr-gateway/README.md", "644"],
     ["README_RU.md", "usr/share/doc/xmr-gateway/README_RU.md", "644"],
     ["DEPLOY_EN.md", "usr/share/doc/xmr-gateway/DEPLOY_EN.md", "644"],
@@ -116,6 +122,7 @@ assets = [
     { source = "target/release/xmr-gateway", dest = "/usr/bin/xmr-gateway", mode = "0755" },
     { source = "deploy/packaging/xmr-gateway-admin", dest = "/usr/bin/xmr-gateway-admin", mode = "0755" },
     { source = "admin.sh", dest = "/usr/share/xmr-gateway/admin.sh", mode = "0755" },
+    { source = "start.sh", dest = "/usr/share/xmr-gateway/start.sh", mode = "0755" },
     { source = "admin/service.sh", dest = "/usr/share/xmr-gateway/admin/service.sh", mode = "0755" },
     { source = "admin/config.sh", dest = "/usr/share/xmr-gateway/admin/config.sh", mode = "0755" },
     { source = "admin/wallet.sh", dest = "/usr/share/xmr-gateway/admin/wallet.sh", mode = "0755" },
@@ -131,6 +138,11 @@ assets = [
     { source = "admin/GUIDE_RU.md", dest = "/usr/share/xmr-gateway/admin/GUIDE_RU.md", mode = "0644" },
     { source = "deploy/reverse-proxy/Caddyfile", dest = "/usr/share/xmr-gateway/reverse-proxy/Caddyfile", mode = "0644" },
     { source = "deploy/reverse-proxy/nginx-xmr-gateway.conf", dest = "/usr/share/xmr-gateway/reverse-proxy/nginx-xmr-gateway.conf", mode = "0644" },
+    { source = "deploy/podman/quadlet/xmr-gateway-internal.network", dest = "/usr/share/xmr-gateway/podman/quadlet/xmr-gateway-internal.network", mode = "0644" },
+    { source = "deploy/podman/quadlet/xmr-gateway-egress.network", dest = "/usr/share/xmr-gateway/podman/quadlet/xmr-gateway-egress.network", mode = "0644" },
+    { source = "deploy/podman/quadlet/monero-wallet-rpc.container", dest = "/usr/share/xmr-gateway/podman/quadlet/monero-wallet-rpc.container", mode = "0644" },
+    { source = "deploy/podman/quadlet/xmr-gateway.container", dest = "/usr/share/xmr-gateway/podman/quadlet/xmr-gateway.container", mode = "0644" },
+    { source = "CHANGELOG.md", dest = "/usr/share/doc/xmr-gateway/CHANGELOG.md", mode = "0644", doc = true },
     { source = "README.md", dest = "/usr/share/doc/xmr-gateway/README.md", mode = "0644", doc = true },
     { source = "README_RU.md", dest = "/usr/share/doc/xmr-gateway/README_RU.md", mode = "0644", doc = true },
     { source = "DEPLOY_EN.md", dest = "/usr/share/doc/xmr-gateway/DEPLOY_EN.md", mode = "0644", doc = true },

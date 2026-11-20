@@ -57,11 +57,25 @@ umask 077
 
 : "${MONERO_RPC_USER:?MONERO_RPC_USER must be set}"
 : "${MONERO_RPC_PASS:?MONERO_RPC_PASS must be set}"
-: "${MONERO_REMOTE_NODE:=xmr-node.cakewallet.com:18081}"
 : "${MONERO_NETWORK:=mainnet}"
 : "${MONERO_TRUSTED_DAEMON:=false}"
 : "${WALLET_FILE:=/wallet/gateway_wallet}"
 : "${WALLET_PASS_FILE:=/wallet/gateway_wallet.password}"
+
+case "${MONERO_RPC_USER}${MONERO_RPC_PASS}" in
+    *"$(printf '\n')"*|*"$(printf '\r')"*)
+        echo "ERROR: MONERO_RPC_USER and MONERO_RPC_PASS must not contain newlines." >&2
+        exit 1
+        ;;
+esac
+
+if [ -z "${MONERO_REMOTE_NODE:-}" ]; then
+    case "${MONERO_NETWORK}" in
+        stagenet|STAGENET) MONERO_REMOTE_NODE="node.monerodevs.org:38089" ;;
+        testnet|TESTNET)   MONERO_REMOTE_NODE="testnet.xmr-tw.org:28081" ;;
+        *)                 MONERO_REMOTE_NODE="xmr-node.cakewallet.com:18081" ;;
+    esac
+fi
 
 if [ ! -f "${WALLET_FILE}.keys" ]; then
     echo "ERROR: Wallet keys file missing at ${WALLET_FILE}.keys. Initialize wallet volume before starting." >&2
@@ -90,6 +104,7 @@ CONF_FILE="/tmp/wallet-rpc.conf"
 } > "${CONF_FILE}"
 chmod 0600 "${CONF_FILE}"
 
+# exec replaces /bin/sh so monero-wallet-rpc is PID 1 and handles SIGTERM directly.
 # Bind on container-internal interface only (never publish port 18082 on the host!)
 exec /usr/local/bin/monero-wallet-rpc \
     --non-interactive \
@@ -100,6 +115,8 @@ exec /usr/local/bin/monero-wallet-rpc \
     --confirm-external-bind \
     --rpc-bind-port 18082 \
     --config-file "${CONF_FILE}" \
+    --max-log-file-size 10485760 \
+    --max-log-files 2 \
     --log-level 1
 EOF
 RUN chmod 0755 /usr/local/bin/entrypoint-monero-rpc.sh
