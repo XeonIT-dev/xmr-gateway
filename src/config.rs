@@ -127,6 +127,8 @@ impl fmt::Display for MoneroNetwork {
 /// - `required_confirmations` must be `>= 1` so `CONFIRMED` never aliases `MEMPOOL` (`0-conf`).
 /// - When `enable_auto_sweep == true`, `wallet_mode` must be `WalletMode::HotWallet` and
 ///   `cold_wallet_address` MUST be present and pass Monero address structural validation.
+/// - `WalletMode::HotWallet` (and `ENABLE_AUTO_SWEEP=true`) requires a distinct, strong
+///   `OPERATOR_API_KEY` (`XMR-AUDIT-004`).
 /// - `WalletMode::HotWallet` requires `ENABLE_AUTO_SWEEP=true` unless
 ///   `ALLOW_HOT_WALLET_WITHOUT_SWEEP=true` is explicitly configured.
 #[derive(Clone, PartialEq, Eq)]
@@ -479,6 +481,15 @@ impl Config {
                 "SWEEP_PRIORITY must be between 0 and 4, got {}",
                 self.sweep_priority
             )));
+        }
+
+        if (self.wallet_mode == WalletMode::HotWallet || self.enable_auto_sweep)
+            && self.operator_api_key.is_none()
+        {
+            return Err(GatewayError::Config(
+                "OPERATOR_API_KEY is required when WALLET_MODE=hot_wallet or ENABLE_AUTO_SWEEP=true (XMR-AUDIT-004)"
+                    .to_string(),
+            ));
         }
 
         if self.enable_auto_sweep && self.wallet_mode != WalletMode::HotWallet {
@@ -1034,6 +1045,7 @@ mod tests {
         let mut cfg = sample_valid_config();
         cfg.enable_auto_sweep = true;
         cfg.wallet_mode = WalletMode::HotWallet;
+        cfg.operator_api_key = Some("c".repeat(32));
         cfg.cold_wallet_address = None;
         assert!(cfg.validate().is_err());
 
@@ -1049,17 +1061,56 @@ mod tests {
         let mut cfg = sample_valid_config();
         cfg.enable_auto_sweep = true;
         cfg.wallet_mode = WalletMode::ViewOnly;
+        cfg.operator_api_key = Some("c".repeat(32));
         cfg.cold_wallet_address = Some(valid_mainnet_address());
         assert!(cfg.validate().is_err());
 
         let mut cfg2 = sample_valid_config();
         cfg2.wallet_mode = WalletMode::HotWallet;
+        cfg2.operator_api_key = Some("c".repeat(32));
         cfg2.enable_auto_sweep = false;
         cfg2.allow_hot_wallet_without_sweep = false;
         assert!(cfg2.validate().is_err());
 
         cfg2.allow_hot_wallet_without_sweep = true;
         assert!(cfg2.validate().is_ok());
+    }
+
+    #[test]
+    fn hot_wallet_requires_distinct_operator_api_key_xmr_audit_004() {
+        // 1) view_only without OPERATOR_API_KEY remains valid (single-tenant fallback)
+        let view_only = sample_valid_config();
+        assert_eq!(view_only.wallet_mode, WalletMode::ViewOnly);
+        assert!(view_only.operator_api_key.is_none());
+        assert!(view_only.validate().is_ok());
+
+        // 2) hot_wallet + enable_auto_sweep without OPERATOR_API_KEY MUST fail closed
+        let mut hot_sweep = sample_valid_config();
+        hot_sweep.wallet_mode = WalletMode::HotWallet;
+        hot_sweep.enable_auto_sweep = true;
+        hot_sweep.cold_wallet_address = Some(valid_mainnet_address());
+        hot_sweep.operator_api_key = None;
+        let err = hot_sweep.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("OPERATOR_API_KEY is required"),
+            "expected mandatory OPERATOR_API_KEY error, got: {err}"
+        );
+
+        // 3) hot_wallet + allow_hot_wallet_without_sweep without OPERATOR_API_KEY MUST fail closed
+        let mut hot_no_sweep = sample_valid_config();
+        hot_no_sweep.wallet_mode = WalletMode::HotWallet;
+        hot_no_sweep.enable_auto_sweep = false;
+        hot_no_sweep.allow_hot_wallet_without_sweep = true;
+        hot_no_sweep.operator_api_key = None;
+        assert!(hot_no_sweep.validate().is_err());
+
+        // 4) hot_wallet with OPERATOR_API_KEY identical to API_SECRET_KEY MUST fail closed
+        hot_sweep.operator_api_key = Some(hot_sweep.api_secret_key.clone());
+        assert!(hot_sweep.validate().is_err());
+
+        // 5) hot_wallet with distinct strong OPERATOR_API_KEY succeeds
+        hot_sweep.operator_api_key = Some("c".repeat(32));
+        assert!(hot_sweep.validate().is_ok());
     }
 
     #[test]

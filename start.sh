@@ -33,6 +33,7 @@ MONERO_SIGNING_KEY_FPR="81AC591FE9C4B65C5806AFC3F0AF4D462A0BDF92"
 MONERO_SIGNING_KEY_URL="https://raw.githubusercontent.com/monero-project/monero/master/utils/gpg_keys/binaryfate.asc"
 
 RPC_PID=""
+RPC_CONF_FILE=""
 GATEWAY_PID=""
 CLEANED_UP=0
 
@@ -84,6 +85,10 @@ cleanup() {
             kill -KILL "$RPC_PID" 2>/dev/null || true
         fi
         wait "$RPC_PID" 2>/dev/null || true
+    fi
+
+    if [[ -n "$RPC_CONF_FILE" ]]; then
+        rm -f "$RPC_CONF_FILE"
     fi
 }
 
@@ -203,6 +208,21 @@ ensure_env_file() {
         && [[ "${ALLOW_HOT_WALLET_WITHOUT_SWEEP,,}" != "true" && "${ALLOW_HOT_WALLET_WITHOUT_SWEEP}" != "1" ]]; then
         log_err "WALLET_MODE=hot_wallet requires ENABLE_AUTO_SWEEP=true (or explicit ALLOW_HOT_WALLET_WITHOUT_SWEEP=true)."
         exit 1
+    fi
+
+    if [[ "$WALLET_MODE" == "hot_wallet" || "${ENABLE_AUTO_SWEEP,,}" == "true" || "${ENABLE_AUTO_SWEEP}" == "1" ]]; then
+        if is_placeholder_secret "${OPERATOR_API_KEY:-}"; then
+            require_cmd openssl
+            local generated_op_key
+            generated_op_key="$(openssl rand -hex 32)"
+            set_env_kv "OPERATOR_API_KEY" "$generated_op_key"
+            chmod 600 "$ENV_FILE"
+            export OPERATOR_API_KEY="$generated_op_key"
+            log_info "Generated fresh OPERATOR_API_KEY in .env (required for hot_wallet mode)"
+        elif [[ "${OPERATOR_API_KEY}" == "${API_SECRET_KEY}" ]]; then
+            log_err "OPERATOR_API_KEY must differ from API_SECRET_KEY."
+            exit 1
+        fi
     fi
 
     case "$MONERO_NETWORK" in
@@ -429,6 +449,45 @@ extract_rpc_port() {
     fi
 }
 
+curl_cfg_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '%s' "$s"
+}
+
+write_rpc_conf() {
+    if [[ "$MONERO_RPC_USER" == *$'\n'* || "$MONERO_RPC_USER" == *$'\r'* || "$MONERO_RPC_PASS" == *$'\n'* || "$MONERO_RPC_PASS" == *$'\r'* ]]; then
+        log_err "MONERO_RPC_USER and MONERO_RPC_PASS must not contain newline characters."
+        exit 1
+    fi
+
+    if [[ -n "${XDG_RUNTIME_DIR:-}" && -d "$XDG_RUNTIME_DIR" && -w "$XDG_RUNTIME_DIR" ]]; then
+        RPC_CONF_FILE="${XDG_RUNTIME_DIR}/xmr-gateway-wallet-rpc.conf"
+    else
+        RPC_CONF_FILE="${DATA_DIR}/.monero-wallet-rpc.conf"
+    fi
+
+    (
+        umask 077
+        printf 'rpc-login=%s:%s\n' "$MONERO_RPC_USER" "$MONERO_RPC_PASS" > "$RPC_CONF_FILE"
+    )
+    chmod 600 "$RPC_CONF_FILE"
+}
+
+rpc_curl_post() {
+    local rpc_port="$1"
+    local payload="$2"
+    local cfg_lines=('header = "Content-Type: application/json"')
+    if [[ -n "${MONERO_RPC_USER:-}" ]]; then
+        cfg_lines+=("digest")
+        cfg_lines+=("user = \"$(curl_cfg_escape "${MONERO_RPC_USER}:${MONERO_RPC_PASS}")\"")
+    fi
+    printf '%s\n' "${cfg_lines[@]}" | curl -sS --config - \
+        -d "$payload" \
+        "http://127.0.0.1:${rpc_port}/json_rpc" 2>/dev/null || true
+}
+
 start_monero_wallet_rpc() {
     mkdir -p "$DATA_DIR" "$WALLET_DIR"
     chmod 700 "$DATA_DIR" "$WALLET_DIR"
@@ -441,6 +500,12 @@ start_monero_wallet_rpc() {
         exit 1
     fi
 
+    if [[ -z "${MONERO_RPC_USER:-}" || -z "${MONERO_RPC_PASS:-}" ]]; then
+        log_err "MONERO_RPC_USER and MONERO_RPC_PASS must both be set (unauthenticated monero-wallet-rpc is forbidden)."
+        exit 1
+    fi
+    write_rpc_conf
+
     local rpc_args=(
         --non-interactive
         --no-initial-sync
@@ -449,6 +514,7 @@ start_monero_wallet_rpc() {
         --daemon-address "$MONERO_REMOTE_NODE"
         --rpc-bind-ip 127.0.0.1
         --rpc-bind-port "$rpc_port"
+        --config-file "$RPC_CONF_FILE"
         --log-file "$RPC_LOG_FILE"
         --log-level 1
     )
@@ -465,12 +531,6 @@ start_monero_wallet_rpc() {
         rpc_args+=(--stagenet)
     fi
 
-    if [[ -z "${MONERO_RPC_USER:-}" || -z "${MONERO_RPC_PASS:-}" ]]; then
-        log_err "MONERO_RPC_USER and MONERO_RPC_PASS must both be set (unauthenticated monero-wallet-rpc is forbidden)."
-        exit 1
-    fi
-    rpc_args+=(--rpc-login "${MONERO_RPC_USER}:${MONERO_RPC_PASS}")
-
     if [[ -n "${MONERO_RPC_PROXY:-}" ]]; then
         log_info "Routing monero-wallet-rpc daemon traffic via SOCKS5 proxy: $MONERO_RPC_PROXY"
         rpc_args+=(--proxy "$MONERO_RPC_PROXY")
@@ -479,11 +539,6 @@ start_monero_wallet_rpc() {
     log_info "Starting monero-wallet-rpc ($MONERO_NETWORK) on 127.0.0.1:${rpc_port} (remote node: $MONERO_REMOTE_NODE)..."
     "$rpc_bin" "${rpc_args[@]}" >/dev/null 2>&1 &
     RPC_PID=$!
-
-    local curl_auth_args=()
-    if [[ -n "${MONERO_RPC_USER:-}" ]]; then
-        curl_auth_args=(--digest -u "${MONERO_RPC_USER}:${MONERO_RPC_PASS}")
-    fi
 
     log_info "Waiting for monero-wallet-rpc readiness..."
     local attempt=0
@@ -495,10 +550,7 @@ start_monero_wallet_rpc() {
         fi
 
         local resp
-        resp="$(curl -sS "${curl_auth_args[@]}" \
-            -H 'Content-Type: application/json' \
-            -d '{"jsonrpc":"2.0","id":"0","method":"get_version"}' \
-            "http://127.0.0.1:${rpc_port}/json_rpc" 2>/dev/null || true)"
+        resp="$(rpc_curl_post "$rpc_port" '{"jsonrpc":"2.0","id":"0","method":"get_version"}')"
 
         if [[ "$resp" == *'"result"'* ]]; then
             log_info "monero-wallet-rpc is ready."
@@ -517,37 +569,101 @@ start_monero_wallet_rpc() {
 
 verify_rpc_wallet_mode() {
     local rpc_port="$1"
-    local curl_auth_args=()
-    if [[ -n "${MONERO_RPC_USER:-}" ]]; then
-        curl_auth_args=(--digest -u "${MONERO_RPC_USER}:${MONERO_RPC_PASS}")
-    fi
+    require_cmd python3
 
     local key_resp
-    key_resp="$(curl -sS "${curl_auth_args[@]}" \
-        -H 'Content-Type: application/json' \
-        -d '{"jsonrpc":"2.0","id":"verify_mode","method":"query_key","params":{"key_type":"spend_key"}}' \
-        "http://127.0.0.1:${rpc_port}/json_rpc" 2>/dev/null || true)"
+    key_resp="$(rpc_curl_post "$rpc_port" '{"jsonrpc":"2.0","id":"verify_mode","method":"query_key","params":{"key_type":"spend_key"}}')"
 
-    if [[ "$key_resp" != *'"error"'* && "$key_resp" != *'"result"'* ]]; then
-        log_err "Failed to verify wallet custody mode via query_key (unexpected RPC response). Aborting."
+    local verdict=""
+    if ! verdict="$(RPC_QUERY_KEY_RESP="$key_resp" python3 - "$WALLET_MODE" <<'PYEOF'
+import json
+import os
+import sys
+
+expected_mode = sys.argv[1]
+raw = os.environ.get("RPC_QUERY_KEY_RESP", "")
+
+try:
+    payload = json.loads(raw)
+except Exception as exc:
+    print(f"Failed to parse query_key JSON-RPC response: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+if not isinstance(payload, dict):
+    print("Unexpected non-object query_key JSON-RPC response.", file=sys.stderr)
+    sys.exit(1)
+
+def is_explicit_watch_only_err(msg: str) -> bool:
+    low = msg.lower()
+    return any(
+        needle in low
+        for needle in (
+            "watch-only",
+            "watch only",
+            "view-only",
+            "view only",
+            "no spend key",
+            "cannot retrieve spend key",
+        )
+    )
+
+err_obj = payload.get("error")
+res_obj = payload.get("result")
+
+if err_obj is not None:
+    if not isinstance(err_obj, dict):
+        print("Malformed JSON-RPC error object in query_key response.", file=sys.stderr)
+        sys.exit(1)
+    code = err_obj.get("code")
+    msg = err_obj.get("message")
+    if isinstance(msg, str) and is_explicit_watch_only_err(msg):
+        detected = "view_only"
+    else:
+        print(
+            f"monero-wallet-rpc query_key(spend_key) failed (code={code}, message={msg!r}); refusing to infer wallet custody mode.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+elif isinstance(res_obj, dict) and isinstance(res_obj.get("key"), str):
+    key = res_obj["key"].strip()
+    is_hex_64 = len(key) == 64 and all(ch in "0123456789abcdefABCDEF" for ch in key)
+    if not is_hex_64:
+        print(
+            f"Unexpected query_key(spend_key) key format (len={len(key)}); refusing to infer wallet custody mode.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if all(ch == "0" for ch in key):
+        detected = "view_only"
+    else:
+        detected = "hot_wallet"
+else:
+    print("query_key JSON-RPC response omitted both valid result.key and error.", file=sys.stderr)
+    sys.exit(1)
+
+if expected_mode == "view_only" and detected != "view_only":
+    print(
+        "SECURITY VIOLATION: WALLET_MODE=view_only is configured, but the loaded wallet contains a private spend key! Aborting startup.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+if expected_mode == "hot_wallet" and detected != "hot_wallet":
+    print(
+        "WALLET_MODE=hot_wallet is configured, but the loaded wallet is view-only (missing spend key)! Aborting startup.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+print(detected)
+PYEOF
+    )"; then
+        log_err "Wallet custody mode verification failed (fail-closed). Aborting startup."
         exit 1
     fi
 
-    if [[ "$WALLET_MODE" == "view_only" ]]; then
-        local spend_key=""
-        if [[ "$key_resp" =~ \"key\"[[:space:]]*:[[:space:]]*\"([^\"]*)\" ]]; then
-            spend_key="${BASH_REMATCH[1]}"
-        fi
-        if [[ -n "$spend_key" && ! "$spend_key" =~ ^0+$ ]]; then
-            log_err "SECURITY VIOLATION: WALLET_MODE=view_only is configured, but the loaded wallet contains a private spend key! Aborting startup."
-            exit 1
-        fi
+    if [[ "$verdict" == "view_only" ]]; then
         log_info "Verified view-only wallet status via monero-wallet-rpc (no spend key present)."
     else
-        if [[ "$key_resp" == *'"error"'* ]]; then
-            log_err "WALLET_MODE=hot_wallet is configured, but the loaded wallet is view-only (missing spend key)! Aborting startup."
-            exit 1
-        fi
         log_info "Verified hot wallet status via monero-wallet-rpc."
     fi
 }

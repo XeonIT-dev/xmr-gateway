@@ -176,7 +176,8 @@ loginctl enable-linger "$USER"
   3. Restart & audit: `sudo systemctl restart xmr-gateway.service && sudo -u xmr-gateway xmr-gateway-admin db audit-invariants`.
 - **Secret Rotation:** `sudo -u xmr-gateway xmr-gateway-admin --env /etc/xmr-gateway/.env config rotate-keys all` (creates `0600` `.env.bak.<UTC>`), then `sudo systemctl restart monero-wallet-rpc.service xmr-gateway.service`.
 - **SQLite Backup Restore:** stop `xmr-gateway.service`, remove stale `xmr_gateway.db-wal` and `xmr_gateway.db-shm`, copy verified backup to `xmr_gateway.db` (`chmod 600`, `chown xmr-gateway:xmr-gateway`), run `xmr-gateway-admin db audit-invariants`, and start the service.
-- **Stagenet → Mainnet Cutover:** isolate `.env` and SQLite path, set `MONERO_NETWORK=mainnet`, `ALLOW_PRIVATE_WEBHOOKS=false`, `REQUIRE_HTTPS_WEBHOOKS=true`, rotate distinct `API_SECRET_KEY`/`OPERATOR_API_KEY`, and pass `config doctor` + `dev health-rbac`.
+- **Stagenet → Mainnet Cutover:** isolate `.env` and SQLite path, set `MONERO_NETWORK=mainnet`, `ALLOW_PRIVATE_WEBHOOKS=false`, `REQUIRE_HTTPS_WEBHOOKS=true` (leaving `REQUIRE_HTTPS_WEBHOOKS=false` on mainnet with `ALLOW_PRIVATE_WEBHOOKS=false` emits a startup & `config doctor` security warning), rotate distinct `API_SECRET_KEY`/`OPERATOR_API_KEY` (`OPERATOR_API_KEY` is strictly required for `WALLET_MODE=hot_wallet` / `ENABLE_AUTO_SWEEP=true`), and pass `config doctor` + `dev health-rbac`.
+- **Zero-Argv-Leak RPC & Unlocked Settlement:** systemd units, containers, `start.sh`, `admin/service.sh`, and `demo-stagenet.sh` all pass `monero-wallet-rpc` credentials via a `0600` `--config-file` (never `--rpc-login` in `argv`). `SETTLED`/`COMPLETED` finality requires unlocked covering outputs `>= invoice amount` at `>= SETTLEMENT_CONFIRMATIONS` (blocking custom `unlock_time` attacks while remaining immune to mempool dust DoS).
 
 ---
 

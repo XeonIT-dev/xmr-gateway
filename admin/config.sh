@@ -261,8 +261,10 @@ if op_key:
         add("FAIL", "rbac_key_separation", "OPERATOR_API_KEY must differ from API_SECRET_KEY (AUDIT-002)")
     else:
         add("PASS", "rbac_key_separation", "OPERATOR_API_KEY is set and distinct from API_SECRET_KEY")
+elif wallet_mode == "hot_wallet" or auto_sweep:
+    add("FAIL", "rbac_key_separation", "OPERATOR_API_KEY is required when WALLET_MODE=hot_wallet or ENABLE_AUTO_SWEEP=true (XMR-AUDIT-004)")
 else:
-    add("WARN", "rbac_key_separation", "OPERATOR_API_KEY unset (single-tenant mode: API_SECRET_KEY accepted on operator routes)")
+    add("WARN", "rbac_key_separation", "OPERATOR_API_KEY unset (single-tenant mode in view_only: API_SECRET_KEY accepted on operator routes)")
 
 # 3) Custody mode & wallet invariants (XMR-002)
 if wallet_mode not in ("view_only", "hot_wallet"):
@@ -303,6 +305,8 @@ except ValueError as exc:
 # 5) SSRF & RPC security flags
 if net == "mainnet" and allow_priv_wh:
     add("WARN", "ssrf_policy", "ALLOW_PRIVATE_WEBHOOKS=true on mainnet (recommended false in production)")
+elif net == "mainnet" and not req_https_wh and not allow_priv_wh:
+    add("WARN", "ssrf_policy", "REQUIRE_HTTPS_WEBHOOKS=false on mainnet permits plaintext HTTP webhooks over public networks (set REQUIRE_HTTPS_WEBHOOKS=true, XMR-AUDIT-006)")
 else:
     add("PASS", "ssrf_policy", f"ALLOW_PRIVATE_WEBHOOKS={str(allow_priv_wh).lower()}, REQUIRE_HTTPS_WEBHOOKS={str(req_https_wh).lower()}")
 

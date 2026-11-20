@@ -10834,3 +10834,232 @@ async fn regression_audit_005_graceful_shutdown_and_wal_checkpoint() {
 
     checkpoint_and_close_pool(reopened, &db_url).await.unwrap();
 }
+
+/// End-to-end regression suite for external audit hardening findings (`XMR-AUDIT-001`,
+/// `XMR-AUDIT-003`, and `XMR-AUDIT-004`):
+/// - `XMR-AUDIT-001`: custom `unlock_time` outputs (`confirmations = 20, locked = true`) reach
+///   `CONFIRMED` but MUST NOT transition to `SETTLED`/`COMPLETED` until unlocked; once
+///   `SETTLED`/`COMPLETED`, a late 1-piconero mempool dust transfer MUST NOT trigger `REORGED`.
+/// - `XMR-AUDIT-003`: `verify_wallet_mode` fails closed on non-watch-only JSON-RPC errors
+///   (`-32601`, `-32603`, `-13`) and malformed/empty spend keys in both `ViewOnly` and `HotWallet`.
+/// - `XMR-AUDIT-004`: `Config::validate` requires a distinct `OPERATOR_API_KEY` whenever
+///   `WALLET_MODE=hot_wallet` or `ENABLE_AUTO_SWEEP=true`.
+#[tokio::test]
+async fn regression_external_audit_hardening_xmr_audit_001_003_004() {
+    let mock_rpc = MockServer::start().await;
+    let mock_hook = MockServer::start().await;
+
+    // -------------------------------------------------------------------------
+    // 1) XMR-AUDIT-003: fail-closed verify_wallet_mode against RPC errors/garbage
+    // -------------------------------------------------------------------------
+    let rpc_client =
+        MoneroRpcClient::new(&format!("{}/json_rpc", mock_rpc.uri()), None, None).unwrap();
+
+    for (code, msg) in [
+        (-32601, "Method not found"),
+        (-32603, "Internal error"),
+        (-13, "No wallet file"),
+    ] {
+        mock_rpc.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/json_rpc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "1",
+                "error": { "code": code, "message": msg }
+            })))
+            .mount(&mock_rpc)
+            .await;
+
+        assert!(
+            rpc_client
+                .verify_wallet_mode(WalletMode::ViewOnly)
+                .await
+                .is_err(),
+            "RPC error {code} ({msg}) MUST NOT be treated as watch-only"
+        );
+        assert!(
+            rpc_client
+                .verify_wallet_mode(WalletMode::HotWallet)
+                .await
+                .is_err(),
+            "RPC error {code} ({msg}) MUST fail closed in hot_wallet mode"
+        );
+    }
+
+    mock_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "2",
+            "result": { "key": "" }
+        })))
+        .mount(&mock_rpc)
+        .await;
+    assert!(
+        rpc_client
+            .verify_wallet_mode(WalletMode::ViewOnly)
+            .await
+            .is_err(),
+        "empty key MUST fail closed in view_only mode"
+    );
+
+    // -------------------------------------------------------------------------
+    // 2) XMR-AUDIT-004: hot_wallet requires OPERATOR_API_KEY
+    // -------------------------------------------------------------------------
+    let mut hot_cfg =
+        (*test_config(format!("{}/json_rpc", mock_rpc.uri()), None, true, 2, 10)).clone();
+    hot_cfg.operator_api_key = None;
+    assert!(
+        hot_cfg.validate().is_err(),
+        "hot_wallet without OPERATOR_API_KEY MUST fail validation"
+    );
+    hot_cfg.operator_api_key = Some("distinct-operator-secret-key-0123456789".to_string());
+    assert!(
+        hot_cfg.validate().is_ok(),
+        "hot_wallet with distinct OPERATOR_API_KEY must pass validation"
+    );
+
+    // -------------------------------------------------------------------------
+    // 3) XMR-AUDIT-001: Scanner + DB + Webhook unlocked settlement & anti-Dust-DoS
+    // -------------------------------------------------------------------------
+    mock_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock_hook)
+        .await;
+
+    let pool = init_sqlite_pool("sqlite::memory:").await.unwrap();
+    let repo = InvoiceRepository::new(pool);
+    let hook_url = format!("{}/hook", mock_hook.uri());
+    let cfg = test_config(
+        format!("{}/json_rpc", mock_rpc.uri()),
+        Some(hook_url.clone()),
+        false,
+        2,
+        10,
+    );
+    let scanner = ScannerService::new(repo.clone(), rpc_client.clone(), cfg.clone());
+    let dispatcher = WebhookDispatcher::new(
+        repo.clone(),
+        false,
+        Duration::from_millis(20),
+        cfg.webhook_url_policy(),
+    )
+    .unwrap();
+
+    let inv = make_invoice(77, 1_000_000_000_000, Some(hook_url));
+    repo.insert_invoice(&inv).await.unwrap();
+
+    // 3a) Full payment with 20 confirmations, but locked=true (custom unlock_time).
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_transfers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "10",
+            "result": {
+                "in": [{
+                    "txid": "a".repeat(64),
+                    "amount": 1_000_000_000_000_u64,
+                    "confirmations": 20,
+                    "double_spend_seen": false,
+                    "locked": true,
+                    "subaddr_index": { "major": 0, "minor": 77 }
+                }]
+            }
+        })))
+        .mount(&mock_rpc)
+        .await;
+
+    scanner.scan_once().await.unwrap();
+    let after_first = repo.get_invoice_by_id(inv.id).await.unwrap().unwrap();
+    assert_eq!(after_first.status, InvoiceStatus::Confirmed);
+
+    // Second scan while still locked=true MUST stay CONFIRMED (never SETTLED/COMPLETED).
+    scanner.scan_once().await.unwrap();
+    dispatcher.process_due_deliveries().await.unwrap();
+    let still_confirmed = repo.get_invoice_by_id(inv.id).await.unwrap().unwrap();
+    assert_eq!(
+        still_confirmed.status,
+        InvoiceStatus::Confirmed,
+        "locked output at 20 confs must remain CONFIRMED and never enter SETTLED/COMPLETED"
+    );
+
+    // 3b) Output unlocks (locked=false) -> transitions to SETTLED, then webhook completes -> COMPLETED.
+    mock_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_transfers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "11",
+            "result": {
+                "in": [{
+                    "txid": "a".repeat(64),
+                    "amount": 1_000_000_000_000_u64,
+                    "confirmations": 20,
+                    "double_spend_seen": false,
+                    "locked": false,
+                    "subaddr_index": { "major": 0, "minor": 77 }
+                }]
+            }
+        })))
+        .mount(&mock_rpc)
+        .await;
+
+    scanner.scan_once().await.unwrap();
+    let settled = repo.get_invoice_by_id(inv.id).await.unwrap().unwrap();
+    assert_eq!(settled.status, InvoiceStatus::Settled);
+
+    dispatcher.process_due_deliveries().await.unwrap();
+    let completed = repo.get_invoice_by_id(inv.id).await.unwrap().unwrap();
+    assert_eq!(completed.status, InvoiceStatus::Completed);
+
+    // 3c) Anti-Dust-DoS: attacker sends 1 piconero into mempool on the COMPLETED subaddress.
+    mock_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_transfers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "12",
+            "result": {
+                "in": [{
+                    "txid": "a".repeat(64),
+                    "amount": 1_000_000_000_000_u64,
+                    "confirmations": 20,
+                    "double_spend_seen": false,
+                    "locked": false,
+                    "subaddr_index": { "major": 0, "minor": 77 }
+                }],
+                "pool": [{
+                    "txid": "b".repeat(64),
+                    "amount": 1_u64,
+                    "confirmations": 0,
+                    "double_spend_seen": false,
+                    "locked": true,
+                    "subaddr_index": { "major": 0, "minor": 77 }
+                }]
+            }
+        })))
+        .mount(&mock_rpc)
+        .await;
+
+    scanner.scan_once().await.unwrap();
+    let after_dust = repo.get_invoice_by_id(inv.id).await.unwrap().unwrap();
+    assert_eq!(
+        after_dust.status,
+        InvoiceStatus::Completed,
+        "1-piconero mempool dust MUST NOT force COMPLETED invoice into REORGED"
+    );
+    let hooks = repo.list_webhooks_for_invoice(inv.id).await.unwrap();
+    assert!(
+        hooks
+            .iter()
+            .all(|h| h.event_type != WebhookEventType::Reorged),
+        "mempool dust MUST NOT emit a REORGED webhook"
+    );
+}
