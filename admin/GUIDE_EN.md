@@ -41,7 +41,7 @@ Inside the main interactive menu, press **`L`** to toggle `EN ↔ RU` instantane
 - `--json` — machine-readable JSON output that is **byte-for-byte identical** under `--lang en` and `--lang ru` (keys, statuses, and enum values are never localized).
 - `--yes` / `-y` — non-interactive confirmation for automation.
 - **`[MAINNET]` Safety Guard:** when `MONERO_NETWORK=mainnet`, all financial or destructive actions (`transfer`, `sweep`, `sweep-all`, `resolve`, `rotate-keys`, `stop`, `set-mode`, `db shell --rw`) display a red `[MAINNET]` warning banner and require typing **`yes`** explicitly (or passing `--yes`). Non-interactive calls without `--yes` fail closed.
-- **Zero-Argv-Leak Secret Passing:** `API_SECRET_KEY`, `OPERATOR_API_KEY`, `MONERO_RPC_PASS`, and `MONERO_DAEMON_RPC_PASS` are passed to `curl` strictly via stdin (`curl --config -`) so secrets never appear in `ps aux`.
+- **Zero-Argv-Leak Secret Passing:** `API_SECRET_KEY`, `OPERATOR_API_KEY`, `MONERO_RPC_PASS`, and `MONERO_DAEMON_RPC_PASS` are passed to `curl` strictly via stdin (`curl --config -`), and `monero-wallet-rpc` credentials are written to a temporary `0600` `--config-file` (deleted on stop) so secrets never appear in `ps aux`.
 
 - **System-Wide Package Installs (`.deb` / `.rpm` / tarball):** once installed from a system package, invoke **`xmr-gateway-admin`** (`/usr/bin/xmr-gateway-admin` → `/usr/share/xmr-gateway/admin.sh`). When `--env` is omitted and no local `.env` exists, it automatically uses `/etc/xmr-gateway/.env` and stores `.admin_lang` in `/var/lib/xmr-gateway` or `~/.local/state/xmr-gateway/` (never attempting writes into read-only `/usr/share/xmr-gateway`). See [DEPLOY_EN.md](../DEPLOY_EN.md) for full `systemd`, Docker Compose, Podman Quadlet, and package instructions.
 
@@ -72,10 +72,10 @@ Inside the main interactive menu, press **`L`** to toggle `EN ↔ RU` instantane
 | `env_permissions` | FAIL | Active `.env` must have mode `0600` (`chmod 600 .env`). |
 | `wallet_*_permissions`, `db/wal/shm_permissions` | FAIL | `.keys`, `.password`, `.db`, `-wal`, `-shm` files must have mode `0600`. |
 | `secret_api_secret_key`, `secret_webhook_secret`, `secret_operator_api_key` | FAIL | Must be `>= 32` bytes and free of placeholders (`replace-with-*`, `changeme*`). Rotate via `config rotate-keys`. |
-| `rbac_key_separation` | FAIL / WARN | When set, `OPERATOR_API_KEY` must differ from `API_SECRET_KEY` (`AUDIT-002`). Unset emits `WARN` (single-tenant mode). |
+| `rbac_key_separation` | FAIL / WARN | When set, `OPERATOR_API_KEY` must differ from `API_SECRET_KEY` (`AUDIT-002`). Missing `OPERATOR_API_KEY` is `FAIL` in `hot_wallet` / `ENABLE_AUTO_SWEEP=true` (`XMR-AUDIT-004`) and `WARN` in `view_only` (single-tenant fallback). |
 | `wallet_mode`, `cold_wallet_address` | FAIL | `ENABLE_AUTO_SWEEP=true` requires `WALLET_MODE=hot_wallet` and `COLD_WALLET_ADDRESS`; `hot_wallet` without sweep requires `ALLOW_HOT_WALLET_WITHOUT_SWEEP=true`. |
 | `confirmations`, `sweep_priority` | FAIL | `REQUIRED_CONFIRMATIONS >= 1`, `SETTLEMENT_CONFIRMATIONS >= REQUIRED_CONFIRMATIONS`, `SWEEP_PRIORITY` in `0..4`. |
-| `ssrf_policy` | WARN / PASS | `ALLOW_PRIVATE_WEBHOOKS=true` on `mainnet` triggers `WARN` (keep `false` + `REQUIRE_HTTPS_WEBHOOKS=true` in production). |
+| `ssrf_policy` | WARN / PASS | On `mainnet`, `ALLOW_PRIVATE_WEBHOOKS=true` or (`REQUIRE_HTTPS_WEBHOOKS=false` with `ALLOW_PRIVATE_WEBHOOKS=false`, `XMR-AUDIT-006`) triggers `WARN`; keep `ALLOW_PRIVATE_WEBHOOKS=false` + `REQUIRE_HTTPS_WEBHOOKS=true` in production. |
 | `rpc_auth`, `daemon_rpc_security` | FAIL / WARN | `ALLOW_UNAUTHENTICATED_RPC=false` requires `MONERO_RPC_USER`/`PASS`; `MONERO_DAEMON_RPC_URL` enforces RPC transport & auth rules (`AUDIT-001`, required for `allow_resweep`). |
 | `health_anon_privacy`, `health_auth_api`, `health_auth_operator` | FAIL | Confirms live unauthenticated `GET /health` hides telemetry (`service`/`monero_rpc`/`database`) while authenticated requests receive full diagnostics (`AUDIT-002`). |
 | `wallet_daemon_sync` | WARN / PASS | Compares wallet `get_height` vs daemon `get_info` height; lag `> 5` blocks raises `WARN`. |

@@ -30,6 +30,7 @@ C_HOOK=$'\033[1;35m'
 C_ERR=$'\033[1;31m'
 
 RPC_PID=""
+RPC_CONF_FILE=""
 RPC_TAIL_PID=""
 WEBHOOK_PID=""
 GATEWAY_PID=""
@@ -66,6 +67,9 @@ cleanup() {
     stop_pid "$WEBHOOK_PID" "webhook listener"
     stop_pid "$RPC_TAIL_PID" "RPC log tailer"
     stop_pid "$RPC_PID" "monero-wallet-rpc"
+    if [[ -n "$RPC_CONF_FILE" ]]; then
+        rm -f "$RPC_CONF_FILE"
+    fi
 }
 
 on_signal() {
@@ -168,7 +172,21 @@ main() {
         demo_err "MONERO_RPC_USER and MONERO_RPC_PASS must both be set in .env (unauthenticated monero-wallet-rpc is forbidden)."
         exit 1
     fi
-    rpc_args+=(--rpc-login "${MONERO_RPC_USER}:${MONERO_RPC_PASS}")
+    if [[ "$MONERO_RPC_USER" == *$'\n'* || "$MONERO_RPC_USER" == *$'\r'* || "$MONERO_RPC_PASS" == *$'\n'* || "$MONERO_RPC_PASS" == *$'\r'* ]]; then
+        demo_err "MONERO_RPC_USER and MONERO_RPC_PASS must not contain newline characters."
+        exit 1
+    fi
+    if [[ -n "${XDG_RUNTIME_DIR:-}" && -d "$XDG_RUNTIME_DIR" && -w "$XDG_RUNTIME_DIR" ]]; then
+        RPC_CONF_FILE="${XDG_RUNTIME_DIR}/xmr-gateway-wallet-rpc.conf"
+    else
+        RPC_CONF_FILE="${DATA_DIR}/.monero-wallet-rpc.conf"
+    fi
+    (
+        umask 077
+        printf 'rpc-login=%s:%s\n' "$MONERO_RPC_USER" "$MONERO_RPC_PASS" > "$RPC_CONF_FILE"
+    )
+    chmod 600 "$RPC_CONF_FILE"
+    rpc_args+=(--config-file "$RPC_CONF_FILE")
     if [[ -n "${MONERO_RPC_PROXY:-}" ]]; then
         rpc_args+=(--proxy "$MONERO_RPC_PROXY")
     fi
@@ -180,10 +198,9 @@ main() {
     tail -n 0 -F "$RPC_LOG_FILE" > >(prefix_stream "${C_RPC}[RPC]${C_RESET}") 2>&1 &
     RPC_TAIL_PID=$!
 
-    local curl_auth_args=()
-    if [[ -n "$MONERO_RPC_USER" ]]; then
-        curl_auth_args=(--digest -u "${MONERO_RPC_USER}:${MONERO_RPC_PASS}")
-    fi
+    local curl_escaped_creds="${MONERO_RPC_USER}:${MONERO_RPC_PASS}"
+    curl_escaped_creds="${curl_escaped_creds//\\/\\\\}"
+    curl_escaped_creds="${curl_escaped_creds//\"/\\\"}"
 
     local attempt=0
     while [[ "$attempt" -lt 120 ]]; do
@@ -192,10 +209,10 @@ main() {
             exit 1
         fi
         local rpc_resp
-        rpc_resp="$(curl -sS "${curl_auth_args[@]}" \
-            -H 'Content-Type: application/json' \
-            -d '{"jsonrpc":"2.0","id":"0","method":"get_version"}' \
-            "http://127.0.0.1:18082/json_rpc" 2>/dev/null || true)"
+        rpc_resp="$(printf 'header = "Content-Type: application/json"\ndigest\nuser = "%s"\n' "$curl_escaped_creds" \
+            | curl -sS --config - \
+                -d '{"jsonrpc":"2.0","id":"0","method":"get_version"}' \
+                "http://127.0.0.1:18082/json_rpc" 2>/dev/null || true)"
         if [[ "$rpc_resp" == *'"result"'* ]]; then
             demo_log "monero-wallet-rpc is ready on 127.0.0.1:18082."
             break

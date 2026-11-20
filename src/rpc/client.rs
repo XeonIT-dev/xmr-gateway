@@ -295,14 +295,23 @@ impl MoneroRpcClient {
     }
 
     /// Queries `monero-wallet-rpc` (`query_key` with `spend_key`) to determine whether the loaded
-    /// wallet is strictly watch-only (holds no private spend key).
+    /// wallet is strictly watch-only (holds no private spend key), failing closed on ambiguity
+    /// (`XMR-AUDIT-003`).
     ///
-    /// Returns `Ok(true)` if `monero-wallet-rpc` rejects `query_key(spend_key)` with a JSON-RPC
-    /// error (the standard behavior for watch-only wallets) or returns an empty/all-zero spend key.
+    /// # Fail-Closed Contract
+    /// - Returns `Ok(true)` **only** if `monero-wallet-rpc` returns Monero's canonical 64-zero
+    ///   watch-only sentinel (`"0".repeat(64)`, i.e. `crypto::null_skey`) OR a JSON-RPC error
+    ///   whose message explicitly indicates a watch-only/view-only wallet with no spend key.
+    /// - Returns `Ok(false)` if `monero-wallet-rpc` returns a valid non-zero 64-character
+    ///   hexadecimal spend key.
+    /// - Returns `Err(GatewayError::Rpc { .. })` for empty/malformed key strings and for all
+    ///   non-watch-only JSON-RPC errors (e.g., `-32601 Method not found`, `-32603 Internal error`,
+    ///   `-13 No wallet file`), blocking startup rather than misclassifying errors as watch-only.
     ///
     /// # Errors
-    /// Returns [`GatewayError::RpcTransport`] if `monero-wallet-rpc` is unreachable or returns
-    /// malformed HTTP responses.
+    /// Returns [`GatewayError::Rpc`] on malformed key payloads or non-watch-only JSON-RPC errors,
+    /// or [`GatewayError::RpcTransport`] if `monero-wallet-rpc` is unreachable or returns
+    /// malformed HTTP/JSON responses.
     pub async fn is_view_only_wallet(&self) -> GatewayResult<bool> {
         let resp: GatewayResult<QueryKeyResponse> = self
             .call(
@@ -316,9 +325,27 @@ impl MoneroRpcClient {
         match resp {
             Ok(key_resp) => {
                 let trimmed = key_resp.key.trim();
-                Ok(trimmed.is_empty() || trimmed.bytes().all(|b| b == b'0'))
+                if trimmed.len() == 64 && trimmed.bytes().all(|b| b == b'0') {
+                    Ok(true)
+                } else if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    Ok(false)
+                } else {
+                    Err(GatewayError::Rpc {
+                        code: None,
+                        message: format!(
+                            "unexpected query_key(spend_key) response format (len={}); refusing to infer wallet custody mode",
+                            trimmed.len()
+                        ),
+                    })
+                }
             }
-            Err(GatewayError::Rpc { .. }) => Ok(true),
+            Err(GatewayError::Rpc { code, message }) => {
+                if is_explicit_watch_only_rpc_error(&message) {
+                    Ok(true)
+                } else {
+                    Err(GatewayError::Rpc { code, message })
+                }
+            }
             Err(other) => Err(other),
         }
     }
@@ -326,10 +353,12 @@ impl MoneroRpcClient {
     /// Verifies that the wallet loaded by `monero-wallet-rpc` strictly matches `expected_mode`.
     ///
     /// Fails closed if `WALLET_MODE=view_only` is configured while `monero-wallet-rpc` holds a
-    /// private spend key, or if `WALLET_MODE=hot_wallet` is configured with a watch-only wallet.
+    /// private spend key, if `WALLET_MODE=hot_wallet` is configured with a watch-only wallet,
+    /// or if `query_key(spend_key)` fails with an unrecognized RPC/transport error.
     ///
     /// # Errors
-    /// Returns [`GatewayError::Config`] on custody mode mismatch, or
+    /// Returns [`GatewayError::Config`] on custody mode mismatch, [`GatewayError::Rpc`] on
+    /// unrecognized JSON-RPC errors or malformed key responses, or
     /// [`GatewayError::RpcTransport`] if `monero-wallet-rpc` cannot be reached.
     pub async fn verify_wallet_mode(&self, expected_mode: WalletMode) -> GatewayResult<()> {
         let view_only = self.is_view_only_wallet().await?;
@@ -643,6 +672,18 @@ impl MoneroRpcClient {
     }
 }
 
+/// Returns `true` iff a `monero-wallet-rpc` `query_key(spend_key)` error message explicitly
+/// identifies a watch-only / view-only wallet without a private spend key (`XMR-AUDIT-003`).
+fn is_explicit_watch_only_rpc_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("watch-only")
+        || lower.contains("watch only")
+        || lower.contains("view-only")
+        || lower.contains("view only")
+        || lower.contains("no spend key")
+        || lower.contains("cannot retrieve spend key")
+}
+
 /// Verifies that `monerod` `get_info` identifies the expected Monero network with no conflicting
 /// network indicators (`AUDIT-001`).
 fn daemon_matches_network(info: &GetInfoResponse, expected: MoneroNetwork) -> bool {
@@ -903,6 +944,122 @@ mod tests {
                 .await
                 .is_ok()
         );
+
+        // 4) Watch-only RPC phrasing variant ("The wallet is watch-only...") -> Ok(true)
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/json_rpc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "4",
+                "error": { "code": -1, "message": "The wallet is watch-only and has no spend key" }
+            })))
+            .mount(&server)
+            .await;
+
+        assert!(client.is_view_only_wallet().await.unwrap());
+        assert!(
+            client
+                .verify_wallet_mode(WalletMode::ViewOnly)
+                .await
+                .is_ok()
+        );
+        assert!(matches!(
+            client.verify_wallet_mode(WalletMode::HotWallet).await,
+            Err(GatewayError::Config(_))
+        ));
+
+        // 5) Empty or malformed spend key MUST fail closed in both modes (XMR-AUDIT-003)
+        for bad_key in ["", "0000", "z".repeat(64).as_str(), "not-a-valid-key"] {
+            server.reset().await;
+            Mock::given(method("POST"))
+                .and(path("/json_rpc"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "5",
+                    "result": { "key": bad_key }
+                })))
+                .mount(&server)
+                .await;
+
+            assert!(matches!(
+                client.is_view_only_wallet().await,
+                Err(GatewayError::Rpc { .. })
+            ));
+            assert!(matches!(
+                client.verify_wallet_mode(WalletMode::ViewOnly).await,
+                Err(GatewayError::Rpc { .. })
+            ));
+            assert!(matches!(
+                client.verify_wallet_mode(WalletMode::HotWallet).await,
+                Err(GatewayError::Rpc { .. })
+            ));
+        }
+
+        // 6) Generic/unknown JSON-RPC errors MUST fail closed in both modes (XMR-AUDIT-003)
+        for (code, msg) in [
+            (-32601, "Method not found"),
+            (-32603, "Internal error"),
+            (-13, "No wallet file"),
+            (-1, "Unexpected daemon timeout"),
+        ] {
+            server.reset().await;
+            Mock::given(method("POST"))
+                .and(path("/json_rpc"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "6",
+                    "error": { "code": code, "message": msg }
+                })))
+                .mount(&server)
+                .await;
+
+            assert!(matches!(
+                client.is_view_only_wallet().await,
+                Err(GatewayError::Rpc { code: Some(c), .. }) if c == code
+            ));
+            assert!(matches!(
+                client.verify_wallet_mode(WalletMode::ViewOnly).await,
+                Err(GatewayError::Rpc { code: Some(c), .. }) if c == code
+            ));
+            assert!(matches!(
+                client.verify_wallet_mode(WalletMode::HotWallet).await,
+                Err(GatewayError::Rpc { code: Some(c), .. }) if c == code
+            ));
+        }
+
+        // 7) Broken JSON and HTTP transport errors MUST fail closed in both modes
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/json_rpc"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{not-valid-json"))
+            .mount(&server)
+            .await;
+
+        assert!(matches!(
+            client.verify_wallet_mode(WalletMode::ViewOnly).await,
+            Err(GatewayError::RpcTransport(_))
+        ));
+        assert!(matches!(
+            client.verify_wallet_mode(WalletMode::HotWallet).await,
+            Err(GatewayError::RpcTransport(_))
+        ));
+
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/json_rpc"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+            .mount(&server)
+            .await;
+
+        assert!(matches!(
+            client.verify_wallet_mode(WalletMode::ViewOnly).await,
+            Err(GatewayError::RpcTransport(_))
+        ));
+        assert!(matches!(
+            client.verify_wallet_mode(WalletMode::HotWallet).await,
+            Err(GatewayError::RpcTransport(_))
+        ));
     }
 
     #[tokio::test]

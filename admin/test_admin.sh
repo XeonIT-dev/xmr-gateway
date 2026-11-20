@@ -993,6 +993,132 @@ for key in ("post_install_script", "pre_uninstall_script", "post_uninstall_scrip
 PYEOF
 pass "YAML workflows/compose and Cargo.toml deb/rpm packaging metadata validated cleanly"
 
+# ==============================================================================
+# 10. External Audit Hardening Checks (XMR-AUDIT-003 / 004 / 005 / 006)
+# ==============================================================================
+printf '\n=== 10. External Audit Hardening Checks ===\n'
+
+# 10a) XMR-AUDIT-005: no --rpc-login in argv in start.sh, admin/service.sh, or demo-stagenet.sh
+for rpc_script in "$REPO_ROOT/start.sh" "$REPO_ROOT/admin/service.sh" "$REPO_ROOT/demo-stagenet.sh"; do
+    rel_name="${rpc_script#"$REPO_ROOT"/}"
+    if grep -vE '^[[:space:]]*#' "$rpc_script" | grep -q -- '--rpc-login'; then
+        fail "XMR-AUDIT-005: $rel_name still passes --rpc-login in process argv"
+    else
+        pass "XMR-AUDIT-005: $rel_name passes zero --rpc-login flags in argv"
+    fi
+    if grep -vE '^[[:space:]]*#' "$rpc_script" | grep -q -- '--config-file'; then
+        pass "XMR-AUDIT-005: $rel_name passes --config-file for monero-wallet-rpc"
+    else
+        fail "XMR-AUDIT-005: $rel_name missing --config-file for monero-wallet-rpc"
+    fi
+done
+
+# 10b) XMR-AUDIT-004: config doctor fails closed on hot_wallet without OPERATOR_API_KEY
+HOT_NO_OP_ENV="$TMP_DIR/hot_no_op.env"
+cat > "$HOT_NO_OP_ENV" <<EOF
+HOST=127.0.0.1
+PORT=${MOCK_PORT}
+DATABASE_URL=sqlite://${DB_FILE}
+API_SECRET_KEY=${API_KEY}
+WEBHOOK_SECRET=${WH_SECRET}
+ALLOW_PRIVATE_WEBHOOKS=true
+REQUIRE_HTTPS_WEBHOOKS=false
+MONERO_NETWORK=stagenet
+WALLET_MODE=hot_wallet
+ENABLE_AUTO_SWEEP=false
+ALLOW_HOT_WALLET_WITHOUT_SWEEP=true
+MONERO_RPC_URL=http://127.0.0.1:${MOCK_PORT}/json_rpc
+MONERO_RPC_USER=rpc_user
+MONERO_RPC_PASS=${RPC_PASS}
+ALLOW_UNAUTHENTICATED_RPC=false
+REQUIRED_CONFIRMATIONS=2
+SETTLEMENT_CONFIRMATIONS=10
+SWEEP_PRIORITY=0
+EOF
+chmod 600 "$HOT_NO_OP_ENV"
+HOT_DOC_JSON=""
+if HOT_DOC_JSON="$("$ADMIN_SH" --env "$HOT_NO_OP_ENV" --json config doctor 2>&1)"; then
+    fail "XMR-AUDIT-004: config doctor MUST fail closed when hot_wallet lacks OPERATOR_API_KEY"
+else
+    assert_contains "$HOT_DOC_JSON" "OPERATOR_API_KEY is required" "XMR-AUDIT-004: config doctor rejects hot_wallet without OPERATOR_API_KEY"
+fi
+
+# 10c) XMR-AUDIT-006: config doctor warns on mainnet cleartext public HTTP webhooks
+MAINNET_HTTP_ENV="$TMP_DIR/mainnet_http.env"
+cat > "$MAINNET_HTTP_ENV" <<EOF
+HOST=127.0.0.1
+PORT=${MOCK_PORT}
+DATABASE_URL=sqlite://${DB_FILE}
+API_SECRET_KEY=${API_KEY}
+OPERATOR_API_KEY=${OP_KEY}
+WEBHOOK_SECRET=${WH_SECRET}
+ALLOW_PRIVATE_WEBHOOKS=false
+REQUIRE_HTTPS_WEBHOOKS=false
+MONERO_NETWORK=mainnet
+WALLET_MODE=view_only
+ENABLE_AUTO_SWEEP=false
+MONERO_RPC_URL=http://127.0.0.1:${MOCK_PORT}/json_rpc
+MONERO_RPC_USER=rpc_user
+MONERO_RPC_PASS=${RPC_PASS}
+ALLOW_UNAUTHENTICATED_RPC=false
+REQUIRED_CONFIRMATIONS=10
+SETTLEMENT_CONFIRMATIONS=10
+SWEEP_PRIORITY=0
+EOF
+chmod 600 "$MAINNET_HTTP_ENV"
+MAINNET_DOC_JSON="$("$ADMIN_SH" --env "$MAINNET_HTTP_ENV" --json config doctor)"
+assert_contains "$MAINNET_DOC_JSON" "XMR-AUDIT-006" "XMR-AUDIT-006: config doctor warns on mainnet REQUIRE_HTTPS_WEBHOOKS=false"
+
+# 10d) XMR-AUDIT-003: verify start.sh fail-closed JSON parser logic across RPC responses
+python3 - "$REPO_ROOT/start.sh" <<'PYEOF'
+import json, os, re, subprocess, sys
+
+start_sh = open(sys.argv[1], encoding="utf-8").read()
+m = re.search(r"python3 - \"\$WALLET_MODE\" <<'PYEOF'\n(.*?)\nPYEOF", start_sh, re.S)
+assert m is not None, "Could not locate fail-closed Python query_key verifier in start.sh"
+py_code = m.group(1)
+
+def run_check(mode: str, raw_resp: str) -> int:
+    env = dict(os.environ)
+    env["RPC_QUERY_KEY_RESP"] = raw_resp
+    proc = subprocess.run(
+        [sys.executable, "-c", py_code, mode],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    return proc.returncode
+
+# 64 zeros -> view_only OK, hot_wallet rejected
+z64 = json.dumps({"jsonrpc": "2.0", "id": "1", "result": {"key": "0" * 64}})
+assert run_check("view_only", z64) == 0
+assert run_check("hot_wallet", z64) != 0
+
+# Real 64-hex spend key -> hot_wallet OK, view_only rejected
+k64 = json.dumps({"jsonrpc": "2.0", "id": "2", "result": {"key": "a" * 64}})
+assert run_check("hot_wallet", k64) == 0
+assert run_check("view_only", k64) != 0
+
+# Explicit watch-only RPC error -> view_only OK, hot_wallet rejected
+wo_err = json.dumps({"jsonrpc": "2.0", "id": "3", "error": {"code": -1, "message": "The wallet is watch-only"}})
+assert run_check("view_only", wo_err) == 0
+assert run_check("hot_wallet", wo_err) != 0
+
+# Unknown RPC errors (-32601, -32603, -13), empty key, malformed key, broken JSON -> FAIL CLOSED in BOTH modes!
+for bad in (
+    json.dumps({"jsonrpc": "2.0", "id": "4", "error": {"code": -32601, "message": "Method not found"}}),
+    json.dumps({"jsonrpc": "2.0", "id": "5", "error": {"code": -32603, "message": "Internal error"}}),
+    json.dumps({"jsonrpc": "2.0", "id": "6", "error": {"code": -13, "message": "No wallet file"}}),
+    json.dumps({"jsonrpc": "2.0", "id": "7", "result": {"key": ""}}),
+    json.dumps({"jsonrpc": "2.0", "id": "8", "result": {"key": "0000"}}),
+    json.dumps({"jsonrpc": "2.0", "id": "9", "result": {}}),
+    "{broken-json",
+):
+    assert run_check("view_only", bad) != 0, f"view_only MUST fail closed on {bad!r}"
+    assert run_check("hot_wallet", bad) != 0, f"hot_wallet MUST fail closed on {bad!r}"
+PYEOF
+pass "XMR-AUDIT-003: start.sh fail-closed query_key JSON verifier passed all positive & adversarial cases"
+
 printf '\n====================================================================\n'
 printf 'Admin Test Summary: %d PASSED, %d FAILED\n' "$PASS_COUNT" "$FAIL_COUNT"
 printf '====================================================================\n'

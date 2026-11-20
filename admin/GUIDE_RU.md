@@ -41,7 +41,7 @@
 - `--json` — машиночитаемый JSON-вывод, **байт-в-байт идентичный** при `--lang ru` и `--lang en` (ключи, статусы и enum-поля не переводятся).
 - `--yes` / `-y` — неинтерактивное подтверждение для автоматизации.
 - **Предохранитель `[MAINNET]`:** при `MONERO_NETWORK=mainnet` перед финансовыми/деструктивными операциями (`transfer`, `sweep`, `sweep-all`, `resolve`, `rotate-keys`, `stop`, `set-mode`, `db shell --rw`) выводится красный баннер `[MAINNET]` и требуется ввод точного слова **`yes`** (либо явный `--yes`). В неинтерактивном окружении без `--yes` команда завершается fail-closed.
-- **Защита секретов в `ps aux`:** `API_SECRET_KEY`, `OPERATOR_API_KEY`, `MONERO_RPC_PASS` и `MONERO_DAEMON_RPC_PASS` передаются в `curl` строго через `stdin` (`curl --config -`), никогда не попадая в аргументы командной строки.
+- **Защита секретов в `ps aux`:** `API_SECRET_KEY`, `OPERATOR_API_KEY`, `MONERO_RPC_PASS` и `MONERO_DAEMON_RPC_PASS` передаются в `curl` строго через `stdin` (`curl --config -`), а учётные данные `monero-wallet-rpc` записываются во временный `0600`-файл (`--config-file`, удаляется при остановке), никогда не попадая в аргументы командной строки.
 
 - **Системная установка (из `.deb` / `.rpm` или tarball):** после установки из пакета админ-панель доступна глобально как **`xmr-gateway-admin`** (`/usr/bin/xmr-gateway-admin` → `/usr/share/xmr-gateway/admin.sh`). Если флаг `--env` не передан и рядом нет локального `.env`, автоматически подхватывается `/etc/xmr-gateway/.env`, а файл языка `.admin_lang` сохраняется в `/var/lib/xmr-gateway` или `~/.local/state/xmr-gateway/` (никогда не пытаясь писать в read-only `/usr/share/xmr-gateway`). Полное руководство по деплою, `systemd`, Docker/Podman и пакетам см. в [DEPLOY_RU.md](../DEPLOY_RU.md).
 
@@ -72,10 +72,10 @@
 | `env_permissions` | FAIL | Права `.env` обязаны быть `0600` (`chmod 600 .env`). |
 | `wallet_*_permissions`, `db/wal/shm_permissions` | FAIL | Файлы `.keys`, `.password`, `.db`, `-wal`, `-shm` должны иметь права `0600`. |
 | `secret_api_secret_key`, `secret_webhook_secret`, `secret_operator_api_key` | FAIL | Длина `>= 32` байт, отсутствие плейсхолдеров (`replace-with-*`, `changeme*`). Сгенерируйте через `config rotate-keys`. |
-| `rbac_key_separation` | FAIL / WARN | При заданном `OPERATOR_API_KEY` он обязан отличаться от `API_SECRET_KEY` (`AUDIT-002`). Если не задан — `WARN` (single-tenant режим). |
+| `rbac_key_separation` | FAIL / WARN | При заданном `OPERATOR_API_KEY` он обязан отличаться от `API_SECRET_KEY` (`AUDIT-002`). Отсутствие `OPERATOR_API_KEY` в `hot_wallet` / `ENABLE_AUTO_SWEEP=true` даёт `FAIL` (`XMR-AUDIT-004`), в `view_only` — `WARN` (single-tenant fallback). |
 | `wallet_mode`, `cold_wallet_address` | FAIL | `ENABLE_AUTO_SWEEP=true` требует `WALLET_MODE=hot_wallet` и валидный `COLD_WALLET_ADDRESS`; `hot_wallet` без автосвипа требует `ALLOW_HOT_WALLET_WITHOUT_SWEEP=true`. |
 | `confirmations`, `sweep_priority` | FAIL | `REQUIRED_CONFIRMATIONS >= 1`, `SETTLEMENT_CONFIRMATIONS >= REQUIRED_CONFIRMATIONS`, `SWEEP_PRIORITY` в `0..4`. |
-| `ssrf_policy` | WARN / PASS | На `mainnet` флаг `ALLOW_PRIVATE_WEBHOOKS=true` помечается как `WARN` (в продакшене оставляйте `false` + `REQUIRE_HTTPS_WEBHOOKS=true`). |
+| `ssrf_policy` | WARN / PASS | На `mainnet` флаги `ALLOW_PRIVATE_WEBHOOKS=true` или (`REQUIRE_HTTPS_WEBHOOKS=false` при `ALLOW_PRIVATE_WEBHOOKS=false`, `XMR-AUDIT-006`) помечаются как `WARN`; в продакшене оставляйте `ALLOW_PRIVATE_WEBHOOKS=false` + `REQUIRE_HTTPS_WEBHOOKS=true`. |
 | `rpc_auth`, `daemon_rpc_security` | FAIL / WARN | При `ALLOW_UNAUTHENTICATED_RPC=false` обязательны `MONERO_RPC_USER`/`PASS`; при заданном `MONERO_DAEMON_RPC_URL` проверяются транспорт и креды (`AUDIT-001`). Отсутствие `MONERO_DAEMON_RPC_URL` — `WARN` (нужен для `allow_resweep`). |
 | `health_anon_privacy`, `health_auth_api`, `health_auth_operator` | FAIL | Проверяет на живом шлюзе, что анонимный `GET /health` НЕ раскрывает `service`/`monero_rpc`/`database`, а авторизованный возвращает полную телеметрию (`AUDIT-002`). |
 | `wallet_daemon_sync` | WARN / PASS | Сравнивает `get_height` кошелька и `get_info` демона; отставание `> 5` блоков помечается `WARN`. |

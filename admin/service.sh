@@ -58,6 +58,35 @@ stop_process_gracefully() {
     log_info "$(t service.stopped "$name")"
 }
 
+rpc_conf_path() {
+    if [[ -n "${XDG_RUNTIME_DIR:-}" && -d "$XDG_RUNTIME_DIR" && -w "$XDG_RUNTIME_DIR" ]]; then
+        printf '%s/xmr-gateway-wallet-rpc.conf\n' "$XDG_RUNTIME_DIR"
+    else
+        printf '%s/.monero-wallet-rpc.conf\n' "$DATA_DIR"
+    fi
+}
+
+cleanup_rpc_conf() {
+    if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+        rm -f "${XDG_RUNTIME_DIR}/xmr-gateway-wallet-rpc.conf"
+    fi
+    if [[ -n "${DATA_DIR:-}" ]]; then
+        rm -f "${DATA_DIR}/.monero-wallet-rpc.conf"
+    fi
+}
+
+write_rpc_conf() {
+    local target="$1"
+    if [[ "$MONERO_RPC_USER" == *$'\n'* || "$MONERO_RPC_USER" == *$'\r'* || "$MONERO_RPC_PASS" == *$'\n'* || "$MONERO_RPC_PASS" == *$'\r'* ]]; then
+        die "MONERO_RPC_USER and MONERO_RPC_PASS must not contain newline characters."
+    fi
+    (
+        umask 077
+        printf 'rpc-login=%s:%s\n' "$MONERO_RPC_USER" "$MONERO_RPC_PASS" > "$target"
+    )
+    chmod 600 "$target"
+}
+
 cmd_start() {
     load_env
     require_cmd curl
@@ -111,8 +140,11 @@ cmd_start() {
             mainnet)  ;;
             *) die "Unsupported MONERO_NETWORK='$MONERO_NETWORK'" ;;
         esac
+        local rpc_conf=""
         if [[ -n "${MONERO_RPC_USER:-}" ]]; then
-            rpc_args+=(--rpc-login "${MONERO_RPC_USER}:${MONERO_RPC_PASS}")
+            rpc_conf="$(rpc_conf_path)"
+            write_rpc_conf "$rpc_conf"
+            rpc_args+=(--config-file "$rpc_conf")
         fi
         if [[ -n "${MONERO_RPC_PROXY:-}" ]]; then
             rpc_args+=(--proxy "$MONERO_RPC_PROXY")
@@ -128,6 +160,7 @@ cmd_start() {
         while [[ "$attempt" -lt 120 ]]; do
             if ! kill -0 "$rpc_pid" 2>/dev/null; then
                 rm -f "$RPC_PID_FILE"
+                cleanup_rpc_conf
                 log_err "$(t service.rpc_exited)"
                 tail -n 20 "$RPC_LOG_FILE" >&2 || true
                 exit 1
@@ -140,6 +173,7 @@ cmd_start() {
             attempt=$((attempt + 1))
         done
         if [[ "$attempt" -ge 120 ]]; then
+            cleanup_rpc_conf
             die "$(t service.rpc_timeout "$rpc_port")"
         fi
     fi
@@ -183,6 +217,7 @@ cmd_stop() {
     # Stop gateway FIRST so it runs PRAGMA wal_checkpoint(TRUNCATE) cleanly while RPC is still alive if needed
     stop_process_gracefully "xmr-gateway" "$GATEWAY_PID_FILE" 25
     stop_process_gracefully "monero-wallet-rpc" "$RPC_PID_FILE" 15
+    cleanup_rpc_conf
 }
 
 cmd_restart() {

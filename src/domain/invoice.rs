@@ -449,10 +449,15 @@ pub struct ObservedTransfer {
 /// Aggregated evaluation of all transfers observed on a single subaddress during a scan cycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubaddressEvaluation {
-    /// Sum of valid (`!double_spend_seen`) incoming outputs in piconero.
+    /// Sum of valid (`!double_spend_seen && !orphaned`) incoming outputs in piconero.
     pub received_piconero: Piconero,
     /// Effective confirmation depth of the paid amount (`0` if unconfirmed or unpaid).
     pub effective_confirmations: u64,
+    /// Sum of valid unlocked (`!double_spend_seen && !orphaned && !in_pool && unlocked`) outputs in piconero.
+    pub unlocked_received_piconero: Piconero,
+    /// Effective confirmation depth of the covering set computed strictly over valid unlocked
+    /// outputs (`0` if unlocked outputs do not cover `expected_amount`).
+    pub effective_unlocked_confirmations: u64,
     /// `true` iff at least one valid transfer exists, none are in mempool, and all are unlocked.
     pub all_unlocked: bool,
     /// `true` if any transfer on this subaddress was flagged `double_spend_seen`.
@@ -465,15 +470,22 @@ pub struct SubaddressEvaluation {
 ///
 /// # Mathematical & Security Semantics
 /// 1. **Double-spend isolation:** Any transfer with `double_spend_seen == true` is excluded from
-///    `received_piconero` and `effective_confirmations`, while flipping `double_spend_seen = true`.
+///    `received_piconero`, `effective_confirmations`, `unlocked_received_piconero`, and
+///    `effective_unlocked_confirmations`, while flipping `double_spend_seen = true`.
 /// 2. **Split-payment confirmation depth:** Transfers are sorted by `confirmations` descending
 ///    and accumulated until `expected_amount` is covered; the minimum confirmation count of that
 ///    covering set is `effective_confirmations`. This prevents a late unconfirmed dust tip from
 ///    un-confirming an already confirmed payment, while preventing an old partial output from
 ///    inflating the confirmation depth of a fresh second partial output.
-/// 3. **Unlock safety:** `all_unlocked` is `true` only when at least one valid mined transfer
-///    exists, zero valid transfers remain in mempool (`!in_pool`), and every valid transfer
-///    satisfies `unlocked && confirmations >= MONERO_UNLOCK_CONFIRMATIONS`.
+/// 3. **Unlocked settlement covering set (`XMR-AUDIT-001`):** `unlocked_received_piconero` and
+///    `effective_unlocked_confirmations` apply the same covering-set computation strictly to valid
+///    mined unlocked outputs (`!in_pool && unlocked`), ensuring custom long `unlock_time` outputs
+///    cannot prematurely reach `SETTLED`/`COMPLETED` while protecting settled invoices against
+///    mempool dust DoS (`all_unlocked` dropping to `false` on a 1-piconero tip does not reduce
+///    `effective_unlocked_confirmations`).
+/// 4. **Sweep unlock safety:** `all_unlocked` is `true` only when at least one valid mined
+///    transfer exists, zero valid transfers remain in mempool (`!in_pool`), and every valid
+///    transfer satisfies `unlocked && confirmations >= MONERO_UNLOCK_CONFIRMATIONS`.
 #[must_use]
 pub fn evaluate_subaddress_transfers(
     expected_amount: Piconero,
@@ -498,6 +510,8 @@ pub fn evaluate_subaddress_transfers(
         return SubaddressEvaluation {
             received_piconero: Piconero::ZERO,
             effective_confirmations: 0,
+            unlocked_received_piconero: Piconero::ZERO,
+            effective_unlocked_confirmations: 0,
             all_unlocked: false,
             double_spend_seen,
             transfers: transfers.to_vec(),
@@ -527,6 +541,32 @@ pub fn evaluate_subaddress_transfers(
             .unwrap_or(0)
     };
 
+    // Covering set strictly over valid mined unlocked outputs (preserves descending conf order).
+    let mut unlocked_received_piconero = Piconero::ZERO;
+    let mut unlocked_transfers: Vec<&ObservedTransfer> = Vec::with_capacity(valid_transfers.len());
+    for tx in &valid_transfers {
+        if !tx.in_pool && tx.unlocked {
+            unlocked_received_piconero =
+                unlocked_received_piconero.saturating_add(tx.amount_piconero);
+            unlocked_transfers.push(*tx);
+        }
+    }
+
+    let effective_unlocked_confirmations = if unlocked_received_piconero >= expected_amount {
+        let mut covered = Piconero::ZERO;
+        let mut min_conf = u64::MAX;
+        for tx in &unlocked_transfers {
+            covered = covered.saturating_add(tx.amount_piconero);
+            min_conf = min_conf.min(tx.confirmations);
+            if covered >= expected_amount {
+                break;
+            }
+        }
+        if min_conf == u64::MAX { 0 } else { min_conf }
+    } else {
+        0
+    };
+
     let all_unlocked = valid_transfers
         .iter()
         .all(|tx| !tx.in_pool && tx.unlocked && tx.confirmations >= MONERO_UNLOCK_CONFIRMATIONS);
@@ -534,6 +574,8 @@ pub fn evaluate_subaddress_transfers(
     SubaddressEvaluation {
         received_piconero: total_received,
         effective_confirmations,
+        unlocked_received_piconero,
+        effective_unlocked_confirmations,
         all_unlocked,
         double_spend_seen,
         transfers: transfers.to_vec(),
@@ -599,7 +641,8 @@ pub fn compute_next_status_with_settlement(
         InvoiceStatus::Completed => {
             if eval.double_spend_seen
                 || eval.received_piconero < expected_amount
-                || eval.effective_confirmations < settlement_confirmations
+                || eval.unlocked_received_piconero < expected_amount
+                || eval.effective_unlocked_confirmations < settlement_confirmations
             {
                 return InvoiceStatus::Reorged;
             }
@@ -608,7 +651,8 @@ pub fn compute_next_status_with_settlement(
         InvoiceStatus::Settled => {
             if eval.double_spend_seen
                 || eval.received_piconero < expected_amount
-                || eval.effective_confirmations < settlement_confirmations
+                || eval.unlocked_received_piconero < expected_amount
+                || eval.effective_unlocked_confirmations < settlement_confirmations
             {
                 return InvoiceStatus::Reorged;
             }
@@ -621,7 +665,9 @@ pub fn compute_next_status_with_settlement(
             {
                 return InvoiceStatus::Reorged;
             }
-            if eval.effective_confirmations >= settlement_confirmations {
+            if eval.unlocked_received_piconero >= expected_amount
+                && eval.effective_unlocked_confirmations >= settlement_confirmations
+            {
                 return InvoiceStatus::Settled;
             }
             InvoiceStatus::Confirmed
@@ -957,5 +1003,108 @@ mod tests {
         let s_settled =
             compute_next_status_with_settlement(s3, expected, &eval10, 2, 10, now, expires);
         assert_eq!(s_settled, InvoiceStatus::Settled);
+    }
+
+    #[test]
+    fn settlement_requires_unlocked_covering_outputs_and_resists_dust_dos_xmr_audit_001() {
+        let expected = Piconero(1_000_000_000_000);
+        let now = Utc::now();
+        let expires = now + Duration::hours(1);
+
+        // 1) Custom unlock_time attack: 20 confirmations, full amount, but unlocked=false.
+        //    Reaches CONFIRMED, MUST NOT transition to SETTLED while outputs remain locked.
+        let eval_locked_20 = evaluate_subaddress_transfers(
+            expected,
+            &[mk_tx("tx_lock", expected.0, 20, false, false)],
+        );
+        assert_eq!(eval_locked_20.received_piconero, expected);
+        assert_eq!(eval_locked_20.effective_confirmations, 20);
+        assert_eq!(eval_locked_20.unlocked_received_piconero, Piconero::ZERO);
+        assert_eq!(eval_locked_20.effective_unlocked_confirmations, 0);
+
+        let st_confirmed = compute_next_status_with_settlement(
+            InvoiceStatus::Pending,
+            expected,
+            &eval_locked_20,
+            2,
+            10,
+            now,
+            expires,
+        );
+        assert_eq!(st_confirmed, InvoiceStatus::Confirmed);
+
+        let st_still_confirmed = compute_next_status_with_settlement(
+            InvoiceStatus::Confirmed,
+            expected,
+            &eval_locked_20,
+            2,
+            10,
+            now,
+            expires,
+        );
+        assert_eq!(
+            st_still_confirmed,
+            InvoiceStatus::Confirmed,
+            "locked custom unlock_time output MUST NOT advance to SETTLED"
+        );
+
+        // 2) Once the output unlocks (unlocked=true), transitions cleanly to SETTLED.
+        let eval_unlocked_20 = evaluate_subaddress_transfers(
+            expected,
+            &[mk_tx("tx_lock", expected.0, 20, true, false)],
+        );
+        assert_eq!(eval_unlocked_20.unlocked_received_piconero, expected);
+        assert_eq!(eval_unlocked_20.effective_unlocked_confirmations, 20);
+        let st_settled = compute_next_status_with_settlement(
+            InvoiceStatus::Confirmed,
+            expected,
+            &eval_unlocked_20,
+            2,
+            10,
+            now,
+            expires,
+        );
+        assert_eq!(st_settled, InvoiceStatus::Settled);
+
+        // 3) Anti-Dust-DoS: late 1-piconero mempool dust arrives on an already SETTLED/COMPLETED
+        //    subaddress. `all_unlocked` becomes false, yet `unlocked_received_piconero` and
+        //    `effective_unlocked_confirmations` remain intact -> MUST NOT drop into REORGED!
+        let eval_with_mempool_dust = evaluate_subaddress_transfers(
+            expected,
+            &[
+                mk_tx("tx_lock", expected.0, 20, true, false),
+                mk_tx("tx_dust", 1, 0, false, true),
+            ],
+        );
+        assert!(!eval_with_mempool_dust.all_unlocked);
+        assert_eq!(eval_with_mempool_dust.unlocked_received_piconero, expected);
+        assert_eq!(eval_with_mempool_dust.effective_unlocked_confirmations, 20);
+
+        assert_eq!(
+            compute_next_status_with_settlement(
+                InvoiceStatus::Settled,
+                expected,
+                &eval_with_mempool_dust,
+                2,
+                10,
+                now,
+                expires,
+            ),
+            InvoiceStatus::Settled,
+            "mempool dust must NOT force SETTLED invoice into REORGED"
+        );
+        assert_eq!(
+            compute_next_status_with_settlement(
+                InvoiceStatus::Completed,
+                expected,
+                &eval_with_mempool_dust,
+                2,
+                10,
+                now,
+                expires,
+            ),
+            InvoiceStatus::Completed,
+            "mempool dust must NOT force COMPLETED invoice into REORGED"
+        );
     }
 }

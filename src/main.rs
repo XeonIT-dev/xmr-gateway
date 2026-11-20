@@ -13,7 +13,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use xmr_gateway::{
     api::{AppState, build_router},
-    config::{Config, LogFormat},
+    config::{Config, LogFormat, MoneroNetwork},
     db::{
         acquire_database_lock, checkpoint_and_close_pool, init_sqlite_pool,
         repository::InvoiceRepository,
@@ -38,6 +38,18 @@ async fn run_gateway() -> GatewayResult<()> {
 
     let config = Arc::new(Config::from_env()?);
     init_tracing(config.log_format);
+
+    if config.monero_network == MoneroNetwork::Mainnet
+        && !config.require_https_webhooks
+        && !config.allow_private_webhooks
+    {
+        tracing::warn!(
+            monero_network = config.monero_network.as_str(),
+            require_https_webhooks = config.require_https_webhooks,
+            allow_private_webhooks = config.allow_private_webhooks,
+            "MAINNET SECURITY WARNING: REQUIRE_HTTPS_WEBHOOKS=false with ALLOW_PRIVATE_WEBHOOKS=false permits plaintext HTTP webhooks over public networks; set REQUIRE_HTTPS_WEBHOOKS=true in production (XMR-AUDIT-006)"
+        );
+    }
 
     if let Some(ref default_url) = config.default_webhook_url {
         resolve_and_validate_webhook_url(
