@@ -1,0 +1,264 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to package (e.g. v0.1.0; defaults to Cargo.toml version)"
+        required: false
+        default: ""
+      dry_run:
+        description: "Build and attest artifacts without publishing a GitHub Release"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build Release (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            deb_arch: amd64
+            rpm_arch: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            arch: aarch64
+            deb_arch: arm64
+            rpm_arch: aarch64
+
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve and validate release tag
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          CARGO_VER="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)"
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="${{ inputs.tag }}"
+            if [[ -z "${TAG}" ]]; then
+              TAG="v${CARGO_VER}"
+            fi
+          fi
+          if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "ERROR: Invalid release tag '${TAG}'." >&2
+            exit 1
+          fi
+          if [[ "${TAG#v}" != "${CARGO_VER}" ]]; then
+            echo "ERROR: Tag '${TAG}' does not match Cargo.toml version '${CARGO_VER}'." >&2
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "version=${TAG#v}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deb and cargo-generate-rpm
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb,cargo-generate-rpm
+
+      - name: Build release binary (--locked)
+        run: cargo build --release --locked --bin xmr-gateway
+
+      - name: Strip binary
+        run: strip target/release/xmr-gateway
+
+      - name: Package binary tarball, .deb, and .rpm
+        shell: bash
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          VER: ${{ steps.meta.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          DEB_ARCH: ${{ matrix.deb_arch }}
+          RPM_ARCH: ${{ matrix.rpm_arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-artifacts
+
+          # 1) Tarball bundle
+          BUNDLE_NAME="xmr-gateway-${TAG}-linux-${ARCH}"
+          STAGE_DIR="stage/${BUNDLE_NAME}"
+          mkdir -p "${STAGE_DIR}"
+          cp target/release/xmr-gateway "${STAGE_DIR}/xmr-gateway"
+          cp admin.sh .env.example README.md README_RU.md DEPLOY_EN.md DEPLOY_RU.md LICENSE "${STAGE_DIR}/"
+          cp -a admin deploy scripts "${STAGE_DIR}/"
+          rm -f "${STAGE_DIR}/admin/test_admin.sh"
+          chmod 0755 "${STAGE_DIR}/xmr-gateway" "${STAGE_DIR}/admin.sh" "${STAGE_DIR}/scripts/install.sh"
+          tar -C stage -czf "release-artifacts/${BUNDLE_NAME}.tar.gz" "${BUNDLE_NAME}"
+
+          # 2) Debian package (.deb)
+          cargo deb --no-build --no-strip -o "release-artifacts/xmr-gateway_${VER}_${DEB_ARCH}.deb"
+
+          # 3) RPM package (.rpm)
+          cargo generate-rpm -o "release-artifacts/xmr-gateway-${VER}-1.${RPM_ARCH}.rpm"
+
+          ls -lh release-artifacts/
+
+      - name: Upload architecture artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.arch }}
+          path: release-artifacts/*
+          if-no-files-found: error
+
+  publish:
+    name: Checksums, GPG Sign, Attest & Publish
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Download all architecture artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Generate sorted SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          LC_ALL=C sha256sum xmr-gateway*.tar.gz xmr-gateway*.deb xmr-gateway*.rpm > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Sign SHA256SUMS with GPG (if GPG_PRIVATE_KEY secret is configured)
+        id: gpg
+        shell: bash
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${GPG_PRIVATE_KEY}" ]]; then
+            echo "signed=false" >> "${GITHUB_OUTPUT}"
+            echo "::warning::GPG_PRIVATE_KEY secret is not configured; publishing without SHA256SUMS.asc."
+            {
+              echo "### GPG Release Signing Notice"
+              echo "Secret \`GPG_PRIVATE_KEY\` is not configured. \`SHA256SUMS\` and GitHub Build Provenance Attestations were generated, but \`SHA256SUMS.asc\` was skipped."
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          GNUPGHOME="$(mktemp -d)"
+          chmod 700 "${GNUPGHOME}"
+          export GNUPGHOME
+          trap 'rm -rf "${GNUPGHOME}"' EXIT
+
+          printf '%s\n' "${GPG_PRIVATE_KEY}" | gpg --batch --import
+          FPR="$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/ { print $10; exit }')"
+          if [[ -z "${FPR}" ]]; then
+            echo "ERROR: Imported GPG_PRIVATE_KEY did not yield a secret key fingerprint." >&2
+            exit 1
+          fi
+
+          if [[ -n "${GPG_PASSPHRASE}" ]]; then
+            printf '%s' "${GPG_PASSPHRASE}" | gpg --batch --yes --pinentry-mode loopback \
+              --passphrase-fd 0 --local-user "${FPR}" \
+              --armor --detach-sign --output dist/SHA256SUMS.asc dist/SHA256SUMS
+          else
+            gpg --batch --yes --local-user "${FPR}" \
+              --armor --detach-sign --output dist/SHA256SUMS.asc dist/SHA256SUMS
+          fi
+
+          gpg --batch --verify dist/SHA256SUMS.asc dist/SHA256SUMS
+          gpg --armor --export "${FPR}" > dist/RELEASE_SIGNING_KEY.asc
+          echo "signed=true" >> "${GITHUB_OUTPUT}"
+          echo "fingerprint=${FPR}" >> "${GITHUB_OUTPUT}"
+
+      - name: Generate GitHub Build Provenance Attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/xmr-gateway*.tar.gz
+            dist/xmr-gateway*.deb
+            dist/xmr-gateway*.rpm
+            dist/SHA256SUMS
+
+      - name: Upload combined release bundle artifact (dry-run inspection)
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle-${{ needs.build.outputs.tag }}
+          path: dist/*
+
+      - name: Publish GitHub Release
+        if: ${{ github.event_name == 'push' || inputs.dry_run == false }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.tag }}
+          GPG_SIGNED: ${{ steps.gpg.outputs.signed }}
+          GPG_FPR: ${{ steps.gpg.outputs.fingerprint }}
+        run: |
+          set -euo pipefail
+          NOTES_FILE="$(mktemp)"
+          trap 'rm -f "${NOTES_FILE}"' EXIT
+          {
+            echo "## xmr-gateway ${TAG}"
+            echo ""
+            echo "### Artifacts"
+            echo "- Linux \`x86_64\` & \`aarch64\` binary tarballs (\`.tar.gz\`)"
+            echo "- Debian / Ubuntu packages (\`.deb\`)"
+            echo "- Fedora / RHEL / Rocky packages (\`.rpm\`)"
+            echo "- \`SHA256SUMS\` + GitHub Build Provenance Attestation"
+            echo ""
+            echo "### Verification"
+            echo '```bash'
+            echo "sha256sum -c SHA256SUMS --ignore-missing"
+            if [[ "${GPG_SIGNED}" == "true" ]]; then
+              echo "gpg --import RELEASE_SIGNING_KEY.asc  # Fingerprint: ${GPG_FPR}"
+              echo "gpg --verify SHA256SUMS.asc SHA256SUMS"
+            fi
+            echo "gh attestation verify xmr-gateway-${TAG}-linux-x86_64.tar.gz --owner ${GITHUB_REPOSITORY_OWNER}"
+            echo '```'
+            if [[ "${GPG_SIGNED}" != "true" ]]; then
+              echo ""
+              echo "> **Note:** \`GPG_PRIVATE_KEY\` secret was not configured for this build; verify integrity via \`SHA256SUMS\` and \`gh attestation verify\`."
+            fi
+          } > "${NOTES_FILE}"
+
+          RELEASE_EXTRA_ARGS=()
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            RELEASE_EXTRA_ARGS+=(--verify-tag)
+          else
+            RELEASE_EXTRA_ARGS+=(--target "${GITHUB_SHA}")
+          fi
+
+          gh release create "${TAG}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            "${RELEASE_EXTRA_ARGS[@]}" \
+            --title "xmr-gateway ${TAG}" \
+            --notes-file "${NOTES_FILE}" \
+            --generate-notes

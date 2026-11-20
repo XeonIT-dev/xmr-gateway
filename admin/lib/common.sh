@@ -24,6 +24,7 @@ REPO_ROOT="$(cd "$ADMIN_DIR/.." && pwd)"
 ADMIN_ENV_FILE="${ADMIN_ENV_FILE:-}"
 ADMIN_JSON="${ADMIN_JSON:-0}"
 ADMIN_YES="${ADMIN_YES:-0}"
+# shellcheck disable=SC2034
 ADMIN_ENV_LOADED=0
 
 # Load pure-Bash RU/EN i18n subsystem
@@ -31,6 +32,7 @@ ADMIN_ENV_LOADED=0
 source "$ADMIN_LIB_DIR/i18n.sh"
 
 # ANSI colors (disabled automatically when stdout/stderr is not a TTY or NO_COLOR is set)
+# shellcheck disable=SC2034
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
     C_RESET=$'\033[0m'
     C_BOLD=$'\033[1m'
@@ -145,9 +147,15 @@ resolve_env_file() {
     if [[ -n "${ADMIN_ENV_FILE:-}" ]]; then
         if [[ "$ADMIN_ENV_FILE" == /* ]]; then
             printf '%s\n' "$ADMIN_ENV_FILE"
+        elif [[ -f "$PWD/$ADMIN_ENV_FILE" ]]; then
+            printf '%s\n' "$PWD/$ADMIN_ENV_FILE"
         else
             printf '%s\n' "$REPO_ROOT/$ADMIN_ENV_FILE"
         fi
+    elif [[ -f "$REPO_ROOT/.env" ]]; then
+        printf '%s\n' "$REPO_ROOT/.env"
+    elif [[ -f "/etc/xmr-gateway/.env" ]]; then
+        printf '%s\n' "/etc/xmr-gateway/.env"
     else
         printf '%s\n' "$REPO_ROOT/.env"
     fi
@@ -249,6 +257,8 @@ load_env() {
     DB_PATH="$(extract_sqlite_path "$DATABASE_URL")"
     if [[ -n "$DB_PATH" ]]; then
         DATA_DIR="$(dirname "$DB_PATH")"
+    elif [[ "$ACTIVE_ENV_FILE" == "/etc/xmr-gateway/.env" && -d "/var/lib/xmr-gateway" ]]; then
+        DATA_DIR="/var/lib/xmr-gateway"
     else
         DATA_DIR="$REPO_ROOT/data"
     fi
@@ -261,9 +271,10 @@ load_env() {
     PID_DIR="$DATA_DIR/pids"
     RPC_PID_FILE="$PID_DIR/monero-wallet-rpc.pid"
     GATEWAY_PID_FILE="$PID_DIR/xmr-gateway.pid"
-    GATEWAY_BIN="$REPO_ROOT/target/release/xmr-gateway"
+    GATEWAY_BIN="$(find_gateway_bin || printf '%s' "$REPO_ROOT/target/release/xmr-gateway")"
     BIN_DIR="$REPO_ROOT/bin"
 
+    # shellcheck disable=SC2034
     ADMIN_ENV_LOADED=1
     export ACTIVE_ENV_FILE GATEWAY_BASE_URL DB_PATH DATA_DIR WALLET_DIR WALLET_FILE WALLET_PASS_FILE
     export RPC_LOG_FILE CLI_LOG_FILE GATEWAY_LOG_FILE PID_DIR RPC_PID_FILE GATEWAY_PID_FILE
@@ -292,6 +303,8 @@ extract_sqlite_path() {
     fi
     if [[ "$p" == /* ]]; then
         printf '%s\n' "$p"
+    elif [[ "${ACTIVE_ENV_FILE:-}" == "/etc/xmr-gateway/.env" ]]; then
+        printf '%s\n' "/var/lib/xmr-gateway/$p"
     else
         printf '%s\n' "$REPO_ROOT/$p"
     fi
@@ -378,13 +391,39 @@ confirm_dangerous_action() {
     fi
 }
 
-# Finds monero-wallet-rpc / monero-wallet-cli in ./bin/ or PATH.
-find_monero_bin() {
-    local name="$1"
-    if [[ -x "$REPO_ROOT/bin/$name" ]]; then
-        printf '%s\n' "$REPO_ROOT/bin/$name"
+# Finds xmr-gateway binary in local release build, system paths, or PATH.
+find_gateway_bin() {
+    local candidate
+    for candidate in \
+        "$REPO_ROOT/target/release/xmr-gateway" \
+        "$REPO_ROOT/xmr-gateway" \
+        "/usr/bin/xmr-gateway" \
+        "/usr/local/bin/xmr-gateway"; do
+        if [[ -x "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    if command -v xmr-gateway >/dev/null 2>&1; then
+        command -v xmr-gateway
         return 0
     fi
+    return 1
+}
+
+# Finds monero-wallet-rpc / monero-wallet-cli in ./bin/, standard system paths, or PATH.
+find_monero_bin() {
+    local name="$1"
+    local candidate
+    for candidate in \
+        "$REPO_ROOT/bin/$name" \
+        "/usr/local/bin/$name" \
+        "/usr/bin/$name"; do
+        if [[ -x "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
     if command -v "$name" >/dev/null 2>&1; then
         command -v "$name"
         return 0
@@ -392,11 +431,16 @@ find_monero_bin() {
     return 1
 }
 
-# Safely updates or appends KEY=VALUE in a target .env file preserving 0600 permissions.
+# Safely updates or appends KEY=VALUE in a target .env file preserving 0600 permissions
+# and original ownership (e.g. xmr-gateway:xmr-gateway under /etc/xmr-gateway/.env).
 set_env_kv_file() {
     local target_file="$1"
     local key="$2"
     local value="$3"
+    local orig_owner=""
+    if [[ -f "$target_file" && "$(id -u)" -eq 0 ]]; then
+        orig_owner="$(stat -c '%u:%g' "$target_file" 2>/dev/null || true)"
+    fi
     local tmp_env
     tmp_env="$(mktemp)"
     chmod 600 "$tmp_env"
@@ -419,6 +463,9 @@ set_env_kv_file() {
         printf '\n%s=%s\n' "$key" "$value" >> "$tmp_env"
     fi
     mv "$tmp_env" "$target_file"
+    if [[ -n "$orig_owner" ]]; then
+        chown "$orig_owner" "$target_file"
+    fi
     chmod 600 "$target_file"
 }
 
@@ -428,7 +475,9 @@ set_env_kv_file() {
 # Globals populated by gateway_api_call:
 #   API_LAST_HTTP_CODE
 #   API_LAST_BODY
+# shellcheck disable=SC2034
 API_LAST_HTTP_CODE=""
+# shellcheck disable=SC2034
 API_LAST_BODY=""
 
 # Usage: gateway_api_call <METHOD> <PATH> <auth_mode: none|merchant|operator|health_api|health_operator> [json_body]
@@ -500,10 +549,12 @@ gateway_api_call() {
     esac
 
     local rc=0
+    # shellcheck disable=SC2034
     API_LAST_HTTP_CODE="$(
         printf '%s\n' "${cfg_lines[@]}" | curl "${curl_args[@]}" "$url"
     )" || rc=$?
 
+    # shellcheck disable=SC2034
     API_LAST_BODY="$(cat "$tmp_out" 2>/dev/null || true)"
     rm -f "$tmp_out" "${tmp_body:-}"
     return "$rc"
@@ -512,7 +563,9 @@ gateway_api_call() {
 # ==============================================================================
 # Zero-Argv-Leak Monero Wallet & Daemon JSON-RPC Helpers
 # ==============================================================================
+# shellcheck disable=SC2034
 RPC_LAST_HTTP_CODE=""
+# shellcheck disable=SC2034
 RPC_LAST_BODY=""
 
 # Usage: monero_json_rpc_call <url> <user> <pass> <method> [params_json]
@@ -542,6 +595,7 @@ monero_json_rpc_call() {
     fi
 
     local rc=0
+    # shellcheck disable=SC2034
     RPC_LAST_HTTP_CODE="$(
         printf '%s\n' "${cfg_lines[@]}" | curl -sS \
             --connect-timeout 5 \
@@ -554,6 +608,7 @@ monero_json_rpc_call() {
             "$rpc_url"
     )" || rc=$?
 
+    # shellcheck disable=SC2034
     RPC_LAST_BODY="$(cat "$tmp_out" 2>/dev/null || true)"
     rm -f "$tmp_out" "$tmp_body"
     return "$rc"

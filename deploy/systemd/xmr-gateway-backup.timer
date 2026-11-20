@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily Hot SQLite Backup Timer for xmr-gateway
+Documentation=https://github.com/XeonIT-dev/xmr-gateway
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=15m
+Persistent=true
+Unit=xmr-gateway-backup.service
+
+[Install]
+WantedBy=timers.target

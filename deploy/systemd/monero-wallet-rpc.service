@@ -9,27 +9,45 @@ Type=simple
 User=xmr-gateway
 Group=xmr-gateway
 WorkingDirectory=/var/lib/xmr-gateway
-EnvironmentFile=/etc/xmr-gateway/xmr-gateway.env
+EnvironmentFile=/etc/xmr-gateway/.env
+RuntimeDirectory=xmr-gateway
+RuntimeDirectoryMode=0700
 UMask=0077
 
-# Start monero-wallet-rpc bound strictly to loopback with --rpc-login enabled.
-# Operators: adjust --daemon-address / --stagenet / --proxy flags or supply via wrapper.
+# Render RPC credentials and daemon options into a RAM-only 0600 config file so
+# MONERO_RPC_PASS never appears in `ps aux` / `/proc/<pid>/cmdline`.
+ExecStartPre=/bin/sh -ec 'umask 077; \
+  test -n "${MONERO_RPC_USER:-}" && test -n "${MONERO_RPC_PASS:-}" || { echo "MONERO_RPC_USER/PASS required" >&2; exit 1; }; \
+  { \
+    printf "rpc-login=%s:%s\n" "${MONERO_RPC_USER}" "${MONERO_RPC_PASS}"; \
+    printf "daemon-address=%s\n" "${MONERO_REMOTE_NODE:-xmr-node.cakewallet.com:18081}"; \
+    case "${MONERO_NETWORK:-mainnet}" in \
+      stagenet|STAGENET) printf "stagenet=1\n" ;; \
+      testnet|TESTNET)   printf "testnet=1\n" ;; \
+    esac; \
+    case "${MONERO_TRUSTED_DAEMON:-false}" in \
+      true|TRUE|1|yes|YES) printf "trusted-daemon=1\n" ;; \
+      *)                   printf "untrusted-daemon=1\n" ;; \
+    esac; \
+    if [ -n "${MONERO_RPC_PROXY:-}" ]; then printf "proxy=%s\n" "${MONERO_RPC_PROXY}"; fi; \
+  } > /run/xmr-gateway/wallet-rpc.conf; \
+  chmod 0600 /run/xmr-gateway/wallet-rpc.conf'
+
 ExecStart=/usr/local/bin/monero-wallet-rpc \
   --non-interactive \
   --no-initial-sync \
-  --untrusted-daemon \
   --wallet-file /var/lib/xmr-gateway/wallet/gateway_wallet \
   --password-file /var/lib/xmr-gateway/wallet/gateway_wallet.password \
-  --daemon-address ${MONERO_REMOTE_NODE} \
   --rpc-bind-ip 127.0.0.1 \
   --rpc-bind-port 18082 \
-  --rpc-login ${MONERO_RPC_USER}:${MONERO_RPC_PASS} \
+  --config-file /run/xmr-gateway/wallet-rpc.conf \
   --log-file /var/lib/xmr-gateway/monero-wallet-rpc.log \
   --log-level 1
 
+KillSignal=SIGTERM
+TimeoutStopSec=30
 Restart=on-failure
 RestartSec=5
-TimeoutStopSec=30
 
 # Systemd Sandboxing & Least-Privilege Hardening (XMR-037)
 NoNewPrivileges=true
@@ -52,7 +70,7 @@ RestrictNamespaces=true
 RestrictRealtime=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 SystemCallArchitectures=native
-ReadWritePaths=/var/lib/xmr-gateway
+ReadWritePaths=/var/lib/xmr-gateway /run/xmr-gateway
 
 [Install]
 WantedBy=multi-user.target

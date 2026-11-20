@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+#DEBHELPER#
+
+case "${1:-}" in
+    remove)
+        if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+            systemctl stop xmr-gateway-backup.timer >/dev/null 2>&1 || true
+            systemctl stop xmr-gateway.service >/dev/null 2>&1 || true
+            systemctl stop monero-wallet-rpc.service >/dev/null 2>&1 || true
+            systemctl disable xmr-gateway-backup.timer >/dev/null 2>&1 || true
+            systemctl disable xmr-gateway.service >/dev/null 2>&1 || true
+            systemctl disable monero-wallet-rpc.service >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
+exit 0

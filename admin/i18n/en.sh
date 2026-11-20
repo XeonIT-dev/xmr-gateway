@@ -6,6 +6,7 @@
 # untranslated. Must maintain 100% key parity with admin/i18n/ru.sh.
 # ==============================================================================
 
+# shellcheck disable=SC2034
 declare -gA I18N_EN=(
     # --- Common & Errors ---
     ["common.required_cmd_missing"]="Required command '%s' was not found in PATH."

@@ -1,0 +1,113 @@
+# ==============================================================================
+# Reproducible Monero Wallet RPC Containerfile (Official Binaries + SHA256 Gate)
+# ==============================================================================
+# Builds a minimal non-root monero-wallet-rpc image directly from official
+# downloads.getmonero.org CLI releases with mandatory fail-closed SHA256 checks
+# for both linux/amd64 and linux/arm64 (TARGETARCH).
+#
+# Updating Monero CLI release:
+#   1. Verify official hashes against https://www.getmonero.org/downloads/hashes.txt
+#      (GPG-signed by binaryFate key 81AC591FE9C4B65C5806AFC3F0AF4D462A0BDF92).
+#   2. Update MONERO_CLI_VERSION, MONERO_CLI_SHA256_AMD64, and MONERO_CLI_SHA256_ARM64.
+# ==============================================================================
+
+FROM debian:bookworm-slim AS downloader
+
+ARG TARGETARCH
+ARG MONERO_CLI_VERSION=v0.18.5.4
+ARG MONERO_CLI_SHA256_AMD64=ba2928962c101b609434bf8c1b43ad59ebe96c5525977284ca599d8bf0f02d10
+ARG MONERO_CLI_SHA256_ARM64=d20d71e6522b41eb8e549c3425f7f4622c9c9a448fc7147525393fd0a6b59703
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl bzip2 tar \
+    && rm -rf /var/lib/apt/lists/* \
+    && set -eux; \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) MONERO_ARCH="x64";   EXPECTED_SHA="${MONERO_CLI_SHA256_AMD64}" ;; \
+      arm64) MONERO_ARCH="armv8"; EXPECTED_SHA="${MONERO_CLI_SHA256_ARM64}" ;; \
+      *) echo "Unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    TARBALL="monero-linux-${MONERO_ARCH}-${MONERO_CLI_VERSION}.tar.bz2"; \
+    URL="https://downloads.getmonero.org/cli/${TARBALL}"; \
+    mkdir -p /tmp/monero /out; \
+    curl -fsSL "${URL}" -o "/tmp/monero/${TARBALL}"; \
+    echo "${EXPECTED_SHA}  /tmp/monero/${TARBALL}" | sha256sum -c -; \
+    tar -xjf "/tmp/monero/${TARBALL}" -C /out --strip-components=1 \
+      --wildcards '*/monero-wallet-rpc' '*/monero-wallet-cli'; \
+    chmod 0755 /out/monero-wallet-rpc /out/monero-wallet-cli; \
+    rm -rf /tmp/monero
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 --system xmr-gateway \
+    && useradd --uid 10001 --gid 10001 --system --home-dir /wallet --shell /usr/sbin/nologin xmr-gateway \
+    && install -d -m 0700 -o 10001 -g 10001 /wallet
+
+COPY --from=downloader --chmod=0755 /out/monero-wallet-rpc /usr/local/bin/monero-wallet-rpc
+COPY --from=downloader --chmod=0755 /out/monero-wallet-cli /usr/local/bin/monero-wallet-cli
+
+# Render RPC credentials into a 0600 tmpfs file so MONERO_RPC_PASS never leaks in `ps`
+RUN cat <<'EOF' > /usr/local/bin/entrypoint-monero-rpc.sh
+#!/bin/sh
+set -eu
+umask 077
+
+: "${MONERO_RPC_USER:?MONERO_RPC_USER must be set}"
+: "${MONERO_RPC_PASS:?MONERO_RPC_PASS must be set}"
+: "${MONERO_REMOTE_NODE:=xmr-node.cakewallet.com:18081}"
+: "${MONERO_NETWORK:=mainnet}"
+: "${MONERO_TRUSTED_DAEMON:=false}"
+: "${WALLET_FILE:=/wallet/gateway_wallet}"
+: "${WALLET_PASS_FILE:=/wallet/gateway_wallet.password}"
+
+if [ ! -f "${WALLET_FILE}.keys" ]; then
+    echo "ERROR: Wallet keys file missing at ${WALLET_FILE}.keys. Initialize wallet volume before starting." >&2
+    exit 1
+fi
+if [ ! -f "${WALLET_PASS_FILE}" ]; then
+    echo "ERROR: Wallet password file missing at ${WALLET_PASS_FILE}." >&2
+    exit 1
+fi
+
+CONF_FILE="/tmp/wallet-rpc.conf"
+{
+    printf 'rpc-login=%s:%s\n' "${MONERO_RPC_USER}" "${MONERO_RPC_PASS}"
+    printf 'daemon-address=%s\n' "${MONERO_REMOTE_NODE}"
+    case "${MONERO_NETWORK}" in
+        stagenet|STAGENET) printf 'stagenet=1\n' ;;
+        testnet|TESTNET)   printf 'testnet=1\n' ;;
+    esac
+    case "${MONERO_TRUSTED_DAEMON}" in
+        true|TRUE|1|yes|YES) printf 'trusted-daemon=1\n' ;;
+        *)                   printf 'untrusted-daemon=1\n' ;;
+    esac
+    if [ -n "${MONERO_RPC_PROXY:-}" ]; then
+        printf 'proxy=%s\n' "${MONERO_RPC_PROXY}"
+    fi
+} > "${CONF_FILE}"
+chmod 0600 "${CONF_FILE}"
+
+# Bind on container-internal interface only (never publish port 18082 on the host!)
+exec /usr/local/bin/monero-wallet-rpc \
+    --non-interactive \
+    --no-initial-sync \
+    --wallet-file "${WALLET_FILE}" \
+    --password-file "${WALLET_PASS_FILE}" \
+    --rpc-bind-ip 0.0.0.0 \
+    --confirm-external-bind \
+    --rpc-bind-port 18082 \
+    --config-file "${CONF_FILE}" \
+    --log-level 1
+EOF
+RUN chmod 0755 /usr/local/bin/entrypoint-monero-rpc.sh
+
+USER 10001:10001
+WORKDIR /wallet
+
+EXPOSE 18082
+STOPSIGNAL SIGTERM
+
+ENTRYPOINT ["/usr/local/bin/entrypoint-monero-rpc.sh"]

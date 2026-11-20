@@ -1,0 +1,45 @@
+# ==============================================================================
+# Rootless Podman Quadlet — monero-wallet-rpc Sidecar Container
+# ==============================================================================
+# Install to: ~/.config/containers/systemd/monero-wallet-rpc.container
+# Prerequisites:
+#   mkdir -p ~/.local/share/xmr-gateway/wallet ~/.config/xmr-gateway
+#   chmod 700 ~/.local/share/xmr-gateway ~/.local/share/xmr-gateway/wallet ~/.config/xmr-gateway
+#   # Put 0600 env file at ~/.config/xmr-gateway/gateway.env
+#   podman build -t localhost/xmr-gateway-wallet-rpc:latest -f deploy/docker/Containerfile.monero-rpc .
+#   systemctl --user daemon-reload && systemctl --user enable --now monero-wallet-rpc xmr-gateway
+# ==============================================================================
+
+[Unit]
+Description=Monero Wallet JSON-RPC Container (rootless Podman Quadlet)
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=localhost/xmr-gateway-wallet-rpc:latest
+ContainerName=xmr-gateway-wallet-rpc
+EnvironmentFile=%h/.config/xmr-gateway/gateway.env
+
+# Map host user UID directly to container UID 10001 so 0600/0700 host files remain readable
+UserNS=keep-id:uid=10001,gid=10001
+
+# Private SELinux relabel (:Z) for Fedora/RHEL; zero host ports published
+Volume=%h/.local/share/xmr-gateway/wallet:/wallet:Z
+Tmpfs=/tmp:rw,noexec,nosuid,size=64m
+
+# Attach to internal RPC network + pasta for outbound remote Monero node connectivity
+Network=xmr-gateway-internal.network
+Network=pasta
+
+ReadOnly=true
+DropCapability=ALL
+NoNewPrivileges=true
+SecurityLabelDisable=false
+
+[Service]
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

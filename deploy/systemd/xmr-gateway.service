@@ -2,22 +2,24 @@
 Description=xmr-gateway Non-Custodial Monero Payment Gateway
 Documentation=https://github.com/XeonIT-dev/xmr-gateway
 After=network-online.target monero-wallet-rpc.service
-Wants=network-online.target
-Requires=monero-wallet-rpc.service
+Wants=network-online.target monero-wallet-rpc.service
 
 [Service]
 Type=simple
 User=xmr-gateway
 Group=xmr-gateway
 WorkingDirectory=/var/lib/xmr-gateway
-EnvironmentFile=/etc/xmr-gateway/xmr-gateway.env
+EnvironmentFile=/etc/xmr-gateway/.env
 UMask=0077
 
-ExecStart=/usr/local/bin/xmr-gateway
+ExecStart=/usr/bin/xmr-gateway
 
+# Graceful shutdown gives scanner/webhook workers and SQLite PRAGMA wal_checkpoint(TRUNCATE)
+# sufficient time to flush WAL frames cleanly before releasing the process lockfile.
+KillSignal=SIGTERM
+TimeoutStopSec=30
 Restart=on-failure
 RestartSec=5
-TimeoutStopSec=30
 
 # Systemd Sandboxing & Least-Privilege Hardening (XMR-037)
 NoNewPrivileges=true

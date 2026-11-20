@@ -1,0 +1,56 @@
+# ==============================================================================
+# xmr-gateway Production Reverse Proxy — Caddy (Automatic Let's Encrypt HTTPS)
+# ==============================================================================
+# Replace `pay.example.com` (or set XMR_GATEWAY_DOMAIN) before deploying.
+# Gateway stays bound strictly to 127.0.0.1:8080 on bare-metal (or xmr-gateway:8080
+# when running via Docker Compose `--profile caddy`); Caddy terminates TLS 1.2/1.3.
+# ==============================================================================
+
+{$XMR_GATEWAY_DOMAIN:pay.example.com} {
+    encode zstd gzip
+
+    # Match / tighten request body bounds (gateway enforces 64 KiB on /api/v1/*)
+    request_body {
+        max_size 1MB
+    }
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "no-referrer"
+        -Server
+    }
+
+    # Optional defense-in-depth: restrict privileged operator routes to admin VPN/IPs.
+    # Uncomment and replace 203.0.113.10/32 or 10.10.0.0/24 with your operator subnet:
+    #
+    # @operator_routes {
+    #     path /api/v1/invoices/*/sweep /api/v1/invoices/*/sweep/resolve
+    #     path /api/v1/invoices/*/webhooks/retry /api/v1/webhooks/*/retry
+    # }
+    # @not_admin_vpn {
+    #     not remote_ip 127.0.0.1 ::1 10.10.0.0/24
+    # }
+    # handle @operator_routes {
+    #     respond @not_admin_vpn "Forbidden" 403
+    #     reverse_proxy {$XMR_GATEWAY_UPSTREAM:127.0.0.1:8080} {
+    #         transport http {
+    #             dial_timeout 5s
+    #             response_header_timeout 35s
+    #         }
+    #     }
+    # }
+
+    reverse_proxy {$XMR_GATEWAY_UPSTREAM:127.0.0.1:8080} {
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+        transport http {
+            dial_timeout 5s
+            response_header_timeout 35s
+            read_timeout 35s
+            write_timeout 35s
+        }
+    }
+}

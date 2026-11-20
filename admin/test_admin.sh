@@ -23,6 +23,7 @@ cleanup() {
         kill -TERM "$MOCK_PID" 2>/dev/null || true
         wait "$MOCK_PID" 2>/dev/null || true
     fi
+    chmod -R u+w "$TMP_DIR" 2>/dev/null || true
     rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
@@ -92,6 +93,14 @@ ALL_SCRIPTS=(
     "$REPO_ROOT/admin/db.sh"
     "$REPO_ROOT/admin/dev.sh"
     "$REPO_ROOT/admin/test_admin.sh"
+    "$REPO_ROOT/scripts/install.sh"
+    "$REPO_ROOT/deploy/packaging/xmr-gateway-admin"
+    "$REPO_ROOT/deploy/packaging/deb/postinst"
+    "$REPO_ROOT/deploy/packaging/deb/prerm"
+    "$REPO_ROOT/deploy/packaging/deb/postrm"
+    "$REPO_ROOT/deploy/packaging/rpm/postinst.sh"
+    "$REPO_ROOT/deploy/packaging/rpm/prerm.sh"
+    "$REPO_ROOT/deploy/packaging/rpm/postrm.sh"
 )
 syntax_ok=1
 for s in "${ALL_SCRIPTS[@]}"; do
@@ -476,7 +485,11 @@ QR_OUT="$TMP_DIR/invoice_qr.png"
 CREATE_JSON="$(PATH="$TMP_DIR/shim:$PATH" "$ADMIN_SH" --env "$TEST_ENV" --json invoices create \
     --order-id "ord-test-125" --amount-xmr "1.25" --callback-url "http://127.0.0.1:9999/cb" --ttl 1800 --qr-out "$QR_OUT")"
 assert_contains "$CREATE_JSON" '"amount_piconero": 1250000000000' "invoices create converts 1.25 XMR -> exact 1250000000000 piconero"
-[[ -f "$QR_OUT" ]] && pass "invoices create wrote QR PNG file" || fail "QR PNG missing"
+if [[ -f "$QR_OUT" ]]; then
+    pass "invoices create wrote QR PNG file"
+else
+    fail "QR PNG missing"
+fi
 assert_eq "$(stat -c '%a' "$QR_OUT")" "600" "QR PNG file has 0600 permissions"
 
 GET_OUT="$(PATH="$TMP_DIR/shim:$PATH" "$ADMIN_SH" --env "$TEST_ENV" --json invoices get "11111111-1111-4111-8111-111111111111")"
@@ -551,7 +564,11 @@ pass "Mock server verified exact RBAC headers (X-API-Key vs X-Operator-Key) and 
 
 # Verify ZERO secrets appeared in curl CLI argv!
 ARGV_CONTENT="$(cat "$ARGV_LOG")"
-[[ -n "$ARGV_CONTENT" ]] && pass "curl shim captured live invocations" || fail "curl shim log unexpectedly empty"
+if [[ -n "$ARGV_CONTENT" ]]; then
+    pass "curl shim captured live invocations"
+else
+    fail "curl shim log unexpectedly empty"
+fi
 for secret in "$API_KEY" "$OP_KEY" "$WH_SECRET" "$RPC_PASS" "daemon-secret-pass-0123456789"; do
     assert_not_contains "$ARGV_CONTENT" "$secret" "zero argv leak for secret (${secret:0:8}...) in curl ps/cmdline"
 done
@@ -764,7 +781,11 @@ fi
 # Save 'ru' via `./admin.sh lang ru` -> stored in $ADMIN_STATE_DIR/.admin_lang (0600)
 "$ADMIN_SH" lang ru >/dev/null
 STATE_LANG_FILE="$ADMIN_STATE_DIR/.admin_lang"
-[[ -f "$STATE_LANG_FILE" ]] && pass "lang ru created isolated .admin_lang state file" || fail ".admin_lang missing"
+if [[ -f "$STATE_LANG_FILE" ]]; then
+    pass "lang ru created isolated .admin_lang state file"
+else
+    fail ".admin_lang missing"
+fi
 assert_eq "$(stat -c '%a' "$STATE_LANG_FILE")" "600" ".admin_lang has 0600 permissions"
 
 LANG_FILE_JSON="$("$ADMIN_SH" --json lang show)"
@@ -832,8 +853,145 @@ GUIDE_EN_PATH="$("$ADMIN_SH" --lang en guide --path)"
 GUIDE_RU_PATH="$("$ADMIN_SH" --lang ru guide --path)"
 assert_eq "$GUIDE_EN_PATH" "$REPO_ROOT/admin/GUIDE_EN.md" "guide --path resolves GUIDE_EN.md for --lang en"
 assert_eq "$GUIDE_RU_PATH" "$REPO_ROOT/admin/GUIDE_RU.md" "guide --path resolves GUIDE_RU.md for --lang ru"
-[[ -s "$GUIDE_EN_PATH" ]] && pass "admin/GUIDE_EN.md exists and is non-empty" || fail "admin/GUIDE_EN.md missing or empty"
-[[ -s "$GUIDE_RU_PATH" ]] && pass "admin/GUIDE_RU.md exists and is non-empty" || fail "admin/GUIDE_RU.md missing or empty"
+if [[ -s "$GUIDE_EN_PATH" ]]; then
+    pass "admin/GUIDE_EN.md exists and is non-empty"
+else
+    fail "admin/GUIDE_EN.md missing or empty"
+fi
+if [[ -s "$GUIDE_RU_PATH" ]]; then
+    pass "admin/GUIDE_RU.md exists and is non-empty"
+else
+    fail "admin/GUIDE_RU.md missing or empty"
+fi
+
+# ==============================================================================
+# 9. Installer (scripts/install.sh), Read-Only System Install, YAML & Packaging Metadata
+# ==============================================================================
+printf '\n=== 9. Installer, Read-Only System Install, YAML & Packaging ===\n'
+
+INSTALL_SH="$REPO_ROOT/scripts/install.sh"
+if HELP_INST="$("$INSTALL_SH" --help)"; then
+    assert_contains "$HELP_INST" "--method auto|deb|rpm|tarball" "install.sh --help displays usage"
+else
+    fail "install.sh --help failed"
+fi
+
+DRY_DEB="$("$INSTALL_SH" --dry-run --method deb --version v0.1.0)"
+assert_contains "$DRY_DEB" "xmr-gateway_0.1.0_" "install.sh --dry-run --method deb computes .deb artifact"
+assert_contains "$DRY_DEB" "SHA256SUMS" "install.sh --dry-run includes SHA256SUMS check"
+
+DRY_RPM="$("$INSTALL_SH" --dry-run --method rpm --version v0.1.0)"
+assert_contains "$DRY_RPM" "xmr-gateway-0.1.0-1." "install.sh --dry-run --method rpm computes .rpm artifact"
+
+DRY_TAR="$("$INSTALL_SH" --dry-run --method tarball --version v0.1.0 --prefix /opt/xmr-custom --require-gpg)"
+assert_contains "$DRY_TAR" "xmr-gateway-v0.1.0-linux-" "install.sh --dry-run --method tarball computes tarball artifact"
+assert_contains "$DRY_TAR" "/opt/xmr-custom" "install.sh --dry-run --prefix applied"
+assert_contains "$DRY_TAR" "REQUIRED (SHA256SUMS.asc)" "install.sh --require-gpg reflected in plan"
+
+# Fail-closed validation checks on scripts/install.sh
+if "$INSTALL_SH" --dry-run --method invalid_pkg >/dev/null 2>&1; then
+    fail "install.sh MUST fail closed on invalid --method"
+else
+    pass "install.sh fails closed on invalid --method"
+fi
+
+for bad_ver in "../etc/passwd" "v1.0;id" "1.2.3" "v1.0.0/evil"; do
+    if "$INSTALL_SH" --dry-run --version "$bad_ver" >/dev/null 2>&1; then
+        fail "install.sh MUST fail closed on invalid --version '$bad_ver'"
+    else
+        pass "install.sh fails closed on invalid --version '$bad_ver'"
+    fi
+done
+
+if "$INSTALL_SH" --dry-run --method tarball --prefix "relative/path" >/dev/null 2>&1; then
+    fail "install.sh MUST fail closed on relative --prefix"
+else
+    pass "install.sh fails closed on relative --prefix"
+fi
+
+# Read-only system installation simulation (e.g. /usr/share/xmr-gateway)
+RO_INSTALL="$TMP_DIR/ro_install"
+XDG_STATE="$TMP_DIR/xdg_state"
+mkdir -p "$RO_INSTALL/admin" "$XDG_STATE"
+cp "$REPO_ROOT/admin.sh" "$RO_INSTALL/admin.sh"
+cp -a "$REPO_ROOT/admin/lib" "$REPO_ROOT/admin/i18n" "$REPO_ROOT/admin/config.sh" "$RO_INSTALL/admin/"
+chmod -R a-w "$RO_INSTALL"
+
+if RO_OUT="$(env -u ADMIN_STATE_DIR -u ADMIN_LANG XDG_STATE_HOME="$XDG_STATE" "$RO_INSTALL/admin.sh" --env "$TEST_ENV" lang ru 2>&1)"; then
+    pass "read-only admin.sh saves language outside read-only install dir"
+else
+    fail "read-only admin.sh failed to save language: $RO_OUT"
+fi
+RO_LANG_FILE="$XDG_STATE/xmr-gateway/.admin_lang"
+if [[ -f "$RO_LANG_FILE" ]]; then
+    pass "read-only admin.sh created XDG .admin_lang"
+else
+    fail "XDG .admin_lang missing"
+fi
+assert_eq "$(stat -c '%a' "$RO_LANG_FILE")" "600" "XDG .admin_lang has 0600 permissions"
+if RO_SHOW="$(env -u ADMIN_STATE_DIR -u ADMIN_LANG XDG_STATE_HOME="$XDG_STATE" "$RO_INSTALL/admin.sh" --env "$TEST_ENV" config show)"; then
+    assert_contains "$RO_SHOW" "Активная конфигурация xmr-gateway" "read-only admin.sh reads XDG saved Russian language & config"
+else
+    fail "read-only admin.sh config show failed"
+fi
+
+# Verify service systemd install-dry-run alignment with deploy/systemd/
+SYS_PLAN="$("$ADMIN_SH" --env "$TEST_ENV" service systemd install-dry-run)"
+assert_contains "$SYS_PLAN" "/etc/xmr-gateway/.env" "service systemd dry-run aligned with /etc/xmr-gateway/.env"
+assert_contains "$SYS_PLAN" "xmr-gateway-backup.timer" "service systemd dry-run includes backup timer"
+
+# Validate YAML files & Cargo.toml deb/rpm packaging asset paths
+python3 - "$REPO_ROOT" <<'PYEOF'
+import os, sys, tomllib
+
+repo = sys.argv[1]
+
+# 1) YAML syntax validation
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+yaml_files = [
+    ".github/workflows/ci.yml",
+    ".github/workflows/security.yml",
+    ".github/workflows/release.yml",
+    "deploy/docker/docker-compose.yml",
+]
+for rel in yaml_files:
+    p = os.path.join(repo, rel)
+    assert os.path.isfile(p), f"Missing YAML file: {rel}"
+    with open(p, "r", encoding="utf-8") as f:
+        raw = f.read()
+    if yaml is not None:
+        doc = yaml.safe_load(raw)
+        assert isinstance(doc, dict) and len(doc) > 0, f"Empty/invalid YAML root in {rel}"
+
+# 2) Cargo.toml [package.metadata.deb] & [package.metadata.generate-rpm] asset existence check
+with open(os.path.join(repo, "Cargo.toml"), "rb") as f:
+    cargo = tomllib.load(f)
+
+deb = cargo["package"]["metadata"]["deb"]
+rpm = cargo["package"]["metadata"]["generate-rpm"]
+
+assert os.path.isdir(os.path.join(repo, deb["maintainer-scripts"])), "deb maintainer-scripts dir missing"
+for entry in deb["assets"]:
+    src = entry[0]
+    if src == "target/release/xmr-gateway":
+        continue
+    assert os.path.exists(os.path.join(repo, src)), f"deb asset missing: {src}"
+
+for entry in rpm["assets"]:
+    src = entry["source"]
+    if src == "target/release/xmr-gateway":
+        continue
+    assert os.path.exists(os.path.join(repo, src)), f"rpm asset missing: {src}"
+
+for key in ("post_install_script", "pre_uninstall_script", "post_uninstall_script"):
+    script_path = rpm[key]
+    assert os.path.isfile(os.path.join(repo, script_path)), f"rpm {key} missing: {script_path}"
+PYEOF
+pass "YAML workflows/compose and Cargo.toml deb/rpm packaging metadata validated cleanly"
 
 printf '\n====================================================================\n'
 printf 'Admin Test Summary: %d PASSED, %d FAILED\n' "$PASS_COUNT" "$FAIL_COUNT"

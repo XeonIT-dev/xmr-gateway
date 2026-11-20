@@ -1,0 +1,12 @@
+# ==============================================================================
+# Rootless Podman Quadlet — Isolated Internal RPC Network
+# ==============================================================================
+# Install to: ~/.config/containers/systemd/xmr-gateway-internal.network
+# ==============================================================================
+
+[Unit]
+Description=Isolated internal RPC network for xmr-gateway and monero-wallet-rpc
+
+[Network]
+Internal=true
+NetworkName=xmr-gateway-internal

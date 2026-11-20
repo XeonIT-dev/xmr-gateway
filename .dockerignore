@@ -1,0 +1,28 @@
+# Build outputs & VCS
+/target/
+/.git/
+/.github/
+/.obsidian/
+
+# Local secrets, databases, wallets, logs & packages
+.env
+.env.*
+!.env.example
+/data/
+/data.*/
+/bin/
+/wallets/
+*.db
+*.db-shm
+*.db-wal
+*.lock
+!Cargo.lock
+*.keys
+*.wallet
+*.log
+*.deb
+*.rpm
+*.tar.gz
+*.tar.bz2
+SHA256SUMS
+SHA256SUMS.asc

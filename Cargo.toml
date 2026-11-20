@@ -60,3 +60,94 @@ uuid = { version = "1.16", features = ["v4", "serde"] }
 wiremock = "0.6"
 http-body-util = "0.1"
 tempfile = "3.19"
+
+# ==============================================================================
+# Debian Package Metadata (cargo-deb)
+# ==============================================================================
+[package.metadata.deb]
+maintainer = "xmr-gateway maintainers <security@xmr-gateway.local>"
+copyright = "2026, xmr-gateway contributors"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+Self-hosted, non-custodial Monero (XMR) payment gateway and auto-sweep engine
+with per-invoice subaddress isolation, SQLite WAL durability, HMAC-SHA256 webhooks,
+RBAC operator separation, and the unified xmr-gateway-admin CLI suite."""
+section = "net"
+priority = "optional"
+depends = "$auto, ca-certificates, curl, python3, openssl"
+recommends = "sqlite3"
+maintainer-scripts = "deploy/packaging/deb"
+assets = [
+    ["target/release/xmr-gateway", "usr/bin/xmr-gateway", "755"],
+    ["deploy/packaging/xmr-gateway-admin", "usr/bin/xmr-gateway-admin", "755"],
+    ["admin.sh", "usr/share/xmr-gateway/admin.sh", "755"],
+    ["admin/service.sh", "usr/share/xmr-gateway/admin/service.sh", "755"],
+    ["admin/config.sh", "usr/share/xmr-gateway/admin/config.sh", "755"],
+    ["admin/wallet.sh", "usr/share/xmr-gateway/admin/wallet.sh", "755"],
+    ["admin/invoices.sh", "usr/share/xmr-gateway/admin/invoices.sh", "755"],
+    ["admin/webhooks.sh", "usr/share/xmr-gateway/admin/webhooks.sh", "755"],
+    ["admin/db.sh", "usr/share/xmr-gateway/admin/db.sh", "755"],
+    ["admin/dev.sh", "usr/share/xmr-gateway/admin/dev.sh", "755"],
+    ["admin/lib/common.sh", "usr/share/xmr-gateway/admin/lib/common.sh", "644"],
+    ["admin/lib/i18n.sh", "usr/share/xmr-gateway/admin/lib/i18n.sh", "644"],
+    ["admin/i18n/en.sh", "usr/share/xmr-gateway/admin/i18n/en.sh", "644"],
+    ["admin/i18n/ru.sh", "usr/share/xmr-gateway/admin/i18n/ru.sh", "644"],
+    ["admin/GUIDE_EN.md", "usr/share/xmr-gateway/admin/GUIDE_EN.md", "644"],
+    ["admin/GUIDE_RU.md", "usr/share/xmr-gateway/admin/GUIDE_RU.md", "644"],
+    ["deploy/reverse-proxy/Caddyfile", "usr/share/xmr-gateway/reverse-proxy/Caddyfile", "644"],
+    ["deploy/reverse-proxy/nginx-xmr-gateway.conf", "usr/share/xmr-gateway/reverse-proxy/nginx-xmr-gateway.conf", "644"],
+    ["README.md", "usr/share/doc/xmr-gateway/README.md", "644"],
+    ["README_RU.md", "usr/share/doc/xmr-gateway/README_RU.md", "644"],
+    ["DEPLOY_EN.md", "usr/share/doc/xmr-gateway/DEPLOY_EN.md", "644"],
+    ["DEPLOY_RU.md", "usr/share/doc/xmr-gateway/DEPLOY_RU.md", "644"],
+    ["LICENSE", "usr/share/doc/xmr-gateway/LICENSE", "644"],
+    [".env.example", "etc/xmr-gateway/env.example", "640"],
+    ["deploy/systemd/xmr-gateway.service", "usr/lib/systemd/system/xmr-gateway.service", "644"],
+    ["deploy/systemd/monero-wallet-rpc.service", "usr/lib/systemd/system/monero-wallet-rpc.service", "644"],
+    ["deploy/systemd/xmr-gateway-backup.service", "usr/lib/systemd/system/xmr-gateway-backup.service", "644"],
+    ["deploy/systemd/xmr-gateway-backup.timer", "usr/lib/systemd/system/xmr-gateway-backup.timer", "644"],
+]
+
+# ==============================================================================
+# RPM Package Metadata (cargo-generate-rpm)
+# ==============================================================================
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/xmr-gateway", dest = "/usr/bin/xmr-gateway", mode = "0755" },
+    { source = "deploy/packaging/xmr-gateway-admin", dest = "/usr/bin/xmr-gateway-admin", mode = "0755" },
+    { source = "admin.sh", dest = "/usr/share/xmr-gateway/admin.sh", mode = "0755" },
+    { source = "admin/service.sh", dest = "/usr/share/xmr-gateway/admin/service.sh", mode = "0755" },
+    { source = "admin/config.sh", dest = "/usr/share/xmr-gateway/admin/config.sh", mode = "0755" },
+    { source = "admin/wallet.sh", dest = "/usr/share/xmr-gateway/admin/wallet.sh", mode = "0755" },
+    { source = "admin/invoices.sh", dest = "/usr/share/xmr-gateway/admin/invoices.sh", mode = "0755" },
+    { source = "admin/webhooks.sh", dest = "/usr/share/xmr-gateway/admin/webhooks.sh", mode = "0755" },
+    { source = "admin/db.sh", dest = "/usr/share/xmr-gateway/admin/db.sh", mode = "0755" },
+    { source = "admin/dev.sh", dest = "/usr/share/xmr-gateway/admin/dev.sh", mode = "0755" },
+    { source = "admin/lib/common.sh", dest = "/usr/share/xmr-gateway/admin/lib/common.sh", mode = "0644" },
+    { source = "admin/lib/i18n.sh", dest = "/usr/share/xmr-gateway/admin/lib/i18n.sh", mode = "0644" },
+    { source = "admin/i18n/en.sh", dest = "/usr/share/xmr-gateway/admin/i18n/en.sh", mode = "0644" },
+    { source = "admin/i18n/ru.sh", dest = "/usr/share/xmr-gateway/admin/i18n/ru.sh", mode = "0644" },
+    { source = "admin/GUIDE_EN.md", dest = "/usr/share/xmr-gateway/admin/GUIDE_EN.md", mode = "0644" },
+    { source = "admin/GUIDE_RU.md", dest = "/usr/share/xmr-gateway/admin/GUIDE_RU.md", mode = "0644" },
+    { source = "deploy/reverse-proxy/Caddyfile", dest = "/usr/share/xmr-gateway/reverse-proxy/Caddyfile", mode = "0644" },
+    { source = "deploy/reverse-proxy/nginx-xmr-gateway.conf", dest = "/usr/share/xmr-gateway/reverse-proxy/nginx-xmr-gateway.conf", mode = "0644" },
+    { source = "README.md", dest = "/usr/share/doc/xmr-gateway/README.md", mode = "0644", doc = true },
+    { source = "README_RU.md", dest = "/usr/share/doc/xmr-gateway/README_RU.md", mode = "0644", doc = true },
+    { source = "DEPLOY_EN.md", dest = "/usr/share/doc/xmr-gateway/DEPLOY_EN.md", mode = "0644", doc = true },
+    { source = "DEPLOY_RU.md", dest = "/usr/share/doc/xmr-gateway/DEPLOY_RU.md", mode = "0644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/doc/xmr-gateway/LICENSE", mode = "0644", doc = true },
+    { source = ".env.example", dest = "/etc/xmr-gateway/env.example", mode = "0640", config = true },
+    { source = "deploy/systemd/xmr-gateway.service", dest = "/usr/lib/systemd/system/xmr-gateway.service", mode = "0644" },
+    { source = "deploy/systemd/monero-wallet-rpc.service", dest = "/usr/lib/systemd/system/monero-wallet-rpc.service", mode = "0644" },
+    { source = "deploy/systemd/xmr-gateway-backup.service", dest = "/usr/lib/systemd/system/xmr-gateway-backup.service", mode = "0644" },
+    { source = "deploy/systemd/xmr-gateway-backup.timer", dest = "/usr/lib/systemd/system/xmr-gateway-backup.timer", mode = "0644" },
+]
+post_install_script = "deploy/packaging/rpm/postinst.sh"
+pre_uninstall_script = "deploy/packaging/rpm/prerm.sh"
+post_uninstall_script = "deploy/packaging/rpm/postrm.sh"
+
+[package.metadata.generate-rpm.requires]
+ca-certificates = "*"
+curl = "*"
+python3 = "*"
+openssl = "*"

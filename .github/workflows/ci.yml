@@ -43,3 +43,41 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps
+
+  packaging-and-scripts:
+    name: Shell Scripts, Admin Suite & Packaging Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate shell script syntax (bash -n)
+        run: |
+          bash -n start.sh demo-stagenet.sh admin.sh \
+            admin/*.sh admin/lib/*.sh admin/i18n/*.sh \
+            scripts/install.sh deploy/packaging/xmr-gateway-admin \
+            deploy/packaging/deb/* deploy/packaging/rpm/*
+
+      - name: Run isolated admin panel test suite
+        run: ./admin/test_admin.sh
+
+      - name: Validate installer dry-run across methods
+        run: |
+          ./scripts/install.sh --dry-run --method deb --version v0.1.0
+          ./scripts/install.sh --dry-run --method rpm --version v0.1.0
+          ./scripts/install.sh --dry-run --method tarball --version v0.1.0
+
+      - name: Validate workflow and Compose YAML syntax
+        run: |
+          python3 -c '
+          import yaml
+          for p in [
+              ".github/workflows/ci.yml",
+              ".github/workflows/security.yml",
+              ".github/workflows/release.yml",
+              "deploy/docker/docker-compose.yml",
+          ]:
+              with open(p, encoding="utf-8") as f:
+                  yaml.safe_load(f)
+              print(f"YAML OK: {p}")
+          '

@@ -735,9 +735,17 @@ cargo test --locked --release --all-targets
   sqlite3 -header -column data/xmr_gateway.db \
     "SELECT id, invoice_id, status, error_message, resolution_action FROM sweep_attempts WHERE status IN ('PREPARED','REORGED','FAILED') ORDER BY created_at DESC LIMIT 10;"
   ```
-- **Эксплуатация через `systemd`:** готовые изолированные юниты лежат в `deploy/systemd/`:
-  - `deploy/systemd/monero-wallet-rpc.service` (пользователь `xmr-gateway`, `UMask=0077`, `ProtectSystem=strict`, `NoNewPrivileges=true`, `ReadWritePaths=/var/lib/xmr-gateway`, конфиг `/etc/xmr-gateway/xmr-gateway.env`).
-  - `deploy/systemd/xmr-gateway.service` (`Requires=monero-wallet-rpc.service`, те же ограничения песочницы).
+- **Промышленная установка, пакеты и контейнеры (подробно в [DEPLOY_RU.md](DEPLOY_RU.md) / [DEPLOY_EN.md](DEPLOY_EN.md)):**
+  - **One-line установщик (`scripts/install.sh`):** автовыбор `.deb` / `.rpm` / `.tar.gz` из GitHub Releases (`x86_64` / `aarch64`) с обязательной проверкой `SHA256SUMS` и опциональной GPG-проверкой (`--require-gpg`):
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/XeonIT-dev/xmr-gateway/main/scripts/install.sh -o install.sh
+    bash install.sh --dry-run
+    sudo bash install.sh
+    ```
+  - **Системные пакеты `.deb` / `.rpm`:** устанавливают `/usr/bin/xmr-gateway`, системную обёртку `/usr/bin/xmr-gateway-admin` (`/usr/share/xmr-gateway/`), шаблон `/etc/xmr-gateway/env.example` (не перезаписывая существующий `/etc/xmr-gateway/.env`) и 4 юнита `systemd` в `/usr/lib/systemd/system/`.
+  - **Эксплуатация через `systemd` (`deploy/systemd/`):** `monero-wallet-rpc.service` (рендерит `0600` `/run/xmr-gateway/wallet-rpc.conf` в RAM без утечки пароля в `ps`), `xmr-gateway.service` (`EnvironmentFile=/etc/xmr-gateway/.env`, `UMask=0077`, `KillSignal=SIGTERM`, `TimeoutStopSec=30`) и ежедневный горячий бэкап `xmr-gateway-backup.service` + `xmr-gateway-backup.timer`.
+  - **Обратный прокси (`deploy/reverse-proxy/`):** готовые `Caddyfile` и `nginx-xmr-gateway.conf` (TLS 1.2/1.3, лимит тела, пример ограничения операторских маршрутов по IP/VPN).
+  - **Контейнеры:** корневой `Containerfile` (UID/GID `10001`), воспроизводимый `deploy/docker/Containerfile.monero-rpc` (SHA256-проверка официального Monero CLI), `deploy/docker/docker-compose.yml` (изолированная сеть `xmr_internal`, `127.0.0.1:8080`, опциональный `--profile caddy`) и rootless Podman Quadlet (`deploy/podman/quadlet/` с `:Z` для SELinux).
 - **Логи:**
   - `xmr-gateway` пишет логи в `stdout` (формат `LOG_FORMAT=json` или `pretty`, фильтрация через `RUST_LOG`). При работе через `systemd`: `journalctl -u xmr-gateway -f`.
   - `monero-wallet-rpc` пишет логи в `data/monero-wallet-rpc.log` (или `/var/lib/xmr-gateway/monero-wallet-rpc.log` в `systemd`).
