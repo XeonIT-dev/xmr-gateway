@@ -16,10 +16,12 @@ UMask=0077
 
 # Render RPC credentials and daemon options into a RAM-only 0600 config file so
 # MONERO_RPC_PASS never appears in `ps aux` / `/proc/<pid>/cmdline`.
-# NOTE: All printf percent signs MUST be doubled (`%%`) for systemd specifier escaping.
+# NOTE: All literal percent signs (`%`) MUST be doubled (`%%`) for systemd specifier escaping.
 ExecStartPre=/bin/sh -ec 'umask 077; \
   test -n "${MONERO_RPC_USER:-}" && test -n "${MONERO_RPC_PASS:-}" || { echo "MONERO_RPC_USER/PASS required" >&2; exit 1; }; \
-  case "${MONERO_RPC_USER}${MONERO_RPC_PASS}" in *"$(printf "\n")"*|*"$(printf "\r")"*) echo "MONERO_RPC_USER/PASS must not contain newlines" >&2; exit 1 ;; esac; \
+  nl="$(printf "\nx")"; nl="${nl%%x}"; \
+  cr="$(printf "\rx")"; cr="${cr%%x}"; \
+  case "${MONERO_RPC_USER}${MONERO_RPC_PASS}" in *"$nl"*|*"$cr"*) echo "MONERO_RPC_USER/PASS must not contain newlines" >&2; exit 1 ;; esac; \
   case "${MONERO_NETWORK:-mainnet}" in \
     stagenet|STAGENET) def_node="node.monerodevs.org:38089" ;; \
     testnet|TESTNET)   def_node="testnet.xmr-tw.org:28081" ;; \

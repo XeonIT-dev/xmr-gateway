@@ -326,6 +326,11 @@ extract_sqlite_path() {
     if [[ "$p" == /* ]]; then
         printf '%s\n' "$p"
     elif [[ "${ACTIVE_ENV_FILE:-}" == "/etc/xmr-gateway/.env" ]]; then
+        # Flatten legacy relative `data/...` to `/var/lib/xmr-gateway/...` so system package
+        # DB_PATH (/var/lib/xmr-gateway/xmr_gateway.db) and WALLET_DIR (/var/lib/xmr-gateway/wallet)
+        # remain consistent with postinst and monero-wallet-rpc.service.
+        p="${p#./}"
+        p="${p#data/}"
         printf '%s\n' "/var/lib/xmr-gateway/$p"
     else
         printf '%s\n' "$REPO_ROOT/$p"

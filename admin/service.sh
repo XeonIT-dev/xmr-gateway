@@ -351,6 +351,34 @@ cmd_build() {
     ls -lh "$REPO_ROOT/target/release/xmr-gateway"
 }
 
+resolve_setup_rpc_bin_dir() {
+    if [[ -n "${XMR_BIN_DIR:-}" ]]; then
+        printf '%s\n' "$XMR_BIN_DIR"
+        return 0
+    fi
+    # System package installations (/usr/share/xmr-gateway, /usr/lib/*, or /etc/xmr-gateway/.env)
+    # MUST always install Monero CLI into /usr/local/bin so monero-wallet-rpc.service finds it.
+    if [[ "$REPO_ROOT" == "/usr/share/xmr-gateway" \
+        || "$REPO_ROOT" == /usr/lib/* \
+        || "${ACTIVE_ENV_FILE:-}" == "/etc/xmr-gateway/.env" \
+        || "${ADMIN_ENV_FILE:-}" == "/etc/xmr-gateway/.env" ]]; then
+        if [[ -w "/usr/local/bin" ]]; then
+            printf '/usr/local/bin\n'
+            return 0
+        fi
+        die "System installation requires write access to /usr/local/bin. Run with sudo (or set XMR_BIN_DIR)."
+    fi
+    if [[ -w "$REPO_ROOT" ]]; then
+        printf '%s/bin\n' "$REPO_ROOT"
+        return 0
+    fi
+    if [[ -w "/usr/local/bin" ]]; then
+        printf '/usr/local/bin\n'
+        return 0
+    fi
+    die "Neither '$REPO_ROOT' nor '/usr/local/bin' is writable. Run with sudo (for /usr/local/bin) or set XMR_BIN_DIR."
+}
+
 cmd_setup_rpc() {
     log_step "$(t service.setup_rpc_run)"
 
@@ -363,16 +391,8 @@ cmd_setup_rpc() {
         die "start.sh not found in '$REPO_ROOT' or '/usr/share/xmr-gateway'."
     fi
 
-    local target_bin_dir="${XMR_BIN_DIR:-}"
-    if [[ -z "$target_bin_dir" ]]; then
-        if [[ -w "$REPO_ROOT" ]]; then
-            target_bin_dir="$REPO_ROOT/bin"
-        elif [[ -w "/usr/local/bin" ]]; then
-            target_bin_dir="/usr/local/bin"
-        else
-            die "Neither '$REPO_ROOT' nor '/usr/local/bin' is writable. Run with sudo (for /usr/local/bin) or set XMR_BIN_DIR."
-        fi
-    fi
+    local target_bin_dir
+    target_bin_dir="$(resolve_setup_rpc_bin_dir)"
 
     XMR_BIN_DIR="$target_bin_dir" bash "$start_sh" --setup-rpc
     for b in monero-wallet-rpc monero-wallet-cli; do

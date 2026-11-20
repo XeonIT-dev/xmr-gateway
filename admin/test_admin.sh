@@ -280,7 +280,7 @@ class MockHandler(BaseHTTPRequestHandler):
                 self._send(200, {
                     "status": "ok",
                     "service": "xmr-gateway",
-                    "version": "0.1.1",
+                    "version": "0.1.2",
                     "database": "connected",
                     "monero_rpc": {"connected": True, "version": 196619, "error": None},
                     "auto_sweep_enabled": False,
@@ -876,15 +876,15 @@ else
     fail "install.sh --help failed"
 fi
 
-DRY_DEB="$("$INSTALL_SH" --dry-run --method deb --version v0.1.1)"
-assert_contains "$DRY_DEB" "xmr-gateway_0.1.1_" "install.sh --dry-run --method deb computes .deb artifact"
+DRY_DEB="$("$INSTALL_SH" --dry-run --method deb --version v0.1.2)"
+assert_contains "$DRY_DEB" "xmr-gateway_0.1.2_" "install.sh --dry-run --method deb computes .deb artifact"
 assert_contains "$DRY_DEB" "SHA256SUMS" "install.sh --dry-run includes SHA256SUMS check"
 
-DRY_RPM="$("$INSTALL_SH" --dry-run --method rpm --version v0.1.1)"
-assert_contains "$DRY_RPM" "xmr-gateway-0.1.1-1." "install.sh --dry-run --method rpm computes .rpm artifact"
+DRY_RPM="$("$INSTALL_SH" --dry-run --method rpm --version v0.1.2)"
+assert_contains "$DRY_RPM" "xmr-gateway-0.1.2-1." "install.sh --dry-run --method rpm computes .rpm artifact"
 
-DRY_TAR="$("$INSTALL_SH" --dry-run --method tarball --version v0.1.1 --prefix /opt/xmr-custom --require-gpg)"
-assert_contains "$DRY_TAR" "xmr-gateway-v0.1.1-linux-" "install.sh --dry-run --method tarball computes tarball artifact"
+DRY_TAR="$("$INSTALL_SH" --dry-run --method tarball --version v0.1.2 --prefix /opt/xmr-custom --require-gpg)"
+assert_contains "$DRY_TAR" "xmr-gateway-v0.1.2-linux-" "install.sh --dry-run --method tarball computes tarball artifact"
 assert_contains "$DRY_TAR" "/opt/xmr-custom" "install.sh --dry-run --prefix applied"
 assert_contains "$DRY_TAR" "REQUIRED (SHA256SUMS.asc)" "install.sh --require-gpg reflected in plan"
 
@@ -1120,9 +1120,9 @@ PYEOF
 pass "XMR-AUDIT-003: start.sh fail-closed query_key JSON verifier passed all positive & adversarial cases"
 
 # ==============================================================================
-# 11. v0.1.1 Packaging, Systemd, Quadlet, Key Rotation & Network Node Checks
+# 11. Packaging, Systemd, Quadlet, Key Rotation & Network Node Checks
 # ==============================================================================
-printf '\n=== 11. v0.1.1 Packaging, Systemd, Quadlet, Rotation & Network Checks ===\n'
+printf '\n=== 11. Packaging, Systemd, Quadlet, Rotation & Network Checks ===\n'
 
 # 11a) Verify systemd units have zero unescaped printf %s/%d specifiers & Quadlet/Compose isolation
 python3 - "$REPO_ROOT" <<'PYEOF'
@@ -1182,7 +1182,7 @@ assert not re.search(r"^\s*HEALTHCHECK\b", cfile_raw, re.M), "Containerfile must
 env_ex = open(os.path.join(repo, ".env.example"), encoding="utf-8").read()
 assert re.search(r"^OPERATOR_API_KEY=", env_ex, re.M), ".env.example must contain uncommented OPERATOR_API_KEY="
 PYEOF
-pass "v0.1.1 systemd escaping, packaging manifests, Quadlet/Compose isolation, OCI healthcheck & .env.example verified"
+pass "systemd escaping, packaging manifests, Quadlet/Compose isolation, OCI healthcheck & .env.example verified"
 
 # 11b) Verify Podman Quadlet generator dry-run cleanly accepts all 4 units (if installed)
 if [[ -x /usr/libexec/podman/quadlet ]]; then
@@ -1247,6 +1247,252 @@ assert_contains "$STAGE_BAD_DOC" "remote_node_network" "config doctor warns when
 TAR_NEXT_STEPS="$(bash -c 'source <(sed "/^main \"\$@\"$/d" "$1"); INSTALL_LANG=en; METHOD=tarball; PREFIX=/home/tester/xmr-app; print_next_steps' _ "$INSTALL_SH")"
 assert_contains "$TAR_NEXT_STEPS" "/home/tester/xmr-app/admin.sh" "install.sh tarball next-steps uses actual PREFIX and admin.sh"
 assert_not_contains "$TAR_NEXT_STEPS" "/etc/xmr-gateway/.env" "install.sh tarball next-steps does not print systemd /etc/xmr-gateway path"
+
+# ==============================================================================
+# 12. Real Runtime Regression Tests (v0.1.2: ExecStartPre, Containerfile,
+#     setup-rpc target/umask, RPM/DEB DB/wallet path & restore height)
+# ==============================================================================
+printf '\n=== 12. Runtime Regression Tests (ExecStartPre, Containerfile, setup-rpc, paths) ===\n'
+
+# 12a) Real /bin/sh -ec execution of ExecStartPre extracted from monero-wallet-rpc.service
+python3 - "$REPO_ROOT/deploy/systemd/monero-wallet-rpc.service" "$TMP_DIR" <<'PYEOF'
+import os, re, stat, subprocess, sys
+
+unit_path, tmp_dir = sys.argv[1], sys.argv[2]
+raw = open(unit_path, encoding="utf-8").read()
+
+# Reconstruct systemd line continuations (`\\\n`) on ExecStartPre=
+lines = raw.splitlines()
+exec_pre_parts = []
+collecting = False
+for line in lines:
+    if not collecting:
+        if line.startswith("ExecStartPre="):
+            collecting = True
+            chunk = line[len("ExecStartPre="):]
+        else:
+            continue
+    else:
+        chunk = line
+    if chunk.endswith("\\"):
+        exec_pre_parts.append(chunk[:-1])
+    else:
+        exec_pre_parts.append(chunk)
+        break
+
+assert exec_pre_parts, "ExecStartPre= not found in monero-wallet-rpc.service"
+exec_pre_raw = "".join(exec_pre_parts)
+
+# Verify no single unescaped % remains after stripping %% (systemd specifier rule)
+assert "%" not in exec_pre_raw.replace("%%", ""), f"Unescaped single % found in ExecStartPre: {exec_pre_raw}"
+
+# Unescape %% -> % exactly as systemd does before invoking /bin/sh -ec '...'
+exec_pre_expanded = exec_pre_raw.replace("%%", "%")
+m = re.match(r"^/bin/sh\s+-ec\s+'(.*)'\s*$", exec_pre_expanded, re.S)
+assert m is not None, f"Unexpected ExecStartPre format: {exec_pre_expanded}"
+sh_script = m.group(1)
+
+run_dir = os.path.join(tmp_dir, "systemd_run_xmr")
+os.makedirs(run_dir, mode=0o700, exist_ok=True)
+sh_script_local = sh_script.replace("/run/xmr-gateway", run_dir)
+conf_path = os.path.join(run_dir, "wallet-rpc.conf")
+
+# Positive runtime test: valid credentials + stagenet default remote node
+env_ok = {
+    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+    "MONERO_RPC_USER": "u",
+    "MONERO_RPC_PASS": "secret123",
+    "MONERO_NETWORK": "stagenet",
+    "MONERO_REMOTE_NODE": "",
+}
+res_ok = subprocess.run(["/bin/sh", "-ec", sh_script_local], env=env_ok, capture_output=True, text=True)
+assert res_ok.returncode == 0, f"ExecStartPre positive case failed (rc={res_ok.returncode}): {res_ok.stderr}"
+assert os.path.isfile(conf_path), "ExecStartPre did not create wallet-rpc.conf"
+mode = stat.S_IMODE(os.stat(conf_path).st_mode)
+assert mode == 0o600, f"wallet-rpc.conf mode expected 0600, got {oct(mode)}"
+conf_body = open(conf_path, encoding="utf-8").read()
+assert "rpc-login=u:secret123\n" in conf_body, f"Missing rpc-login in conf: {conf_body!r}"
+assert "daemon-address=node.monerodevs.org:38089\n" in conf_body, f"Missing stagenet daemon-address: {conf_body!r}"
+assert "stagenet=1\n" in conf_body, f"Missing stagenet=1: {conf_body!r}"
+assert "untrusted-daemon=1\n" in conf_body, f"Missing untrusted-daemon=1: {conf_body!r}"
+
+# Negative runtime tests: real \n and \r in credentials MUST fail closed
+for label, bad_user, bad_pass in (
+    ("LF in pass", "u", "secret\npass"),
+    ("CR in pass", "u", "secret\rpass"),
+    ("LF in user", "bad\nuser", "secret123"),
+):
+    env_bad = dict(env_ok)
+    env_bad["MONERO_RPC_USER"] = bad_user
+    env_bad["MONERO_RPC_PASS"] = bad_pass
+    res_bad = subprocess.run(["/bin/sh", "-ec", sh_script_local], env=env_bad, capture_output=True, text=True)
+    assert res_bad.returncode != 0, f"ExecStartPre MUST fail closed for {label}"
+    assert "newlines" in res_bad.stderr.lower(), f"Expected newline error for {label}, got: {res_bad.stderr!r}"
+PYEOF
+pass "Runtime test: systemd monero-wallet-rpc.service ExecStartPre succeeds on valid creds & rejects LF/CR"
+
+# 12b) Real /bin/sh execution of entrypoint-monero-rpc.sh extracted from Containerfile.monero-rpc
+python3 - "$REPO_ROOT/deploy/docker/Containerfile.monero-rpc" "$TMP_DIR" <<'PYEOF'
+import os, re, stat, subprocess, sys
+
+cfile_path, tmp_dir = sys.argv[1], sys.argv[2]
+raw = open(cfile_path, encoding="utf-8").read()
+m = re.search(
+    r"RUN cat <<'EOF' > /usr/local/bin/entrypoint-monero-rpc\.sh\n(.*?)\nEOF",
+    raw,
+    re.S,
+)
+assert m is not None, "Could not locate entrypoint-monero-rpc.sh heredoc in Containerfile.monero-rpc"
+ep_code = m.group(1)
+
+work_dir = os.path.join(tmp_dir, "container_ep_test")
+wallet_dir = os.path.join(work_dir, "wallet")
+os.makedirs(wallet_dir, mode=0o700, exist_ok=True)
+wallet_file = os.path.join(wallet_dir, "gateway_wallet")
+pass_file = os.path.join(wallet_dir, "gateway_wallet.password")
+open(wallet_file + ".keys", "w", encoding="utf-8").write("dummy-keys")
+open(pass_file, "w", encoding="utf-8").write("dummy-pass")
+os.chmod(wallet_file + ".keys", 0o600)
+os.chmod(pass_file, 0o600)
+
+conf_file = os.path.join(work_dir, "wallet-rpc.conf")
+args_log = os.path.join(work_dir, "rpc_args.txt")
+stub_rpc = os.path.join(work_dir, "stub-monero-wallet-rpc")
+open(stub_rpc, "w", encoding="utf-8").write(
+    f"#!/bin/sh\nprintf '%s\\n' \"$@\" > '{args_log}'\nexit 0\n"
+)
+os.chmod(stub_rpc, 0o755)
+
+ep_patched = ep_code.replace('CONF_FILE="/tmp/wallet-rpc.conf"', f'CONF_FILE="{conf_file}"')
+ep_patched = ep_patched.replace("exec /usr/local/bin/monero-wallet-rpc", f"exec '{stub_rpc}'")
+ep_path = os.path.join(work_dir, "entrypoint-monero-rpc.sh")
+open(ep_path, "w", encoding="utf-8").write(ep_patched)
+os.chmod(ep_path, 0o755)
+
+# Positive runtime test: passes newline check, writes 0600 conf, reaches exec stub
+env_ok = {
+    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+    "MONERO_RPC_USER": "u",
+    "MONERO_RPC_PASS": "secret123",
+    "MONERO_NETWORK": "stagenet",
+    "MONERO_REMOTE_NODE": "",
+    "WALLET_FILE": wallet_file,
+    "WALLET_PASS_FILE": pass_file,
+}
+res_ok = subprocess.run(["/bin/sh", ep_path], env=env_ok, capture_output=True, text=True)
+assert res_ok.returncode == 0, f"Containerfile entrypoint positive case failed: {res_ok.stderr}"
+assert stat.S_IMODE(os.stat(conf_file).st_mode) == 0o600, "Container wallet-rpc.conf must be 0600"
+conf_body = open(conf_file, encoding="utf-8").read()
+assert "rpc-login=u:secret123\n" in conf_body
+assert "daemon-address=node.monerodevs.org:38089\n" in conf_body
+assert "stagenet=1\n" in conf_body
+invoked_args = open(args_log, encoding="utf-8").read()
+assert "--non-interactive" in invoked_args and "--config-file" in invoked_args
+
+# Negative runtime tests: LF and CR in MONERO_RPC_PASS MUST exit 1
+for label, bad_pass in (("LF", "secret\npass"), ("CR", "secret\rpass")):
+    env_bad = dict(env_ok)
+    env_bad["MONERO_RPC_PASS"] = bad_pass
+    res_bad = subprocess.run(["/bin/sh", ep_path], env=env_bad, capture_output=True, text=True)
+    assert res_bad.returncode == 1, f"entrypoint MUST exit 1 on {label} in pass (got {res_bad.returncode})"
+    assert "newlines" in res_bad.stderr.lower(), f"Expected newline error for {label}: {res_bad.stderr!r}"
+PYEOF
+pass "Runtime test: Containerfile.monero-rpc entrypoint-monero-rpc.sh succeeds on valid creds & rejects LF/CR"
+
+# 12c) Runtime test: resolve_setup_rpc_bin_dir for system install vs tarball + 0755 BIN_DIR under umask 077
+TARBALL_FAKE_ROOT="$TMP_DIR/tarball_fake_root"
+mkdir -p "$TARBALL_FAKE_ROOT"
+SERVICE_LIB_COPY="$TMP_DIR/service_lib_test.sh"
+# shellcheck disable=SC2016
+sed -e '/^SCRIPT_DIR=/d' -e '/^source "\$SCRIPT_DIR\/lib\/common\.sh"/d' -e '/^main "\$@"$/d' \
+    "$REPO_ROOT/admin/service.sh" > "$SERVICE_LIB_COPY"
+
+TARBALL_BIN_RES="$(bash -c '
+    set -euo pipefail
+    source "$1"
+    source "$2"
+    unset XMR_BIN_DIR ACTIVE_ENV_FILE ADMIN_ENV_FILE || true
+    REPO_ROOT="$3"
+    resolve_setup_rpc_bin_dir
+' _ "$REPO_ROOT/admin/lib/common.sh" "$SERVICE_LIB_COPY" "$TARBALL_FAKE_ROOT")"
+assert_eq "$TARBALL_BIN_RES" "$TARBALL_FAKE_ROOT/bin" "resolve_setup_rpc_bin_dir selects REPO_ROOT/bin for writable tarball install"
+
+SYS_BIN_OUT=""
+if SYS_BIN_OUT="$(bash -c '
+    set -euo pipefail
+    source "$1"
+    source "$2"
+    unset XMR_BIN_DIR || true
+    REPO_ROOT="/usr/share/xmr-gateway"
+    ACTIVE_ENV_FILE="/etc/xmr-gateway/.env"
+    resolve_setup_rpc_bin_dir
+' _ "$REPO_ROOT/admin/lib/common.sh" "$SERVICE_LIB_COPY" 2>&1)"; then
+    assert_eq "$SYS_BIN_OUT" "/usr/local/bin" "resolve_setup_rpc_bin_dir selects /usr/local/bin for system package install"
+else
+    assert_contains "$SYS_BIN_OUT" "/usr/local/bin" "resolve_setup_rpc_bin_dir targets /usr/local/bin (never /usr/share/xmr-gateway/bin) on non-root system install"
+    assert_not_contains "$SYS_BIN_OUT" "/usr/share/xmr-gateway/bin" "resolve_setup_rpc_bin_dir never falls back to /usr/share/xmr-gateway/bin"
+fi
+
+UMASK_TEST_BIN="$TMP_DIR/umask77_bin_dir"
+(umask 077 && install -d -m 0755 "$UMASK_TEST_BIN")
+assert_eq "$(stat -c '%a' "$UMASK_TEST_BIN")" "755" "install -d -m 0755 produces 0755 BIN_DIR even under umask 077"
+# shellcheck disable=SC2016
+if grep -q 'install -d -m 0755 "\$BIN_DIR"' "$REPO_ROOT/start.sh"; then
+    pass "start.sh creates BIN_DIR with explicit 0755 permissions under umask 077"
+else
+    fail "start.sh missing explicit install -d -m 0755 for BIN_DIR"
+fi
+
+# 12d) Runtime test: RPM/DEB postinst DB rewrite + load_env wallet/DB consistency + WALLET_RESTORE_HEIGHT defaults
+for pscript in "$REPO_ROOT/deploy/packaging/deb/postinst" "$REPO_ROOT/deploy/packaging/rpm/postinst.sh"; do
+    rel_ps="${pscript#"$REPO_ROOT"/}"
+    if grep -q 'DATABASE_URL=sqlite:///var/lib/xmr-gateway/xmr_gateway.db' "$pscript"; then
+        pass "$rel_ps rewrites DATABASE_URL to /var/lib/xmr-gateway/xmr_gateway.db"
+    else
+        fail "$rel_ps missing canonical DATABASE_URL rewrite"
+    fi
+done
+
+SEEDED_SYS_ENV="$TMP_DIR/seeded_sys.env"
+sed 's|^DATABASE_URL=sqlite://data/xmr_gateway\.db$|DATABASE_URL=sqlite:///var/lib/xmr-gateway/xmr_gateway.db|' \
+    "$REPO_ROOT/.env.example" > "$SEEDED_SYS_ENV"
+chmod 600 "$SEEDED_SYS_ENV"
+assert_contains "$(cat "$SEEDED_SYS_ENV")" "DATABASE_URL=sqlite:///var/lib/xmr-gateway/xmr_gateway.db" "postinst sed rewrite produces canonical /var/lib/xmr-gateway DB URL"
+
+SYS_PATHS_OUT="$(bash -c '
+    set -euo pipefail
+    source "$1"
+    ADMIN_ENV_FILE="$2"
+    load_env
+    printf "%s|%s|%s|%s|%s\n" "$DB_PATH" "$DATA_DIR" "$WALLET_DIR" "$WALLET_FILE" "$WALLET_PASS_FILE"
+' _ "$REPO_ROOT/admin/lib/common.sh" "$SEEDED_SYS_ENV")"
+assert_eq "$SYS_PATHS_OUT" \
+    "/var/lib/xmr-gateway/xmr_gateway.db|/var/lib/xmr-gateway|/var/lib/xmr-gateway/wallet|/var/lib/xmr-gateway/wallet/gateway_wallet|/var/lib/xmr-gateway/wallet/gateway_wallet.password" \
+    "load_env on postinst-seeded env matches systemd monero-wallet-rpc.service wallet & DB paths exactly"
+
+LEGACY_SYS_DB="$(bash -c '
+    set -euo pipefail
+    source "$1"
+    ACTIVE_ENV_FILE="/etc/xmr-gateway/.env"
+    extract_sqlite_path "sqlite://data/xmr_gateway.db"
+' _ "$REPO_ROOT/admin/lib/common.sh")"
+assert_eq "$LEGACY_SYS_DB" "/var/lib/xmr-gateway/xmr_gateway.db" "legacy relative sqlite://data/xmr_gateway.db flattens cleanly under /etc/xmr-gateway/.env"
+
+# Verify empty WALLET_RESTORE_HEIGHT= in templates & auto-selection for stagenet/testnet/mainnet
+if grep -qE '^WALLET_RESTORE_HEIGHT=$' "$REPO_ROOT/.env.example" && grep -qE '^WALLET_RESTORE_HEIGHT=$' "$REPO_ROOT/deploy/docker/.env.docker.example"; then
+    pass ".env.example and .env.docker.example leave WALLET_RESTORE_HEIGHT= empty for network-aware auto-selection"
+else
+    fail ".env.example or .env.docker.example still hardcodes non-empty WALLET_RESTORE_HEIGHT"
+fi
+assert_contains "$STAGE_SHOW_JSON" '"wallet_restore_height": "1600000"' "stagenet auto-selects default WALLET_RESTORE_HEIGHT=1600000 when empty"
+
+TESTNET_NODE_ENV="$TMP_DIR/testnet_default.env"
+cp "$STAGE_NODE_ENV" "$TESTNET_NODE_ENV"
+chmod 600 "$TESTNET_NODE_ENV"
+sed -i 's/^MONERO_NETWORK=stagenet$/MONERO_NETWORK=testnet/' "$TESTNET_NODE_ENV"
+TESTNET_SHOW_JSON="$("$ADMIN_SH" --env "$TESTNET_NODE_ENV" --json config show)"
+assert_contains "$TESTNET_SHOW_JSON" '"monero_remote_node": "testnet.xmr-tw.org:28081"' "testnet auto-selects testnet default MONERO_REMOTE_NODE"
+assert_contains "$TESTNET_SHOW_JSON" '"wallet_restore_height": "2600000"' "testnet auto-selects default WALLET_RESTORE_HEIGHT=2600000 when empty"
 
 printf '\n====================================================================\n'
 printf 'Admin Test Summary: %d PASSED, %d FAILED\n' "$PASS_COUNT" "$FAIL_COUNT"

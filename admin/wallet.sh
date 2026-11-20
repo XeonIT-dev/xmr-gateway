@@ -250,6 +250,7 @@ fix_system_wallet_ownership() {
         && [[ "$ACTIVE_ENV_FILE" == "/etc/xmr-gateway/.env" || "$DATA_DIR" == /var/lib/xmr-gateway* ]] \
         && id xmr-gateway >/dev/null 2>&1; then
         chown xmr-gateway:xmr-gateway "$DATA_DIR" "$WALLET_DIR"
+        chmod 700 "$DATA_DIR" "$WALLET_DIR"
         if [[ -f "$WALLET_PASS_FILE" ]]; then
             chown xmr-gateway:xmr-gateway "$WALLET_PASS_FILE"
             chmod 600 "$WALLET_PASS_FILE"

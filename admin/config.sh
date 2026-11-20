@@ -343,6 +343,9 @@ if remote_node:
         add("PASS", "remote_node_network", f"MONERO_REMOTE_NODE={remote_node} ({net})")
 
 # 6) SQLite DB / WAL / lock inventory
+db_url = os.environ.get("DATABASE_URL", "").strip()
+if env_file == "/etc/xmr-gateway/.env" and db_url and not db_url.startswith("sqlite:///"):
+    add("WARN", "sqlite_path", f"System /etc/xmr-gateway/.env uses relative DATABASE_URL='{db_url}' (recommended: sqlite:///var/lib/xmr-gateway/xmr_gateway.db)")
 if db_path:
     if os.path.exists(db_path):
         db_sz = os.path.getsize(db_path)
@@ -440,6 +443,7 @@ else:
         "rpc_auth": "Аутентификация RPC",
         "daemon_rpc_security": "Безопасность MONERO_DAEMON_RPC_URL",
         "remote_node_network": "Соответствие MONERO_REMOTE_NODE сети",
+        "sqlite_path": "Путь DATABASE_URL в системном .env",
         "sqlite_files": "Файлы SQLite / WAL / lock",
         "health_anon_privacy": "Скрытие телеметрии /health",
         "health_auth_api": "Диагностика /health (X-API-Key)",

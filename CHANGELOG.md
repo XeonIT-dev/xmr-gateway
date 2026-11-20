@@ -2,6 +2,15 @@
 
 All notable changes to `xmr-gateway` are documented in this file.
 
+## [0.1.2] - 2026-11-20
+
+### Fixed
+- **POSIX `sh` Newline Guard Regression (`monero-wallet-rpc.service` & `Containerfile.monero-rpc`):** Replaced broken `$(printf "\n")` (which POSIX command substitution strips to empty string, causing `**` to reject all valid credentials) with `nl="$(printf '\nx')"; nl="${nl%x}"` (and `%%` escaped as `${nl%%x}` / `${cr%%x}` inside systemd `ExecStartPre`), restoring startup for `.rpm`/`.deb` systemd services and Docker/Podman containers.
+- **System Package `service setup-rpc` Target & Permissions (`admin/service.sh`, `start.sh`):** Always targets `/usr/local/bin` (instead of `/usr/share/xmr-gateway/bin`) when running from a system package install (`/usr/share/xmr-gateway`, `/usr/lib/*`, or `/etc/xmr-gateway/.env`), and creates `$BIN_DIR` via `install -d -m 0755` so `User=xmr-gateway` can always execute `monero-wallet-rpc` under `umask 077`.
+- **Unified `.rpm`/`.deb` DB & Wallet Paths (`postinst`, `common.sh`, `wallet.sh`, `config.sh`):** System package post-install now rewrites seeded `/etc/xmr-gateway/.env` to `DATABASE_URL=sqlite:///var/lib/xmr-gateway/xmr_gateway.db`, `admin/lib/common.sh` flattens legacy relative `sqlite://data/...` paths for `/etc/xmr-gateway/.env`, and `admin/wallet.sh` enforces `0700`/`0600` `xmr-gateway:xmr-gateway` ownership on `/var/lib/xmr-gateway/wallet`, eliminating the `/var/lib/xmr-gateway/data/wallet` vs `/var/lib/xmr-gateway/wallet` mismatch.
+- **Network-Aware Default `WALLET_RESTORE_HEIGHT` (`.env.example`, `.env.docker.example`):** Left `WALLET_RESTORE_HEIGHT=` empty by default so `start.sh` and `admin/lib/common.sh` auto-select `3280000` (mainnet), `1600000` (stagenet), or `2600000` (testnet) instead of overriding stagenet with mainnet height `3280000`.
+- **Runtime Regression Tests (`admin/test_admin.sh`):** Added real executable runtime tests that run extracted `monero-wallet-rpc.service` `ExecStartPre` and `Containerfile.monero-rpc` `entrypoint-monero-rpc.sh` through `/bin/sh` (positive + `\n`/`\r` negative cases), verify `resolve_setup_rpc_bin_dir` + `0755` `BIN_DIR` under `umask 077`, and validate `postinst` + `load_env` path/height consistency.
+
 ## [0.1.1] - 2026-11-20
 
 ### Fixed

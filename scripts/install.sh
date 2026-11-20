@@ -111,7 +111,7 @@ validate_version() {
         return 0
     fi
     if [[ ! "$v" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-        die "$(msg "Invalid --version '${v}': must be 'latest' or semantic tag like 'v0.1.1'." "Некорректная версия --version '${v}': ожидается 'latest' или тег вида 'v0.1.1'.")"
+        die "$(msg "Invalid --version '${v}': must be 'latest' or semantic tag like 'v0.1.2'." "Некорректная версия --version '${v}': ожидается 'latest' или тег вида 'v0.1.2'.")"
     fi
 }
 

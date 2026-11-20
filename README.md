@@ -207,7 +207,7 @@ curl -s -H "X-Operator-Key: ${OPERATOR_API_KEY}" http://127.0.0.1:8080/health | 
 {
   "status": "ok",
   "service": "xmr-gateway",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "database": "connected",
   "monero_rpc": {
     "connected": true,

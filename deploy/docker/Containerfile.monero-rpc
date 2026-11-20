@@ -62,8 +62,10 @@ umask 077
 : "${WALLET_FILE:=/wallet/gateway_wallet}"
 : "${WALLET_PASS_FILE:=/wallet/gateway_wallet.password}"
 
+nl="$(printf '\nx')"; nl="${nl%x}"
+cr="$(printf '\rx')"; cr="${cr%x}"
 case "${MONERO_RPC_USER}${MONERO_RPC_PASS}" in
-    *"$(printf '\n')"*|*"$(printf '\r')"*)
+    *"$nl"*|*"$cr"*)
         echo "ERROR: MONERO_RPC_USER and MONERO_RPC_PASS must not contain newlines." >&2
         exit 1
         ;;

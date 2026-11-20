@@ -29,15 +29,15 @@ sudo bash install.sh
 Дополнительные опции:
 ```bash
 # Явный метод и версия:
-sudo bash install.sh --method deb --version v0.1.1
-sudo bash install.sh --method rpm --version v0.1.1
-sudo bash install.sh --method tarball --prefix /opt/xmr-gateway --version v0.1.1
+sudo bash install.sh --method deb --version v0.1.2
+sudo bash install.sh --method rpm --version v0.1.2
+sudo bash install.sh --method tarball --prefix /opt/xmr-gateway --version v0.1.2
 
 # Непривилегированная установка tarball в домашний каталог (без sudo):
-bash install.sh --method tarball --prefix "$HOME/xmr-gateway" --version v0.1.1
+bash install.sh --method tarball --prefix "$HOME/xmr-gateway" --version v0.1.2
 
 # Fail-closed проверка GPG-подписи SHA256SUMS.asc:
-sudo bash install.sh --version v0.1.1 --gpg-key ./RELEASE_SIGNING_KEY.asc --require-gpg
+sudo bash install.sh --version v0.1.2 --gpg-key ./RELEASE_SIGNING_KEY.asc --require-gpg
 ```
 
 ### 2.2. Ручная криптографическая верификация релиза
@@ -51,7 +51,7 @@ gpg --import RELEASE_SIGNING_KEY.asc
 gpg --verify SHA256SUMS.asc SHA256SUMS
 
 # 3. Проверка GitHub Build Provenance Attestation (требует GitHub CLI `gh`)
-gh attestation verify xmr-gateway_0.1.1_amd64.deb --owner XeonIT-dev
+gh attestation verify xmr-gateway_0.1.2_amd64.deb --owner XeonIT-dev
 ```
 
 ---
@@ -61,10 +61,10 @@ gh attestation verify xmr-gateway_0.1.1_amd64.deb --owner XeonIT-dev
 ### 3.1. Установка пакета `.deb` или `.rpm`
 ```bash
 # Debian / Ubuntu:
-sudo apt-get install -y ./xmr-gateway_0.1.1_amd64.deb
+sudo apt-get install -y ./xmr-gateway_0.1.2_amd64.deb
 
 # Fedora / RHEL / Rocky:
-sudo dnf install -y ./xmr-gateway-0.1.1-1.x86_64.rpm
+sudo dnf install -y ./xmr-gateway-0.1.2-1.x86_64.rpm
 ```
 Пакет автоматически:
 - создаёт системного пользователя и группу `xmr-gateway` (`/usr/sbin/nologin`);
@@ -259,13 +259,13 @@ gpg --armor --export-secret-keys <KEY_FINGERPRINT>
 
 ### Выпуск релиза (3 шага)
 ```bash
-# 1. Убедитесь, что version в Cargo.toml совпадает с тегом (например, 0.1.1), и main актуален:
+# 1. Убедитесь, что version в Cargo.toml совпадает с тегом (например, 0.1.2), и main актуален:
 git checkout main && git pull --ff-only
 
 # 2. Создайте (подписанный) аннотированный тег:
-git tag -s v0.1.1 -m "Release v0.1.1"
+git tag -s v0.1.2 -m "Release v0.1.2"
 
 # 3. Запушьте тег — GitHub Actions автоматически соберёт и опубликует релиз:
-git push origin v0.1.1
+git push origin v0.1.2
 ```
 Для пробного прогона без публикации релиза запустите **Actions → Release → Run workflow** с параметром `dry_run: true`.

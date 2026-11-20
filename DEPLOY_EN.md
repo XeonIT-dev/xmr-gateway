@@ -29,15 +29,15 @@ sudo bash install.sh
 Common options:
 ```bash
 # Pin method and release version:
-sudo bash install.sh --method deb --version v0.1.1
-sudo bash install.sh --method rpm --version v0.1.1
-sudo bash install.sh --method tarball --prefix /opt/xmr-gateway --version v0.1.1
+sudo bash install.sh --method deb --version v0.1.2
+sudo bash install.sh --method rpm --version v0.1.2
+sudo bash install.sh --method tarball --prefix /opt/xmr-gateway --version v0.1.2
 
 # Unprivileged tarball install into your home directory (no sudo required):
-bash install.sh --method tarball --prefix "$HOME/xmr-gateway" --version v0.1.1
+bash install.sh --method tarball --prefix "$HOME/xmr-gateway" --version v0.1.2
 
 # Enforce fail-closed GPG verification of SHA256SUMS.asc:
-sudo bash install.sh --version v0.1.1 --gpg-key ./RELEASE_SIGNING_KEY.asc --require-gpg
+sudo bash install.sh --version v0.1.2 --gpg-key ./RELEASE_SIGNING_KEY.asc --require-gpg
 ```
 
 ### 2.2. Manual Cryptographic Release Verification
@@ -51,7 +51,7 @@ gpg --import RELEASE_SIGNING_KEY.asc
 gpg --verify SHA256SUMS.asc SHA256SUMS
 
 # 3. Verify GitHub Build Provenance Attestation (requires GitHub CLI `gh`)
-gh attestation verify xmr-gateway_0.1.1_amd64.deb --owner XeonIT-dev
+gh attestation verify xmr-gateway_0.1.2_amd64.deb --owner XeonIT-dev
 ```
 
 ---
@@ -61,10 +61,10 @@ gh attestation verify xmr-gateway_0.1.1_amd64.deb --owner XeonIT-dev
 ### 3.1. Installing `.deb` or `.rpm`
 ```bash
 # Debian / Ubuntu:
-sudo apt-get install -y ./xmr-gateway_0.1.1_amd64.deb
+sudo apt-get install -y ./xmr-gateway_0.1.2_amd64.deb
 
 # Fedora / RHEL / Rocky:
-sudo dnf install -y ./xmr-gateway-0.1.1-1.x86_64.rpm
+sudo dnf install -y ./xmr-gateway-0.1.2-1.x86_64.rpm
 ```
 The package automatically:
 - creates system group & user `xmr-gateway` (`/usr/sbin/nologin`);
@@ -259,13 +259,13 @@ Configure repository secrets:
 
 ### Cutting a New Release (3 Commands)
 ```bash
-# 1. Confirm Cargo.toml version matches the tag (e.g. 0.1.1) on up-to-date main:
+# 1. Confirm Cargo.toml version matches the tag (e.g. 0.1.2) on up-to-date main:
 git checkout main && git pull --ff-only
 
 # 2. Create a (signed) annotated tag:
-git tag -s v0.1.1 -m "Release v0.1.1"
+git tag -s v0.1.2 -m "Release v0.1.2"
 
 # 3. Push the tag to trigger the automated Release workflow:
-git push origin v0.1.1
+git push origin v0.1.2
 ```
 To test packaging end-to-end without publishing a release, trigger **Actions → Release → Run workflow** with `dry_run: true`.

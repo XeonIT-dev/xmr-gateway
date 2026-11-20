@@ -20,8 +20,15 @@ if [ -f /etc/xmr-gateway/env.example ]; then
 fi
 
 # Never overwrite an existing /etc/xmr-gateway/.env on upgrade!
+# Rewrite relative DATABASE_URL to the canonical /var/lib/xmr-gateway path so
+# xmr-gateway.service, monero-wallet-rpc.service, backup timer, and xmr-gateway-admin match.
 if [ ! -f /etc/xmr-gateway/.env ] && [ -f /etc/xmr-gateway/env.example ]; then
-    install -m 0600 -o xmr-gateway -g xmr-gateway /etc/xmr-gateway/env.example /etc/xmr-gateway/.env
+    tmp_env="$(mktemp)"
+    chmod 0600 "$tmp_env"
+    sed 's|^DATABASE_URL=sqlite://data/xmr_gateway\.db$|DATABASE_URL=sqlite:///var/lib/xmr-gateway/xmr_gateway.db|' \
+        /etc/xmr-gateway/env.example > "$tmp_env"
+    install -m 0600 -o xmr-gateway -g xmr-gateway "$tmp_env" /etc/xmr-gateway/.env
+    rm -f "$tmp_env"
 fi
 
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then

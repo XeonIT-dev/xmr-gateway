@@ -368,11 +368,11 @@ download_and_verify_monero_cli() {
         exit 1
     fi
 
-    mkdir -p "$BIN_DIR"
+    install -d -m 0755 "$BIN_DIR"
     log_info "Extracting monero-wallet-rpc and monero-wallet-cli into ${BIN_DIR}..."
     tar -xjf "$tmp_dir/$tarball_name" -C "$BIN_DIR" --strip-components=1 \
         --wildcards '*/monero-wallet-rpc' '*/monero-wallet-cli'
-    chmod 755 "$BIN_DIR/monero-wallet-rpc" "$BIN_DIR/monero-wallet-cli"
+    chmod 0755 "$BIN_DIR" "$BIN_DIR/monero-wallet-rpc" "$BIN_DIR/monero-wallet-cli"
 
     log_info "Monero CLI binaries installed and verified in $BIN_DIR"
 }
