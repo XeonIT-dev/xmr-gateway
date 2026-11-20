@@ -24,6 +24,7 @@ REPO_ROOT="$(cd "$ADMIN_DIR/.." && pwd)"
 ADMIN_ENV_FILE="${ADMIN_ENV_FILE:-}"
 ADMIN_JSON="${ADMIN_JSON:-0}"
 ADMIN_YES="${ADMIN_YES:-0}"
+# shellcheck disable=SC2034
 ADMIN_ENV_LOADED=0
 
 # Load pure-Bash RU/EN i18n subsystem
@@ -31,6 +32,7 @@ ADMIN_ENV_LOADED=0
 source "$ADMIN_LIB_DIR/i18n.sh"
 
 # ANSI colors (disabled automatically when stdout/stderr is not a TTY or NO_COLOR is set)
+# shellcheck disable=SC2034
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
     C_RESET=$'\033[0m'
     C_BOLD=$'\033[1m'
@@ -272,6 +274,7 @@ load_env() {
     GATEWAY_BIN="$(find_gateway_bin || printf '%s' "$REPO_ROOT/target/release/xmr-gateway")"
     BIN_DIR="$REPO_ROOT/bin"
 
+    # shellcheck disable=SC2034
     ADMIN_ENV_LOADED=1
     export ACTIVE_ENV_FILE GATEWAY_BASE_URL DB_PATH DATA_DIR WALLET_DIR WALLET_FILE WALLET_PASS_FILE
     export RPC_LOG_FILE CLI_LOG_FILE GATEWAY_LOG_FILE PID_DIR RPC_PID_FILE GATEWAY_PID_FILE
@@ -472,7 +475,9 @@ set_env_kv_file() {
 # Globals populated by gateway_api_call:
 #   API_LAST_HTTP_CODE
 #   API_LAST_BODY
+# shellcheck disable=SC2034
 API_LAST_HTTP_CODE=""
+# shellcheck disable=SC2034
 API_LAST_BODY=""
 
 # Usage: gateway_api_call <METHOD> <PATH> <auth_mode: none|merchant|operator|health_api|health_operator> [json_body]
@@ -544,10 +549,12 @@ gateway_api_call() {
     esac
 
     local rc=0
+    # shellcheck disable=SC2034
     API_LAST_HTTP_CODE="$(
         printf '%s\n' "${cfg_lines[@]}" | curl "${curl_args[@]}" "$url"
     )" || rc=$?
 
+    # shellcheck disable=SC2034
     API_LAST_BODY="$(cat "$tmp_out" 2>/dev/null || true)"
     rm -f "$tmp_out" "${tmp_body:-}"
     return "$rc"
@@ -556,7 +563,9 @@ gateway_api_call() {
 # ==============================================================================
 # Zero-Argv-Leak Monero Wallet & Daemon JSON-RPC Helpers
 # ==============================================================================
+# shellcheck disable=SC2034
 RPC_LAST_HTTP_CODE=""
+# shellcheck disable=SC2034
 RPC_LAST_BODY=""
 
 # Usage: monero_json_rpc_call <url> <user> <pass> <method> [params_json]
@@ -586,6 +595,7 @@ monero_json_rpc_call() {
     fi
 
     local rc=0
+    # shellcheck disable=SC2034
     RPC_LAST_HTTP_CODE="$(
         printf '%s\n' "${cfg_lines[@]}" | curl -sS \
             --connect-timeout 5 \
@@ -598,6 +608,7 @@ monero_json_rpc_call() {
             "$rpc_url"
     )" || rc=$?
 
+    # shellcheck disable=SC2034
     RPC_LAST_BODY="$(cat "$tmp_out" 2>/dev/null || true)"
     rm -f "$tmp_out" "$tmp_body"
     return "$rc"

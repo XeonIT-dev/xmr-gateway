@@ -485,7 +485,11 @@ QR_OUT="$TMP_DIR/invoice_qr.png"
 CREATE_JSON="$(PATH="$TMP_DIR/shim:$PATH" "$ADMIN_SH" --env "$TEST_ENV" --json invoices create \
     --order-id "ord-test-125" --amount-xmr "1.25" --callback-url "http://127.0.0.1:9999/cb" --ttl 1800 --qr-out "$QR_OUT")"
 assert_contains "$CREATE_JSON" '"amount_piconero": 1250000000000' "invoices create converts 1.25 XMR -> exact 1250000000000 piconero"
-[[ -f "$QR_OUT" ]] && pass "invoices create wrote QR PNG file" || fail "QR PNG missing"
+if [[ -f "$QR_OUT" ]]; then
+    pass "invoices create wrote QR PNG file"
+else
+    fail "QR PNG missing"
+fi
 assert_eq "$(stat -c '%a' "$QR_OUT")" "600" "QR PNG file has 0600 permissions"
 
 GET_OUT="$(PATH="$TMP_DIR/shim:$PATH" "$ADMIN_SH" --env "$TEST_ENV" --json invoices get "11111111-1111-4111-8111-111111111111")"
@@ -560,7 +564,11 @@ pass "Mock server verified exact RBAC headers (X-API-Key vs X-Operator-Key) and 
 
 # Verify ZERO secrets appeared in curl CLI argv!
 ARGV_CONTENT="$(cat "$ARGV_LOG")"
-[[ -n "$ARGV_CONTENT" ]] && pass "curl shim captured live invocations" || fail "curl shim log unexpectedly empty"
+if [[ -n "$ARGV_CONTENT" ]]; then
+    pass "curl shim captured live invocations"
+else
+    fail "curl shim log unexpectedly empty"
+fi
 for secret in "$API_KEY" "$OP_KEY" "$WH_SECRET" "$RPC_PASS" "daemon-secret-pass-0123456789"; do
     assert_not_contains "$ARGV_CONTENT" "$secret" "zero argv leak for secret (${secret:0:8}...) in curl ps/cmdline"
 done
@@ -773,7 +781,11 @@ fi
 # Save 'ru' via `./admin.sh lang ru` -> stored in $ADMIN_STATE_DIR/.admin_lang (0600)
 "$ADMIN_SH" lang ru >/dev/null
 STATE_LANG_FILE="$ADMIN_STATE_DIR/.admin_lang"
-[[ -f "$STATE_LANG_FILE" ]] && pass "lang ru created isolated .admin_lang state file" || fail ".admin_lang missing"
+if [[ -f "$STATE_LANG_FILE" ]]; then
+    pass "lang ru created isolated .admin_lang state file"
+else
+    fail ".admin_lang missing"
+fi
 assert_eq "$(stat -c '%a' "$STATE_LANG_FILE")" "600" ".admin_lang has 0600 permissions"
 
 LANG_FILE_JSON="$("$ADMIN_SH" --json lang show)"
@@ -841,8 +853,16 @@ GUIDE_EN_PATH="$("$ADMIN_SH" --lang en guide --path)"
 GUIDE_RU_PATH="$("$ADMIN_SH" --lang ru guide --path)"
 assert_eq "$GUIDE_EN_PATH" "$REPO_ROOT/admin/GUIDE_EN.md" "guide --path resolves GUIDE_EN.md for --lang en"
 assert_eq "$GUIDE_RU_PATH" "$REPO_ROOT/admin/GUIDE_RU.md" "guide --path resolves GUIDE_RU.md for --lang ru"
-[[ -s "$GUIDE_EN_PATH" ]] && pass "admin/GUIDE_EN.md exists and is non-empty" || fail "admin/GUIDE_EN.md missing or empty"
-[[ -s "$GUIDE_RU_PATH" ]] && pass "admin/GUIDE_RU.md exists and is non-empty" || fail "admin/GUIDE_RU.md missing or empty"
+if [[ -s "$GUIDE_EN_PATH" ]]; then
+    pass "admin/GUIDE_EN.md exists and is non-empty"
+else
+    fail "admin/GUIDE_EN.md missing or empty"
+fi
+if [[ -s "$GUIDE_RU_PATH" ]]; then
+    pass "admin/GUIDE_RU.md exists and is non-empty"
+else
+    fail "admin/GUIDE_RU.md missing or empty"
+fi
 
 # ==============================================================================
 # 9. Installer (scripts/install.sh), Read-Only System Install, YAML & Packaging Metadata
@@ -903,7 +923,11 @@ else
     fail "read-only admin.sh failed to save language: $RO_OUT"
 fi
 RO_LANG_FILE="$XDG_STATE/xmr-gateway/.admin_lang"
-[[ -f "$RO_LANG_FILE" ]] && pass "read-only admin.sh created XDG .admin_lang" || fail "XDG .admin_lang missing"
+if [[ -f "$RO_LANG_FILE" ]]; then
+    pass "read-only admin.sh created XDG .admin_lang"
+else
+    fail "XDG .admin_lang missing"
+fi
 assert_eq "$(stat -c '%a' "$RO_LANG_FILE")" "600" "XDG .admin_lang has 0600 permissions"
 if RO_SHOW="$(env -u ADMIN_STATE_DIR -u ADMIN_LANG XDG_STATE_HOME="$XDG_STATE" "$RO_INSTALL/admin.sh" --env "$TEST_ENV" config show)"; then
     assert_contains "$RO_SHOW" "Активная конфигурация xmr-gateway" "read-only admin.sh reads XDG saved Russian language & config"
