@@ -2,6 +2,16 @@
 
 All notable changes to `xmr-gateway` are documented in this file.
 
+## [0.1.3] - 2026-11-21
+
+### Fixed
+- **Systemd `ExecStartPre` External POSIX Helper (`deploy/systemd/render-wallet-rpc-conf.sh`, `monero-wallet-rpc.service`):** Extracted inline `ExecStartPre=/bin/sh -ec '...'` into a dedicated `0755` POSIX script installed at `/usr/share/xmr-gateway/scripts/render-wallet-rpc-conf.sh` across `.deb`, `.rpm`, and release `.tar.gz` bundles, eliminating systemd's premature `${...}` environment expansion (`Invalid environment variable name evaluates to an empty string: cr%x, nl%x`) that blocked service startup in `v0.1.2`.
+- **SELinux `etc_t` Context Preservation (`admin/lib/common.sh`, `admin/config.sh`, `start.sh`, `postinst`):** Atomic `.env` rewrites now create temporary files inside the target `.env`'s own directory (`$(dirname "$target")/.env.tmp.XXXXXX`), preserve ownership via `chown --reference` and `0600` mode prior to `mv`, and invoke `restorecon` when available on `/etc/xmr-gateway/.env` so SELinux `Enforcing` hosts retain `etc_t` instead of `user_tmp_t`.
+- **Fail-Closed Mainnet Public HTTP Webhooks (`src/config.rs`, `admin/config.sh`, `.env.example`):** On `MONERO_NETWORK=mainnet` with `ALLOW_PRIVATE_WEBHOOKS=false`, `REQUIRE_HTTPS_WEBHOOKS` now defaults to `true` when omitted, and setting `REQUIRE_HTTPS_WEBHOOKS=false` fails closed at startup (and reports `FAIL` in `config doctor`). Cleartext HTTP remains permitted on `stagenet`/`testnet` or with `ALLOW_PRIVATE_WEBHOOKS=true` for local loopback bots.
+- **Chunked `get_transfers` Scanner Batching (`src/services/scanner.rs`, `src/config.rs`):** Added `SCANNER_SUBADDRESS_BATCH_SIZE` (`1..=1000`, default `100`), grouping monitored subaddresses by `account_index` and querying `monero-wallet-rpc` in disjoint chunks to prevent exceeding the 16 MiB RPC response limit, with strict fail-closed error propagation before database writes so partial batch failures never falsely orphan or reorg invoices.
+- **Per-Attempt Fresh Webhook Timestamps & Signatures (`src/services/webhook.rs`, `admin/webhooks.sh`, `demo-stagenet.sh`):** Computes fresh Unix epoch `X-Webhook-Timestamp` and `X-Webhook-Signature` (`HMAC-SHA256(WEBHOOK_SECRET, "{timestamp}.{payload}")`) on every initial delivery, exponential-backoff retry, and manual operator retry while preserving immutable `event_id` (`X-Webhook-Event-Id` / `X-Delivery-Id`) and JSON payload bytes for idempotent deduplication (retaining backwards-compatible `X-Signature-256`).
+- **Security & Architecture Documentation (`README.md`, `README_RU.md`, `DEPLOY_EN.md`, `DEPLOY_RU.md`):** Clarified view-only vs. hot-wallet trust boundaries, single-instance SQLite / single-merchant deployment scope, opaque PII-free `order_id` guidance, updated webhook verification examples, and replaced imprecise wording with self-hosted technical terminology.
+
 ## [0.1.2] - 2026-11-20
 
 ### Fixed

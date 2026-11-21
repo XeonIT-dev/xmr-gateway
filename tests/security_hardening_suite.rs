@@ -110,6 +110,7 @@ fn test_config(
         settlement_confirmations: settle_conf,
         invoice_ttl_seconds: 3600,
         scan_interval_seconds: 10,
+        scanner_subaddress_batch_size: xmr_gateway::config::DEFAULT_SCANNER_SUBADDRESS_BATCH_SIZE,
         webhook_poll_interval_seconds: 5,
         subaddress_monitor_days: 0,
         log_format: LogFormat::Json,
@@ -507,6 +508,7 @@ async fn regression_xmr_025_026_reorg_epoch_unblocks_recovery_webhooks_and_orpha
     let scanner = ScannerService::new(repo.clone(), rpc, cfg.clone());
     let dispatcher = WebhookDispatcher::new(
         repo.clone(),
+        cfg.webhook_secret.clone(),
         false,
         Duration::from_secs(5),
         cfg.webhook_url_policy(),
@@ -747,6 +749,7 @@ async fn regression_xmr_027_slow_webhook_does_not_block_other_invoices_and_prese
 
     let dispatcher = WebhookDispatcher::new(
         repo.clone(),
+        "secret".to_string(),
         false,
         Duration::from_secs(5),
         WebhookUrlPolicy {
@@ -943,6 +946,7 @@ async fn regression_xmr_028_029_033_038_api_hardening_endpoints_and_limits() {
 
     let dispatcher = WebhookDispatcher::new(
         repo.clone(),
+        cfg.webhook_secret.clone(),
         false,
         Duration::from_secs(5),
         cfg.webhook_url_policy(),
@@ -1754,6 +1758,7 @@ async fn regression_reorg_after_completed_emits_reorged_webhook_and_recovers() {
     let scanner = ScannerService::new(repo.clone(), rpc, cfg.clone());
     let dispatcher = WebhookDispatcher::new(
         repo.clone(),
+        "secret".to_string(),
         false,
         Duration::from_secs(5),
         WebhookUrlPolicy {
@@ -2919,6 +2924,7 @@ async fn regression_xmr_042_expired_invoice_late_payment_sweep_reorg_emits_webho
     let scanner = ScannerService::new(repo.clone(), rpc, cfg.clone());
     let dispatcher = WebhookDispatcher::new(
         repo.clone(),
+        cfg.webhook_secret.clone(),
         true,
         Duration::from_secs(5),
         WebhookUrlPolicy {
@@ -4627,7 +4633,7 @@ async fn regression_audit_001_verify_wallet_synced_contract_and_daemon_security(
         webhook_secret: "b".repeat(32),
         default_webhook_url: None,
         allow_private_webhooks: false,
-        require_https_webhooks: false,
+        require_https_webhooks: true,
         monero_network: MoneroNetwork::Mainnet,
         monero_rpc_url: "http://127.0.0.1:18082/json_rpc".to_string(),
         monero_daemon_rpc_url: Some("http://192.168.10.20:18081/json_rpc".to_string()),
@@ -4647,6 +4653,7 @@ async fn regression_audit_001_verify_wallet_synced_contract_and_daemon_security(
         settlement_confirmations: 10,
         invoice_ttl_seconds: 3600,
         scan_interval_seconds: 10,
+        scanner_subaddress_batch_size: xmr_gateway::config::DEFAULT_SCANNER_SUBADDRESS_BATCH_SIZE,
         webhook_poll_interval_seconds: 5,
         subaddress_monitor_days: 0,
         log_format: LogFormat::Json,
@@ -5960,6 +5967,7 @@ async fn regression_audit_004_post_resweep_swept_webhook_and_mark_reconciled_val
         let scanner = ScannerService::new(repo.clone(), rpc.clone(), cfg.clone());
         let dispatcher = WebhookDispatcher::new(
             repo.clone(),
+            cfg.webhook_secret.clone(),
             cfg.enable_auto_sweep,
             Duration::from_secs(1),
             cfg.webhook_url_policy(),
@@ -10768,6 +10776,7 @@ async fn regression_audit_005_graceful_shutdown_and_wal_checkpoint() {
     let scanner = ScannerService::new(repo.clone(), rpc, cfg.clone());
     let dispatcher = WebhookDispatcher::new(
         repo.clone(),
+        cfg.webhook_secret.clone(),
         cfg.enable_auto_sweep,
         Duration::from_millis(50),
         cfg.webhook_url_policy(),
@@ -10906,7 +10915,7 @@ async fn regression_external_audit_hardening_xmr_audit_001_003_004() {
     );
 
     // -------------------------------------------------------------------------
-    // 2) XMR-AUDIT-004: hot_wallet requires OPERATOR_API_KEY
+    // 2) XMR-AUDIT-004 & XMR-AUDIT-006: hot_wallet RBAC & mainnet HTTPS webhooks
     // -------------------------------------------------------------------------
     let mut hot_cfg =
         (*test_config(format!("{}/json_rpc", mock_rpc.uri()), None, true, 2, 10)).clone();
@@ -10919,6 +10928,20 @@ async fn regression_external_audit_hardening_xmr_audit_001_003_004() {
     assert!(
         hot_cfg.validate().is_ok(),
         "hot_wallet with distinct OPERATOR_API_KEY must pass validation"
+    );
+
+    let mut mainnet_http_cfg = hot_cfg.clone();
+    mainnet_http_cfg.monero_network = MoneroNetwork::Mainnet;
+    mainnet_http_cfg.allow_private_webhooks = false;
+    mainnet_http_cfg.require_https_webhooks = false;
+    assert!(
+        mainnet_http_cfg.validate().is_err(),
+        "mainnet with ALLOW_PRIVATE_WEBHOOKS=false and REQUIRE_HTTPS_WEBHOOKS=false MUST fail closed"
+    );
+    mainnet_http_cfg.require_https_webhooks = true;
+    assert!(
+        mainnet_http_cfg.validate().is_ok(),
+        "mainnet with ALLOW_PRIVATE_WEBHOOKS=false and REQUIRE_HTTPS_WEBHOOKS=true must pass validation"
     );
 
     // -------------------------------------------------------------------------
@@ -10944,6 +10967,7 @@ async fn regression_external_audit_hardening_xmr_audit_001_003_004() {
     let scanner = ScannerService::new(repo.clone(), rpc_client.clone(), cfg.clone());
     let dispatcher = WebhookDispatcher::new(
         repo.clone(),
+        cfg.webhook_secret.clone(),
         false,
         Duration::from_millis(20),
         cfg.webhook_url_policy(),

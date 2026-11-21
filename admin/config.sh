@@ -205,7 +205,11 @@ api_key = os.environ.get("API_SECRET_KEY", "")
 op_key = os.environ.get("OPERATOR_API_KEY", "")
 wh_secret = os.environ.get("WEBHOOK_SECRET", "")
 allow_priv_wh = is_truthy(os.environ.get("ALLOW_PRIVATE_WEBHOOKS"))
-req_https_wh = is_truthy(os.environ.get("REQUIRE_HTTPS_WEBHOOKS"))
+req_https_raw = os.environ.get("REQUIRE_HTTPS_WEBHOOKS", "").strip()
+if req_https_raw == "":
+    req_https_wh = (net == "mainnet" and not allow_priv_wh)
+else:
+    req_https_wh = is_truthy(req_https_raw)
 allow_unauth_rpc = is_truthy(os.environ.get("ALLOW_UNAUTHENTICATED_RPC"))
 allow_insec_rpc = is_truthy(os.environ.get("ALLOW_INSECURE_REMOTE_RPC"))
 rpc_url = os.environ.get("MONERO_RPC_URL", "").strip()
@@ -290,6 +294,8 @@ try:
     req_c = int(os.environ.get("REQUIRED_CONFIRMATIONS", "10"))
     set_c = int(os.environ.get("SETTLEMENT_CONFIRMATIONS", "10"))
     prio = int(os.environ.get("SWEEP_PRIORITY", "0"))
+    batch_raw = os.environ.get("SCANNER_SUBADDRESS_BATCH_SIZE", "").strip() or "100"
+    batch_sz = int(batch_raw)
     if req_c < 1:
         add("FAIL", "confirmations", f"REQUIRED_CONFIRMATIONS={req_c} (must be >= 1)")
     elif set_c < req_c:
@@ -300,6 +306,10 @@ try:
         add("PASS", "sweep_priority", f"SWEEP_PRIORITY={prio}")
     else:
         add("FAIL", "sweep_priority", f"SWEEP_PRIORITY={prio} out of range 0..4")
+    if 1 <= batch_sz <= 1000:
+        add("PASS", "scanner_batch_size", f"SCANNER_SUBADDRESS_BATCH_SIZE={batch_sz}")
+    else:
+        add("FAIL", "scanner_batch_size", f"SCANNER_SUBADDRESS_BATCH_SIZE={batch_sz} out of range 1..1000")
 except ValueError as exc:
     add("FAIL", "numeric_config", f"Invalid numeric config value: {exc}")
 
@@ -307,7 +317,7 @@ except ValueError as exc:
 if net == "mainnet" and allow_priv_wh:
     add("WARN", "ssrf_policy", "ALLOW_PRIVATE_WEBHOOKS=true on mainnet (recommended false in production)")
 elif net == "mainnet" and not req_https_wh and not allow_priv_wh:
-    add("WARN", "ssrf_policy", "REQUIRE_HTTPS_WEBHOOKS=false on mainnet permits plaintext HTTP webhooks over public networks (set REQUIRE_HTTPS_WEBHOOKS=true, XMR-AUDIT-006)")
+    add("FAIL", "ssrf_policy", "REQUIRE_HTTPS_WEBHOOKS=false with ALLOW_PRIVATE_WEBHOOKS=false is forbidden on mainnet (public mainnet webhooks require HTTPS; set REQUIRE_HTTPS_WEBHOOKS=true, XMR-AUDIT-006)")
 else:
     add("PASS", "ssrf_policy", f"ALLOW_PRIVATE_WEBHOOKS={str(allow_priv_wh).lower()}, REQUIRE_HTTPS_WEBHOOKS={str(req_https_wh).lower()}")
 
@@ -438,6 +448,7 @@ else:
         "view_only_bootstrap": "Параметры view_only",
         "confirmations": "Пороги подтверждений",
         "sweep_priority": "Приоритет SWEEP_PRIORITY",
+        "scanner_batch_size": "Размер батча сканера",
         "numeric_config": "Числовые параметры",
         "ssrf_policy": "Политика SSRF вебхуков",
         "rpc_auth": "Аутентификация RPC",
@@ -482,7 +493,13 @@ cmd_rotate_keys() {
     ts="$(date -u +%Y%m%dT%H%M%SZ)"
     backup_file="${ACTIVE_ENV_FILE}.bak.${ts}"
     cp "$ACTIVE_ENV_FILE" "$backup_file"
+    if [[ "$(id -u)" -eq 0 ]]; then
+        chown --reference="$ACTIVE_ENV_FILE" "$backup_file" 2>/dev/null || true
+    fi
     chmod 600 "$backup_file"
+    if [[ "$ACTIVE_ENV_FILE" == "/etc/xmr-gateway/.env" ]] && command -v restorecon >/dev/null 2>&1; then
+        restorecon "$backup_file" 2>/dev/null || true
+    fi
     log_info "$(t config.backup_created "$backup_file")"
 
     local rotated=()
@@ -561,7 +578,13 @@ cmd_set_mode() {
     ts="$(date -u +%Y%m%dT%H%M%SZ)"
     backup_file="${ACTIVE_ENV_FILE}.bak.${ts}"
     cp "$ACTIVE_ENV_FILE" "$backup_file"
+    if [[ "$(id -u)" -eq 0 ]]; then
+        chown --reference="$ACTIVE_ENV_FILE" "$backup_file" 2>/dev/null || true
+    fi
     chmod 600 "$backup_file"
+    if [[ "$ACTIVE_ENV_FILE" == "/etc/xmr-gateway/.env" ]] && command -v restorecon >/dev/null 2>&1; then
+        restorecon "$backup_file" 2>/dev/null || true
+    fi
     log_info "$(t config.backup_created "$backup_file")"
 
     set_env_kv_file "$ACTIVE_ENV_FILE" "WALLET_MODE" "$target_mode"

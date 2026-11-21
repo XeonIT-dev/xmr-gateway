@@ -16,31 +16,8 @@ UMask=0077
 
 # Render RPC credentials and daemon options into a RAM-only 0600 config file so
 # MONERO_RPC_PASS never appears in `ps aux` / `/proc/<pid>/cmdline`.
-# NOTE: All literal percent signs (`%`) MUST be doubled (`%%`) for systemd specifier escaping.
-ExecStartPre=/bin/sh -ec 'umask 077; \
-  test -n "${MONERO_RPC_USER:-}" && test -n "${MONERO_RPC_PASS:-}" || { echo "MONERO_RPC_USER/PASS required" >&2; exit 1; }; \
-  nl="$(printf "\nx")"; nl="${nl%%x}"; \
-  cr="$(printf "\rx")"; cr="${cr%%x}"; \
-  case "${MONERO_RPC_USER}${MONERO_RPC_PASS}" in *"$nl"*|*"$cr"*) echo "MONERO_RPC_USER/PASS must not contain newlines" >&2; exit 1 ;; esac; \
-  case "${MONERO_NETWORK:-mainnet}" in \
-    stagenet|STAGENET) def_node="node.monerodevs.org:38089" ;; \
-    testnet|TESTNET)   def_node="testnet.xmr-tw.org:28081" ;; \
-    *)                 def_node="xmr-node.cakewallet.com:18081" ;; \
-  esac; \
-  { \
-    printf "rpc-login=%%s:%%s\n" "${MONERO_RPC_USER}" "${MONERO_RPC_PASS}"; \
-    printf "daemon-address=%%s\n" "${MONERO_REMOTE_NODE:-$def_node}"; \
-    case "${MONERO_NETWORK:-mainnet}" in \
-      stagenet|STAGENET) printf "stagenet=1\n" ;; \
-      testnet|TESTNET)   printf "testnet=1\n" ;; \
-    esac; \
-    case "${MONERO_TRUSTED_DAEMON:-false}" in \
-      true|TRUE|1|yes|YES) printf "trusted-daemon=1\n" ;; \
-      *)                   printf "untrusted-daemon=1\n" ;; \
-    esac; \
-    if [ -n "${MONERO_RPC_PROXY:-}" ]; then printf "proxy=%%s\n" "${MONERO_RPC_PROXY}"; fi; \
-  } > /run/xmr-gateway/wallet-rpc.conf; \
-  chmod 0600 /run/xmr-gateway/wallet-rpc.conf'
+# Delegated to a standalone POSIX script so systemd never expands `${...}` or `%`.
+ExecStartPre=/usr/share/xmr-gateway/scripts/render-wallet-rpc-conf.sh /run/xmr-gateway/wallet-rpc.conf
 
 ExecStart=/usr/local/bin/monero-wallet-rpc \
   --non-interactive \

@@ -29,15 +29,15 @@ sudo bash install.sh
 Дополнительные опции:
 ```bash
 # Явный метод и версия:
-sudo bash install.sh --method deb --version v0.1.2
-sudo bash install.sh --method rpm --version v0.1.2
-sudo bash install.sh --method tarball --prefix /opt/xmr-gateway --version v0.1.2
+sudo bash install.sh --method deb --version v0.1.3
+sudo bash install.sh --method rpm --version v0.1.3
+sudo bash install.sh --method tarball --prefix /opt/xmr-gateway --version v0.1.3
 
 # Непривилегированная установка tarball в домашний каталог (без sudo):
-bash install.sh --method tarball --prefix "$HOME/xmr-gateway" --version v0.1.2
+bash install.sh --method tarball --prefix "$HOME/xmr-gateway" --version v0.1.3
 
 # Fail-closed проверка GPG-подписи SHA256SUMS.asc:
-sudo bash install.sh --version v0.1.2 --gpg-key ./RELEASE_SIGNING_KEY.asc --require-gpg
+sudo bash install.sh --version v0.1.3 --gpg-key ./RELEASE_SIGNING_KEY.asc --require-gpg
 ```
 
 ### 2.2. Ручная криптографическая верификация релиза
@@ -51,7 +51,7 @@ gpg --import RELEASE_SIGNING_KEY.asc
 gpg --verify SHA256SUMS.asc SHA256SUMS
 
 # 3. Проверка GitHub Build Provenance Attestation (требует GitHub CLI `gh`)
-gh attestation verify xmr-gateway_0.1.2_amd64.deb --owner XeonIT-dev
+gh attestation verify xmr-gateway_0.1.3_amd64.deb --owner XeonIT-dev
 ```
 
 ---
@@ -61,16 +61,16 @@ gh attestation verify xmr-gateway_0.1.2_amd64.deb --owner XeonIT-dev
 ### 3.1. Установка пакета `.deb` или `.rpm`
 ```bash
 # Debian / Ubuntu:
-sudo apt-get install -y ./xmr-gateway_0.1.2_amd64.deb
+sudo apt-get install -y ./xmr-gateway_0.1.3_amd64.deb
 
 # Fedora / RHEL / Rocky:
-sudo dnf install -y ./xmr-gateway-0.1.2-1.x86_64.rpm
+sudo dnf install -y ./xmr-gateway-0.1.3-1.x86_64.rpm
 ```
 Пакет автоматически:
 - создаёт системного пользователя и группу `xmr-gateway` (`/usr/sbin/nologin`);
 - создаёт каталоги `/var/lib/xmr-gateway`, `/var/lib/xmr-gateway/wallet`, `/var/lib/xmr-gateway/backups` (`0700`, `xmr-gateway:xmr-gateway`) и `/etc/xmr-gateway` (`0750`, `root:xmr-gateway`);
 - копирует шаблон в `/etc/xmr-gateway/.env` (`0600`) **только если файл ещё не существует** (при обновлениях существующий `.env` никогда не перезаписывается);
-- устанавливает бинарник `/usr/bin/xmr-gateway`, системную админ-панель `/usr/bin/xmr-gateway-admin` (`/usr/share/xmr-gateway/`, включая `start.sh`) и юниты в `/usr/lib/systemd/system/`.
+- устанавливает бинарник `/usr/bin/xmr-gateway`, системную админ-панель `/usr/bin/xmr-gateway-admin`, каталог `/usr/share/xmr-gateway/` (включая `start.sh` и `scripts/render-wallet-rpc-conf.sh` `0755`) и юниты в `/usr/lib/systemd/system/`.
 
 ### 3.2. Настройка `/etc/xmr-gateway/.env` и инициализация кошелька
 1. Сгенерируйте все 4 свежих раздельных секрета (`API_SECRET_KEY`, `OPERATOR_API_KEY`, `WEBHOOK_SECRET`, `MONERO_RPC_PASS`):
@@ -111,7 +111,7 @@ sudo systemctl enable --now xmr-gateway-backup.timer   # ежедневный г
 sudo systemctl status monero-wallet-rpc.service xmr-gateway.service xmr-gateway-backup.timer
 sudo -u xmr-gateway xmr-gateway-admin --env /etc/xmr-gateway/.env dev health-rbac
 ```
-> **Безопасность `systemd`-юнитов:** `monero-wallet-rpc.service` формирует временный `/run/xmr-gateway/wallet-rpc.conf` (`0600`, RAM-only) через `RuntimeDirectory=xmr-gateway`, поэтому `MONERO_RPC_PASS` никогда не светится в `ps aux`. Оба сервиса работают с `UMask=0077`, `ProtectSystem=strict`, `NoNewPrivileges=true` и `KillSignal=SIGTERM` / `TimeoutStopSec=30` для гарантированного `PRAGMA wal_checkpoint(TRUNCATE)`.
+> **Безопасность `systemd`-юнитов:** `monero-wallet-rpc.service` делегирует `ExecStartPre` автономному `0755` POSIX-скрипту `/usr/share/xmr-gateway/scripts/render-wallet-rpc-conf.sh`, который формирует временный `/run/xmr-gateway/wallet-rpc.conf` (`0600`, RAM-only) через `RuntimeDirectory=xmr-gateway`, поэтому `MONERO_RPC_PASS` никогда не светится в `ps aux`. Оба сервиса работают с `UMask=0077`, `ProtectSystem=strict`, `NoNewPrivileges=true` и `KillSignal=SIGTERM` / `TimeoutStopSec=30` для гарантированного `PRAGMA wal_checkpoint(TRUNCATE)`.
 
 ### 3.4. Обратный прокси (Caddy / Nginx) и Firewall
 Готовые шаблоны лежат в `deploy/reverse-proxy/` (и `/usr/share/xmr-gateway/reverse-proxy/` после установки из пакета):
@@ -237,10 +237,15 @@ loginctl enable-linger "$USER"
   1. Сделайте горячий бэкап: `sudo -u xmr-gateway xmr-gateway-admin db backup`.
   2. Установите новый пакет (`apt-get install ./xmr-gateway_...deb` или `dnf upgrade ./xmr-gateway-...rpm`) — `/etc/xmr-gateway/.env` и `/var/lib/xmr-gateway/` сохранятся нетронутыми.
   3. Перезапустите: `sudo systemctl restart xmr-gateway.service` и проверьте `xmr-gateway-admin db audit-invariants`.
-- **Ротация секретов:** `sudo -u xmr-gateway xmr-gateway-admin --env /etc/xmr-gateway/.env config rotate-keys all` (создаёт `0600`-бэкап `.env.bak.<UTC>`), затем `sudo systemctl restart monero-wallet-rpc.service xmr-gateway.service`.
+- **Ротация секретов и SELinux:** `sudo xmr-gateway-admin --env /etc/xmr-gateway/.env config rotate-keys all` (создаёт `0600`-бэкап `.env.bak.<UTC>`, атомарно обновляет `.env` внутри `/etc/xmr-gateway/`, сохраняет владельца и SELinux-контекст `etc_t` через `restorecon`), затем `sudo systemctl restart monero-wallet-rpc.service xmr-gateway.service`.
 - **Восстановление БД из бэкапа:** остановите `xmr-gateway.service`, удалите старые `xmr_gateway.db-wal` и `xmr_gateway.db-shm`, скопируйте проверенный бэкап (`chmod 600`, `chown xmr-gateway:xmr-gateway`), проверьте `xmr-gateway-admin db audit-invariants` и запустите сервис.
-- **Переход Stagenet → Mainnet:** используйте отдельный файл окружения и отдельную БД (`/var/lib/xmr-gateway`), выставите `MONERO_NETWORK=mainnet`, `ALLOW_PRIVATE_WEBHOOKS=false`, `REQUIRE_HTTPS_WEBHOOKS=true` (при `REQUIRE_HTTPS_WEBHOOKS=false` и `ALLOW_PRIVATE_WEBHOOKS=false` на `mainnet` шлюз и `config doctor` выдают предупреждение безопасности), свежие раздельные `API_SECRET_KEY`/`OPERATOR_API_KEY` (`OPERATOR_API_KEY` строго обязателен для `WALLET_MODE=hot_wallet` / `ENABLE_AUTO_SWEEP=true`), прогоните `config doctor` и `dev health-rbac`.
-- **Изоляция RPC-пароля и разблокированная финальность:** systemd-юниты, контейнеры, `start.sh`, `admin/service.sh` и `demo-stagenet.sh` передают учётные данные `monero-wallet-rpc` строго через `0600` `--config-file` (никогда через `--rpc-login` в `argv`). Финальность `SETTLED`/`COMPLETED` требует разблокированных покрывающих выходов на сумму инвойса при глубине `>= SETTLEMENT_CONFIRMATIONS` (защита от кастомного `unlock_time` и mempool Dust-DoS).
+- **Модель доверия и границы архитектуры:**
+  - **Self-hosted single-instance / single-merchant:** шлюз работает без стороннего платёжного посредника в модели одного мерчанта, одной БД SQLite (WAL) и одного кошелька `monero-wallet-rpc` (эксклюзивная блокировка `<db_path>.lock` запрещает второй процесс).
+  - **View-Only vs Hot-Wallet:** в `WALLET_MODE=view_only` (рекомендуется) приватный spend-ключ физически отсутствует на сервере. В `WALLET_MODE=hot_wallet` spend-ключ находится в `monero-wallet-rpc` — держите только минимальный операционный транзитный остаток, строго изолируйте хост/RPC, задавайте отдельный `OPERATOR_API_KEY` и выводите средства на холодный/аппаратный `COLD_WALLET_ADDRESS`.
+  - **Непрозрачный `order_id` без PII:** не передавайте email, логины или персональные данные в `order_id`, т.к. он попадает в операционные логи, `monero:` URI и метки кошелька.
+- **Контракт подписи вебхуков (ретраи и свежесть):** при каждой попытке доставки (первичная отправка, автоматический retry и ручной `webhooks retry`) формируются свежий Unix-timestamp `X-Webhook-Timestamp` и новая подпись `X-Webhook-Signature = HMAC-SHA256(WEBHOOK_SECRET, "{X-Webhook-Timestamp}.{raw_body}")`, тогда как `X-Webhook-Event-Id` (`payload.event_id`) и тело JSON остаются неизменными. Получатель обязан проверять окно свежести (`<= 300s`), подпись `X-Webhook-Signature` в constant-time и идемпотентность по `event_id` (обратно совместимый `X-Signature-256` также передаётся).
+- **Переход Stagenet → Mainnet:** используйте отдельный файл окружения и отдельную БД (`/var/lib/xmr-gateway`), выставите `MONERO_NETWORK=mainnet`, `ALLOW_PRIVATE_WEBHOOKS=false`, `REQUIRE_HTTPS_WEBHOOKS=true` (при `REQUIRE_HTTPS_WEBHOOKS=false` и `ALLOW_PRIVATE_WEBHOOKS=false` на `mainnet` запуск **отклоняется fail-closed**, а `config doctor` выдаёт `FAIL`), настройте `SCANNER_SUBADDRESS_BATCH_SIZE=100` (`1..=1000`), свежие раздельные `API_SECRET_KEY`/`OPERATOR_API_KEY` (`OPERATOR_API_KEY` строго обязателен для `WALLET_MODE=hot_wallet` / `ENABLE_AUTO_SWEEP=true`), прогоните `config doctor` и `dev health-rbac`.
+- **Изоляция RPC-пароля и разблокированная финальность:** systemd-юниты (`render-wallet-rpc-conf.sh`), контейнеры, `start.sh`, `admin/service.sh` и `demo-stagenet.sh` передают учётные данные `monero-wallet-rpc` строго через `0600` `--config-file` (никогда через `--rpc-login` в `argv`). Финальность `SETTLED`/`COMPLETED` требует разблокированных покрывающих выходов на сумму инвойса при глубине `>= SETTLEMENT_CONFIRMATIONS` (защита от кастомного `unlock_time` и mempool Dust-DoS).
 
 ---
 
@@ -259,13 +264,13 @@ gpg --armor --export-secret-keys <KEY_FINGERPRINT>
 
 ### Выпуск релиза (3 шага)
 ```bash
-# 1. Убедитесь, что version в Cargo.toml совпадает с тегом (например, 0.1.2), и main актуален:
+# 1. Убедитесь, что version в Cargo.toml совпадает с тегом (например, 0.1.3), и main актуален:
 git checkout main && git pull --ff-only
 
 # 2. Создайте (подписанный) аннотированный тег:
-git tag -s v0.1.2 -m "Release v0.1.2"
+git tag -s v0.1.3 -m "Release v0.1.3"
 
 # 3. Запушьте тег — GitHub Actions автоматически соберёт и опубликует релиз:
-git push origin v0.1.2
+git push origin v0.1.3
 ```
 Для пробного прогона без публикации релиза запустите **Actions → Release → Run workflow** с параметром `dry_run: true`.

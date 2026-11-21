@@ -1,6 +1,6 @@
 # xmr-gateway — Руководство по архитектуре, настройке и эксплуатации
 
-`xmr-gateway` — автономный (self-hosted), некастодиальный платёжный шлюз Monero (XMR) на языке Rust с изоляцией субадресов на каждый инвойс, учётом в SQLite (WAL), подписанными вебхуками (`HMAC-SHA256`) и опциональным движком автоматического вывода средств на холодный кошелёк (Hot Auto-Sweep).
+`xmr-gateway` — автономный (self-hosted), некастодиальный платёжный шлюз Monero (XMR) на языке Rust (без сторонних платёжных посредников) с изоляцией субадресов на каждый инвойс, учётом в SQLite (WAL), подписанными вебхуками (`HMAC-SHA256` со свежим `X-Webhook-Timestamp` на каждую попытку) и опциональным движком автоматического вывода средств на холодный кошелёк (Hot Auto-Sweep).
 
 ---
 
@@ -12,7 +12,7 @@
   - [2.2. HTTP API и разделение прав (RBAC)](#22-http-api-и-разделение-прав-rbac)
   - [2.3. Жизненный цикл инвойса и подтверждения](#23-жизненный-цикл-инвойса-и-подтверждения)
   - [2.4. Движок автосвипа и восстановление инцидентов](#24-движок-автосвипа-и-восстановление-инцидентов)
-  - [2.5. Вебхуки, подпись `X-Signature-256` и политика повторов](#25-вебхуки-подпись-x-signature-256-и-политика-повторов)
+  - [2.5. Вебхуки, подпись `X-Webhook-Signature` / `X-Signature-256` и политика повторов](#25-вебхуки-подпись-x-webhook-signature--x-signature-256-и-политика-повторов)
 - [3. Автоматические bash-скрипты и сценарии запуска](#3-автоматические-bash-скрипты-и-сценарии-запуска)
   - [3.1. Оркестратор `start.sh`](#31-оркестратор-startsh)
   - [3.2. Интерактивное демо `demo-stagenet.sh`](#32-интерактивное-демо-demo-stagenetsh)
@@ -27,7 +27,7 @@
   - [4.5. Подтверждения, таймауты, интервалы и логирование](#45-подтверждения-таймауты-интервалы-и-логирование)
   - [4.6. Переменные скрипта `start.sh` (bootstrap и загрузка CLI)](#46-переменные-скрипта-startsh-bootstrap-и-загрузка-cli)
 - [5. Проверки безопасности и ограничения при запуске](#5-проверки-безопасности-и-ограничения-при-запуске)
-  - [5.1. Контроль режима кошелька (`WALLET_MODE`) и `spend_key`](#51-контроль-режима-кошелька-wallet_mode-и-spend_key)
+  - [5.1. Модель доверия: `view_only` vs `hot_wallet` и контроль `spend_key`](#51-модель-доверия-view_only-vs-hot_wallet-и-контроль-spend_key)
   - [5.2. Ограничения режима `hot_wallet` и `COLD_WALLET_ADDRESS`](#52-ограничения-режима-hot_wallet-и-cold_wallet_address)
   - [5.3. Требования к секретам и RPC-транспорту](#53-требования-к-секретам-и-rpc-транспорту)
   - [5.4. Анти-SSRF защита исходящих вебхуков](#54-анти-ssrf-защита-исходящих-вебхуков)
@@ -77,7 +77,10 @@
 
 - **HTTP API (`src/api/`):** построен на `axum 0.8` + `tower-http`. Включает лимит тела запроса `64 KiB` (`MAX_REQUEST_BODY_BYTES`), таймаут обработки запроса `30s`, `x-request-id` (UUID), редактирование чувствительных заголовков (`x-api-key`, `x-operator-key`, `authorization`, `cookie`) в логах и настраиваемый CORS.
 - **Хранилище SQLite (`src/db/`):** пул `sqlx` (`max_connections = 8` для файловой БД и `1` для `sqlite::memory:`), `journal_mode = WAL`, `synchronous = FULL`, `foreign_keys = ON`, `busy_timeout = 5s`. Все денежные суммы хранятся строго как целые `INTEGER` в атомарных пиконеро (`1 XMR = 10^12 piconero`, тип `Piconero`, без чисел с плавающей точкой).
-- **Воркер сканера (`src/services/scanner.rs` — `ScannerService`):** раз в `SCAN_INTERVAL_SECONDS` выполняет батч-запрос `get_transfers` по всем отслеживаемым субадресам аккаунта `0`, дедуплицирует транзакции между `pool` и `in` (приоритет у `in`), исключает выходы с `double_spend_seen = true`, обновляет таблицы `invoices`, `invoice_transfers`, `subaddress_transfers`, обнаруживает реорганизации (reorg), поздние платежи (`LATE_PAYMENT`), переплаты (`OVERPAYMENT`) и при `ENABLE_AUTO_SWEEP=true` запускает изолированный `sweep_all` под per-invoice мьютексом.
+- **Воркер сканера (`src/services/scanner.rs` — `ScannerService`):** раз в `SCAN_INTERVAL_SECONDS` группирует отслеживаемые субадреса по `account_index` и выполняет чанкованные батч-запросы `get_transfers` размером `SCANNER_SUBADDRESS_BATCH_SIZE` (по умолчанию `100`, лимит `1..=1000` для защиты от превышения лимита ответа RPC `16 MiB`), дедуплицирует транзакции между `pool` и `in` (приоритет у `in`) без двойного учёта кросс-батч транзакций, fail-closed отменяет цикл при сбое любого батча до записи в БД, исключает выходы с `double_spend_seen = true`, обновляет таблицы `invoices`, `invoice_transfers`, `subaddress_transfers`, обнаруживает реорганизации (reorg), поздние платежи (`LATE_PAYMENT`), переплаты (`OVERPAYMENT`) и при `ENABLE_AUTO_SWEEP=true` запускает изолированный `sweep_all` под per-invoice мьютексом.
+- **Границы архитектуры и приватность `order_id`:**
+  - **Single-instance SQLite / single-merchant:** шлюз рассчитан на одного мерчанта в self-hosted развёртывании без сторонних платёжных посредников. Один экземпляр процесса `xmr-gateway` обслуживает одну БД SQLite и один кошелёк `monero-wallet-rpc` (эксклюзивный `<db_path>.lock` не допускает запуск второго процесса на ту же БД).
+  - **Непрозрачный `order_id` без PII:** используйте внутренние непрозрачные идентификаторы (`ord_7f9a2c`, UUID), **не** помещайте в `order_id` email, логины, телефоны или имена клиентов — `order_id` попадает в операционные логи, `tx_description` в `monero:` URI и метки субадресов кошелька (`inv_<order_id>`).
 - **Диспетчер вебхуков (`src/services/webhook.rs` — `WebhookDispatcher`):** транзакционный outbox (`webhook_deliveries`). Раз в `WEBHOOK_POLL_INTERVAL_SECONDS` забирает до 50 готовых задач и доставляет их параллельно (до `8` одновременных отправок по разным инвойсам, сохраняя строгий порядок внутри одного инвойса).
 - **RPC-клиент (`src/rpc/client.rs` — `MoneroRpcClient`):** JSON-RPC 2.0 клиент к `monero-wallet-rpc` (и опциональному `monerod` через `MONERO_DAEMON_RPC_URL`) с поддержкой HTTP Digest (RFC 2617/7616 с кэшированием nonce) и Basic аутентификации и жёстким лимитом размера ответа `16 MiB`.
 
@@ -144,23 +147,29 @@ PENDING ----------+-----------------------------> MEMPOOL (0-conf, не исте
    - `action = "allow_resweep"` требует `confirm_absent_on_chain = true`, непустой `operator_note`, сверку синхронизации кошелька и демона (`MONERO_DAEMON_RPC_URL` обязателен!) и подтверждение отсутствия живых исходящих транзакций с этого субадреса.
    - `action = "mark_reconciled"` требует строгий 64-hex `replacement_tx_hash` (или сохранённые хэши попытки), fail-closed проверку, что все положительные выходы в `destinations` идут строго на `COLD_WALLET_ADDRESS`, защиту от dust-сумм и атомарную (`BEGIN IMMEDIATE`) проверку уникальности `tx_hash` между инвойсами.
 
-### 2.5. Вебхуки, подпись `X-Signature-256` и политика повторов
+### 2.5. Вебхуки, подпись `X-Webhook-Signature` / `X-Signature-256` и политика повторов
 
 События (`WebhookEventType`): `UNDERPAID`, `MEMPOOL`, `CONFIRMED`, `SETTLED`, `REORGED`, `SWEPT`, `EXPIRED`, `LATE_PAYMENT`, `OVERPAYMENT`.
 
-Каждая отправка формируется один раз при записи в SQLite (байты тела не пере-сериализуются при ретраях) и отправляется методом `POST` с заголовками:
+Бизнес-событие (`event_id` и байты JSON-тела) сериализуется один раз при записи в SQLite и остаётся **неизменным** между всеми ретраями для идемпотентной дедупликации на стороне мерчанта. При **каждой попытке доставки** (первичная отправка, автоматический экспоненциальный retry и ручной операторский `webhooks retry`) диспетчер генерирует свежий `X-Webhook-Timestamp` (Unix epoch seconds) и на лету вычисляет `X-Webhook-Signature = HMAC-SHA256(WEBHOOK_SECRET, "{X-Webhook-Timestamp}.{raw_body}")` — благодаря этому ретраи после простоя сервера мерчанта проходят строгую проверку свежести подписи (`<= 300s`):
 
 | Заголовок | Значение |
 |---|---|
 | `Content-Type` | `application/json` |
-| `User-Agent` | `xmr-gateway/0.1.2` |
-| `X-Signature-256` | Lowercase hex `HMAC-SHA256(WEBHOOK_SECRET, raw_body_bytes)` |
+| `User-Agent` | `xmr-gateway/0.1.3` |
+| `X-Webhook-Timestamp` | Свежий Unix epoch timestamp (секунды) текущей попытки доставки (обновляется при каждом retry) |
+| `X-Webhook-Signature` | **Рекомендуемая основная подпись:** lowercase hex `HMAC-SHA256(WEBHOOK_SECRET, "{X-Webhook-Timestamp}.{raw_body}")` |
+| `X-Webhook-Event-Id` | Стабильный UUID бизнес-события (`payload.event_id`, неизменен между ретраями для идемпотентности) |
+| `X-Delivery-Id` | Обратно совместимый алиас `X-Webhook-Event-Id` (`webhook_deliveries.id`) |
+| `X-Signature-256` | Обратно совместимая подпись тела `HMAC-SHA256(WEBHOOK_SECRET, raw_body_bytes)` |
 | `X-Webhook-Event` | Имя события (`MEMPOOL`, `CONFIRMED`, `SETTLED`, `SWEPT`, `REORGED`, `EXPIRED`, `UNDERPAID`, `LATE_PAYMENT`, `OVERPAYMENT`) |
-| `X-Delivery-Id` | UUID конкретной доставки (`webhook_deliveries.id`) |
-| `X-Webhook-Timestamp` | UTC timestamp создания события в RFC 3339 |
 
+- **Контракт проверки на стороне получателя:**
+  1. Проверить окно свежести `abs(now_unix - int(X-Webhook-Timestamp)) <= 300` сек.
+  2. Проверить `X-Webhook-Signature` в constant-time по строке `f"{X-Webhook-Timestamp}.".encode() + raw_body` с ключом `WEBHOOK_SECRET`.
+  3. Выполнять идемпотентную дедупликацию по `event_id` (`X-Webhook-Event-Id`), чтобы повторная доставка не привела к двойному зачислению.
 - **Таймауты и чтение ошибок:** connect `5s`, общий таймаут `10s`, HTTP `3xx` редиректы запрещены (`redirect::Policy::none()`), при неуспешном ответе читается не более `1024` байт тела ответа.
-- **Ретраи:** максимум `10` попыток (`DEFAULT_WEBHOOK_MAX_ATTEMPTS`), экспоненциальная задержка `5s * 2^(attempt - 1)` с потолком `3600s` (1 час): `5s -> 10s -> 20s -> 40s -> 80s -> 160s -> 320s -> 640s -> 1280s -> 2560s`. После исчерпания попыток статус становится `FAILED` (можно перезапустить через API `/retry`).
+- **Ретраи:** максимум `10` попыток (`DEFAULT_WEBHOOK_MAX_ATTEMPTS`), экспоненциальная задержка `5s * 2^(attempt - 1)` с потолком `3600s` (1 час): `5s -> 10s -> 20s -> 40s -> 80s -> 160s -> 320s -> 640s -> 1280s -> 2560s`. После исчерпания попыток статус становится `FAILED` (ручной `webhooks retry` также формирует свежий `X-Webhook-Timestamp` и новую `X-Webhook-Signature`).
 
 ---
 
@@ -303,7 +312,7 @@ PENDING ----------+-----------------------------> MEMPOOL (0-conf, не исте
 | `WEBHOOK_SECRET` | string (`>= 32` байт) | — | **Да** | Общий секрет для расчёта подписи `HMAC-SHA256` в заголовке `X-Signature-256`. Генерация: `openssl rand -hex 32`. |
 | `DEFAULT_WEBHOOK_URL` | HTTP/HTTPS URL | `None` | Нет | URL вебхука по умолчанию, если в `POST /api/v1/invoices` не передан `callback_url`. Валидируется (включая DNS) прямо на старте сервиса. |
 | `ALLOW_PRIVATE_WEBHOOKS` | `bool` | `false` | Нет | Разрешает отправку вебхуков на loopback (`127.0.0.0/8`, `::1`), RFC1918, link-local (`169.254.169.254`), `.localhost`/`.local`/`.internal`. В продакшене строго `false`; для локального бота/демо — `true`. |
-| `REQUIRE_HTTPS_WEBHOOKS` | `bool` | `false` | Нет | При `true` отклоняет `http://` URL вебхуков и разрешает только `https://`. В продакшене рекомендуется `true` (на `mainnet` при `ALLOW_PRIVATE_WEBHOOKS=false` и `REQUIRE_HTTPS_WEBHOOKS=false` шлюз и `config doctor` выводят предупреждение, `XMR-AUDIT-006`). |
+| `REQUIRE_HTTPS_WEBHOOKS` | `bool` | `true` на `mainnet` при `ALLOW_PRIVATE_WEBHOOKS=false`; иначе `false` | Нет | На `mainnet` при `ALLOW_PRIVATE_WEBHOOKS=false` публичные HTTP-вебхуки **строго запрещены (fail-closed на старте и `FAIL` в `config doctor`, `XMR-AUDIT-006`)**; если переменная не задана, по умолчанию используется `true`. На `stagenet`/`testnet` или при `ALLOW_PRIVATE_WEBHOOKS=true` (локальный бот на `127.0.0.1`) HTTP остаётся разрешённым. |
 
 ### 4.3. Сеть Monero, RPC кошелька и демона
 
@@ -339,6 +348,7 @@ PENDING ----------+-----------------------------> MEMPOOL (0-conf, не исте
 | `SUBADDRESS_MONITOR_DAYS` | `u64` | `0` | Нет | Окно (в днях) мониторинга терминальных субадресов (`COMPLETED`/`SWEPT`/`EXPIRED`). `0` = непрерывный бессрочный мониторинг всех неархивных субадресов. |
 | `INVOICE_TTL_SECONDS` | `u64` (`>= 1`) | `3600` | Нет | Время жизни нового инвойса по умолчанию (в секундах; 3600 = 1 час). В API допустим per-invoice `ttl_seconds` до `2592000` (30 дней). |
 | `SCAN_INTERVAL_SECONDS` | `u64` (`>= 1`) | `10` | Нет | Интервал опроса `monero-wallet-rpc` фоновым сканером (в секундах). |
+| `SCANNER_SUBADDRESS_BATCH_SIZE` | `usize` (`1..=1000`) | `100` | Нет | Максимальное число субадресов в одном батче `get_transfers` (исключает превышение лимита ответа RPC `16 MiB` при росте числа инвойсов). |
 | `WEBHOOK_POLL_INTERVAL_SECONDS` | `u64` (`>= 1`) | `5` | Нет | Интервал опроса таблицы `webhook_deliveries` фоновым диспетчером (в секундах). |
 | `RUST_LOG` | `EnvFilter` string | `info,xmr_gateway=debug` | Нет | Директивы фильтрации логов `tracing` (например, `info,xmr_gateway=debug,sqlx=warn`). |
 | `LOG_FORMAT` | enum | `json` | Нет | Формат вывода логов: `json` (структурированный JSON для продакшена) или `pretty` (читаемый формат для локальной отладки). |
@@ -350,7 +360,7 @@ PENDING ----------+-----------------------------> MEMPOOL (0-conf, не исте
 | Переменная | По умолчанию | Назначение |
 |---|---|---|
 | `MONERO_REMOTE_NODE` | `xmr-node.cakewallet.com:18081` (`start.sh`) / `node.monerodevs.org:38089` (`demo-stagenet.sh`) | Адрес `host:port` удалённой (или локальной) ноды `monerod`, передаваемый в `--daemon-address`. |
-| `WALLET_RESTORE_HEIGHT` | `3280000` | Начальная высота блока при первичном создании кошелька (`--restore-height`), чтобы не сканировать блокчейн с блока `0`. |
+| `WALLET_RESTORE_HEIGHT` | пусто (`mainnet=3280000`, `stagenet=1600000`, `testnet=2600000`) | Начальная высота блока при первичном создании кошелька (`--restore-height`); если оставить пустой, подбирается автоматически под `MONERO_NETWORK`. |
 | `MONERO_RPC_PROXY` | `""` | Опциональный SOCKS5-прокси для трафика `monero-wallet-rpc -> monerod` (например `127.0.0.1:9050` для Tor). |
 | `MONERO_VIEW_ONLY_ADDRESS` | `""` | Основной адрес кошелька. **Обязателен** в `start.sh` при первом создании кошелька в `WALLET_MODE=view_only`. |
 | `MONERO_VIEW_ONLY_KEY` | `""` | Приватный view-ключ (64 hex). **Обязателен** в `start.sh` при первом создании кошелька в `WALLET_MODE=view_only`. |
@@ -363,8 +373,10 @@ PENDING ----------+-----------------------------> MEMPOOL (0-conf, не исте
 
 `xmr-gateway` спроектирован по принципу **fail-closed**: при нарушении любого инварианта безопасности сервис завершается с ненулевым кодом выхода (`fatal startup error: ...`) до открытия HTTP-порта.
 
-### 5.1. Контроль режима кошелька (`WALLET_MODE`) и `spend_key`
+### 5.1. Модель доверия: `view_only` vs `hot_wallet` и контроль `spend_key`
 
+- **Режим `view_only` (рекомендуемый):** на сервере хранятся только публичный адрес и приватный `view_key`; приватный `spend_key` физически отсутствует на хосте. Компрометация сервера не позволяет вывести средства (риск ограничен чтением входящих сумм и метаданных).
+- **Режим `hot_wallet`:** приватный `spend_key` находится в процессе `monero-wallet-rpc` на сервере для подписи `sweep_all`. Используйте его строго как **транзитный операционный кошелёк**: храните минимальный операционный остаток, жёстко изолируйте хост и `127.0.0.1:18082`, обязательно задавайте отдельный `OPERATOR_API_KEY` и регулярно выводите средства на оффлайн/аппаратный `COLD_WALLET_ADDRESS`.
 - **При первом запуске `start.sh` (`validate_wallet_bootstrap_policy`):** если файл `data/wallet/gateway_wallet.keys` отсутствует и выбран `WALLET_MODE=view_only`, но не заданы `MONERO_VIEW_ONLY_ADDRESS` и `MONERO_VIEW_ONLY_KEY`, скрипт **отказывается** молча генерировать горячий кошелёк со spend-ключом.
 - **Проверка через RPC (`start.sh::verify_rpc_wallet_mode` и `src/rpc/client.rs::verify_wallet_mode`):** на старте вызывается `query_key({"key_type": "spend_key"})`:
   - Если настроено `WALLET_MODE=view_only`, а `monero-wallet-rpc` вернул ненулевой приватный `spend_key` -> немедленная ошибка `SECURITY VIOLATION: WALLET_MODE=view_only is configured, but monero-wallet-rpc loaded a hot wallet holding a private spend key`.
@@ -557,7 +569,7 @@ RUST_LOG=info,xmr_gateway=debug
    {
      "status": "ok",
      "service": "xmr-gateway",
-     "version": "0.1.2",
+     "version": "0.1.3",
      "database": "connected",
      "monero_rpc": {
        "connected": true,
@@ -592,10 +604,10 @@ RUST_LOG=info,xmr_gateway=debug
 ### 6.4. Интеграция с Telegram-ботом (создание счёта и приём вебхуков)
 
 Типовой поток интеграции Telegram-бота с `xmr-gateway`:
-1. Пользователь нажимает «Оплатить XMR» -> бот вызывает `POST http://127.0.0.1:8080/api/v1/invoices` с заголовком `X-API-Key: <API_SECRET_KEY>`, уникальным `order_id` (например `tg_<user_id>_<order_id>`), суммой в `amount_piconero` (`1 XMR = 1_000_000_000_000`) и `callback_url` на HTTP-обработчик бота.
+1. Пользователь нажимает «Оплатить XMR» -> бот вызывает `POST http://127.0.0.1:8080/api/v1/invoices` с заголовком `X-API-Key: <API_SECRET_KEY>`, уникальным **непрозрачным `order_id` без PII** (например `ord_7f9a2c41`, не используйте email/username/телефон), суммой в `amount_piconero` (`1 XMR = 1_000_000_000_000`) и `callback_url` на HTTP-обработчик бота.
 2. Бот декодирует `qr_code_base64` в PNG-картинку и отправляет пользователю сообщение с QR-кодом, `subaddress`, `amount_xmr_formatted` и `monero_uri`.
 3. Когда клиент отправляет тестовые монеты Stagenet (например, через Stagenet-кошелёк или публичный faucet), `xmr-gateway` последовательно шлёт подписанные `POST`-вебхуки: `MEMPOOL` (0-conf) -> `CONFIRMED` -> `SETTLED` (или `SWEPT`).
-4. Бот **обязательно проверяет подпись `X-Signature-256` по сырым байтам тела** и обеспечивает идемпотентность по `event_id` / `(order_id, event)`:
+4. Бот **обязательно проверяет свежесть `X-Webhook-Timestamp` (например `<= 300s`) и подпись `X-Webhook-Signature` по `"{timestamp}.{raw_body}"`**, а также обеспечивает идемпотентность по `event_id` (`X-Webhook-Event-Id`):
 
 ```python
 import base64
@@ -603,6 +615,7 @@ import hashlib
 import hmac
 import json
 import os
+import time
 import urllib.request
 
 GATEWAY_URL = os.environ.get("XMR_GATEWAY_URL", "http://127.0.0.1:8080")
@@ -632,10 +645,19 @@ def create_xmr_invoice(order_id: str, amount_piconero: int, callback_url: str) -
     return inv
 
 
-def verify_webhook(raw_body: bytes, sig_header: str) -> dict:
-    expected = hmac.new(WEBHOOK_SECRET, raw_body, hashlib.sha256).hexdigest()
+def verify_webhook(
+    raw_body: bytes,
+    timestamp_header: str,
+    sig_header: str,
+    max_skew_seconds: int = 300,
+) -> dict:
+    ts = int(timestamp_header.strip())
+    if abs(int(time.time()) - ts) > max_skew_seconds:
+        raise ValueError("stale X-Webhook-Timestamp")
+    signing_input = f"{ts}.".encode("utf-8") + raw_body
+    expected = hmac.new(WEBHOOK_SECRET, signing_input, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected, sig_header.strip().lower()):
-        raise ValueError("invalid X-Signature-256 signature")
+        raise ValueError("invalid X-Webhook-Signature")
     return json.loads(raw_body.decode("utf-8"))
 ```
 
@@ -745,7 +767,7 @@ cargo test --locked --release --all-targets
     sudo bash install.sh
     ```
   - **Системные пакеты `.deb` / `.rpm`:** устанавливают `/usr/bin/xmr-gateway`, системную обёртку `/usr/bin/xmr-gateway-admin` (`/usr/share/xmr-gateway/`), шаблон `/etc/xmr-gateway/env.example` (не перезаписывая существующий `/etc/xmr-gateway/.env`) и 4 юнита `systemd` в `/usr/lib/systemd/system/`.
-  - **Эксплуатация через `systemd` (`deploy/systemd/`):** `monero-wallet-rpc.service` (рендерит `0600` `/run/xmr-gateway/wallet-rpc.conf` в RAM без утечки пароля в `ps`), `xmr-gateway.service` (`EnvironmentFile=/etc/xmr-gateway/.env`, `UMask=0077`, `KillSignal=SIGTERM`, `TimeoutStopSec=30`) и ежедневный горячий бэкап `xmr-gateway-backup.service` + `xmr-gateway-backup.timer`.
+  - **Эксплуатация через `systemd` (`deploy/systemd/`):** `monero-wallet-rpc.service` (вызывает автономный `0755` POSIX-скрипт `/usr/share/xmr-gateway/scripts/render-wallet-rpc-conf.sh`, который рендерит `0600` `/run/xmr-gateway/wallet-rpc.conf` в RAM без утечки пароля в `ps`), `xmr-gateway.service` (`EnvironmentFile=/etc/xmr-gateway/.env`, `UMask=0077`, `KillSignal=SIGTERM`, `TimeoutStopSec=30`) и ежедневный горячий бэкап `xmr-gateway-backup.service` + `xmr-gateway-backup.timer`.
   - **Обратный прокси (`deploy/reverse-proxy/`):** готовые `Caddyfile` и `nginx-xmr-gateway.conf` (TLS 1.2/1.3, лимит тела, пример ограничения операторских маршрутов по IP/VPN).
   - **Контейнеры:** корневой `Containerfile` (UID/GID `10001`), воспроизводимый `deploy/docker/Containerfile.monero-rpc` (SHA256-проверка официального Monero CLI), `deploy/docker/docker-compose.yml` (изолированная сеть `xmr_internal`, `127.0.0.1:8080`, опциональный `--profile caddy`) и rootless Podman Quadlet (`deploy/podman/quadlet/` с `:Z` для SELinux).
 - **Логи:**
@@ -757,7 +779,7 @@ cargo test --locked --release --all-targets
 - [ ] **Секреты и разделение ролей:** сгенерированы свежие случайные `API_SECRET_KEY`, `WEBHOOK_SECRET` (`>= 32` байт), `MONERO_RPC_PASS` (`>= 16` симв.); при необходимости задан отдельный `OPERATOR_API_KEY` (`>= 32` байт). Файл `.env` имеет права `0600` и не попадает в Git.
 - [ ] **Режим кастодиальности:** по возможности используется **View-Only Zero-Trust** (`WALLET_MODE=view_only`, `ENABLE_AUTO_SWEEP=false`, кошелёк создан из `MONERO_VIEW_ONLY_ADDRESS` + `MONERO_VIEW_ONLY_KEY`). Если выбран `hot_wallet`, проверены `ENABLE_AUTO_SWEEP=true`, `COLD_WALLET_ADDRESS` (mainnet) и резервная копия 25-словной seed-фразы.
 - [ ] **Сетевая изоляция:** `HOST=127.0.0.1`, `MONERO_RPC_URL=http://127.0.0.1:18082/json_rpc`, `ALLOW_UNAUTHENTICATED_RPC=false`, `ALLOW_INSECURE_REMOTE_RPC=false`; внешний доступ (если нужен) — только через TLS reverse proxy (Caddy/Nginx).
-- [ ] **Вебхуки:** `ALLOW_PRIVATE_WEBHOOKS=false`, `REQUIRE_HTTPS_WEBHOOKS=true`, на стороне получателя проверяется `X-Signature-256` и идемпотентность по `event_id`.
+- [ ] **Вебхуки:** `ALLOW_PRIVATE_WEBHOOKS=false`, `REQUIRE_HTTPS_WEBHOOKS=true` (обязательно на `mainnet` fail-closed), на стороне получателя проверяются свежесть `X-Webhook-Timestamp` (`<= 300s`), подпись `X-Webhook-Signature` и идемпотентность по `event_id` (`X-Webhook-Event-Id`).
 - [ ] **Собственный `monerod` и инциденты:** для максимальной надёжности подключите собственный локальный `monerod` (`MONERO_REMOTE_NODE=127.0.0.1:18081`, `MONERO_TRUSTED_DAEMON=true`) и задайте `MONERO_DAEMON_RPC_URL` (+ логин/пароль), чтобы при инциденте работал `POST /api/v1/invoices/{id}/sweep/resolve` (`allow_resweep`).
 - [ ] **Подтверждения и мониторинг:** `REQUIRED_CONFIRMATIONS=10` (и `SETTLEMENT_CONFIRMATIONS=15` для крупных заказов), `SUBADDRESS_MONITOR_DAYS=0`, `LOG_FORMAT=json`.
 - [ ] **Бэкапы и `systemd`:** настроены юниты из `deploy/systemd/` и регулярный онлайн-бэкап SQLite (`sqlite3 ... ".backup ..."`).

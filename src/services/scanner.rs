@@ -1,11 +1,15 @@
 //! Background blockchain/mempool scanner and isolated subaddress auto-sweep engine.
 //!
 //! # Operational & Security Invariants
-//! 1. **Single-Query Batching:** Queries `monero-wallet-rpc` `get_transfers` once per scan tick
-//!    for all active subaddress indices (`account_index = 0`), aggregating confirmed (`in`)
-//!    and unconfirmed (`pool`) transfers per subaddress.
+//! 1. **Bounded Chunked Batching:** Groups monitored subaddress indices by `account_index` and
+//!    queries `monero-wallet-rpc` `get_transfers` in deterministic chunks of
+//!    `SCANNER_SUBADDRESS_BATCH_SIZE` (default `100`) to stay safely below the 16 MiB RPC limit.
+//!    Batches are strictly disjoint per account and fail closed on any partial RPC error before
+//!    mutating database state so unread subaddresses are never falsely orphaned or reorged.
 //! 2. **Txid Deduplication:** If a transaction transitions from `pool` to `in` concurrently with
 //!    an RPC query and appears in both lists, `in` takes precedence and the txid is counted once.
+//!    Cross-batch multi-subaddress transactions are scoped strictly to the queried chunk's
+//!    subaddresses so outputs are never double-counted across batches.
 //! 3. **Double-Spend Immunity:** Any output with `double_spend_seen == true` is excluded from
 //!    paid totals and logged at `ERROR` severity.
 //! 4. **10-Block Consensus Sweep Lock & Per-Invoice Mutex:** In `ENABLE_AUTO_SWEEP=true` mode,
@@ -16,9 +20,9 @@
 
 use std::{
     cmp::Reverse,
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -187,6 +191,7 @@ impl ScannerService {
     /// Returns [`GatewayError::Database`] if monitored invoices cannot be fetched or updated, or
     /// [`GatewayError::RpcTransport`]/[`GatewayError::Rpc`] if batch `get_transfers` fails.
     pub async fn scan_once(&self) -> GatewayResult<ScanReport> {
+        let scan_started = Instant::now();
         let reconciled = self.reconcile_in_flight_sweeps().await?;
         let cutoff = self.monitor_cutoff();
         let monitored_invoices = self.repo.list_monitored_invoices(cutoff).await?;
@@ -200,19 +205,42 @@ impl ScannerService {
             return Ok(report);
         }
 
-        let unique_indices: Vec<u32> = monitored_invoices
-            .iter()
-            .map(|inv| inv.address_index)
-            .collect::<BTreeSet<u32>>()
-            .into_iter()
-            .collect();
+        let mut indices_by_account: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+        for inv in &monitored_invoices {
+            indices_by_account
+                .entry(inv.account_index)
+                .or_default()
+                .insert(inv.address_index);
+        }
 
-        let transfers_resp = self.rpc.get_transfers(0, &unique_indices, true).await?;
-        let grouped = group_transfers_by_subaddress(0, &transfers_resp)?;
+        let batch_size = self.config.scanner_subaddress_batch_size.max(1);
+        let mut grouped: HashMap<(u32, u32), Vec<ObservedTransfer>> = HashMap::new();
+        let mut total_subaddresses = 0_usize;
+        let mut total_batches = 0_usize;
+
+        for (account_index, subaddr_set) in &indices_by_account {
+            let sorted_indices: Vec<u32> = subaddr_set.iter().copied().collect();
+            total_subaddresses += sorted_indices.len();
+
+            for batch in sorted_indices.chunks(batch_size) {
+                total_batches += 1;
+                // Fail closed on any partial batch failure BEFORE updating SQLite state so
+                // invoices in unread batches are never falsely treated as orphaned/reorged.
+                let transfers_resp = self.rpc.get_transfers(*account_index, batch, true).await?;
+                let mut batch_grouped =
+                    group_transfers_by_subaddress(*account_index, &transfers_resp)?;
+                // Only merge subaddresses owned by this disjoint chunk so a single Monero tx
+                // paying subaddresses in multiple chunks is never double-counted.
+                for &minor_idx in batch {
+                    let transfers = batch_grouped.remove(&minor_idx).unwrap_or_default();
+                    grouped.insert((*account_index, minor_idx), transfers);
+                }
+            }
+        }
 
         for invoice in monitored_invoices {
             let subaddr_transfers = grouped
-                .get(&invoice.address_index)
+                .get(&(invoice.account_index, invoice.address_index))
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
 
@@ -315,6 +343,34 @@ impl ScannerService {
                     }
                 }
             }
+        }
+
+        let elapsed_ms = u64::try_from(scan_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if report.sweep_errors > 0 || elapsed_ms >= 5_000 {
+            tracing::info!(
+                monitored_invoices = report.invoices_scanned,
+                monitored_subaddresses = total_subaddresses,
+                accounts = indices_by_account.len(),
+                batches = total_batches,
+                batch_size,
+                status_transitions = report.status_transitions,
+                invoices_swept = report.invoices_swept,
+                sweep_errors = report.sweep_errors,
+                elapsed_ms,
+                "scanner cycle completed with anomalies or elevated latency"
+            );
+        } else {
+            tracing::debug!(
+                monitored_invoices = report.invoices_scanned,
+                monitored_subaddresses = total_subaddresses,
+                accounts = indices_by_account.len(),
+                batches = total_batches,
+                batch_size,
+                status_transitions = report.status_transitions,
+                invoices_swept = report.invoices_swept,
+                elapsed_ms,
+                "scanner cycle completed"
+            );
         }
 
         Ok(report)
@@ -2135,6 +2191,7 @@ mod tests {
             settlement_confirmations: 10,
             invoice_ttl_seconds: 3600,
             scan_interval_seconds: 10,
+            scanner_subaddress_batch_size: crate::config::DEFAULT_SCANNER_SUBADDRESS_BATCH_SIZE,
             webhook_poll_interval_seconds: 5,
             subaddress_monitor_days: 0,
             log_format: LogFormat::Json,
@@ -2823,6 +2880,7 @@ mod tests {
         let scanner = ScannerService::new(repo.clone(), rpc, cfg.clone());
         let dispatcher = crate::services::webhook::WebhookDispatcher::new(
             repo.clone(),
+            cfg.webhook_secret.clone(),
             cfg.enable_auto_sweep,
             Duration::from_secs(5),
             cfg.webhook_url_policy(),
@@ -3344,5 +3402,188 @@ mod tests {
             ),
             "expected AmountOverflow for pool transfer sum overflow, got: {pool_err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn scanner_batches_get_transfers_and_fails_closed_on_partial_batch_error() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use wiremock::{Request as WireRequest, Respond};
+
+        let pool = init_sqlite_pool("sqlite::memory:").await.unwrap();
+        let repo = InvoiceRepository::new(pool);
+        let mock_rpc = MockServer::start().await;
+
+        // Create 5 monitored invoices across subaddress indices 1..=5 with batch_size = 2 -> 3 batches:
+        // [1, 2], [3, 4], [5]
+        let mut invoices = Vec::new();
+        for idx in 1_u32..=5 {
+            let inv = insertable_invoice(idx, 1_000_000_000_000, None);
+            repo.insert_invoice(&inv).await.unwrap();
+            invoices.push(inv);
+        }
+
+        let mut cfg_val = (*test_config(format!("{}/json_rpc", mock_rpc.uri()), false)).clone();
+        cfg_val.scanner_subaddress_batch_size = 2;
+        let cfg = Arc::new(cfg_val);
+        let rpc = MoneroRpcClient::new(&cfg.monero_rpc_url, None, None).unwrap();
+        let scanner = ScannerService::new(repo.clone(), rpc, cfg);
+
+        type RecordedBatches = Arc<std::sync::Mutex<Vec<(u32, Vec<u32>)>>>;
+
+        let recorded_batches: RecordedBatches = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fail_second_batch = Arc::new(AtomicBool::new(false));
+
+        struct BatchTransferResponder {
+            recorded_batches: RecordedBatches,
+            fail_second_batch: Arc<AtomicBool>,
+        }
+
+        impl Respond for BatchTransferResponder {
+            fn respond(&self, request: &WireRequest) -> ResponseTemplate {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["method"], "get_transfers");
+                let acct = u32::try_from(body["params"]["account_index"].as_u64().unwrap())
+                    .expect("account_index u32");
+                let indices: Vec<u32> = body["params"]["subaddr_indices"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| u32::try_from(v.as_u64().unwrap()).unwrap())
+                    .collect();
+
+                self.recorded_batches
+                    .lock()
+                    .unwrap()
+                    .push((acct, indices.clone()));
+
+                if self.fail_second_batch.load(Ordering::SeqCst) && indices == vec![3, 4] {
+                    return ResponseTemplate::new(500).set_body_string("simulated rpc batch error");
+                }
+
+                // Include:
+                // - Single-subaddress txs for indices 1, 4, 5
+                // - A cross-batch multi-subaddress tx paying BOTH subaddr 2 (batch 1) and subaddr 3 (batch 2)
+                //   to prove disjoint chunk merging never double-counts!
+                let mut in_entries = Vec::new();
+                if indices.contains(&1) {
+                    in_entries.push(serde_json::json!({
+                        "txid": "1".repeat(64),
+                        "amount": 1_000_000_000_000_u64,
+                        "confirmations": 5,
+                        "double_spend_seen": false,
+                        "locked": true,
+                        "subaddr_index": { "major": 0, "minor": 1 }
+                    }));
+                }
+                if indices.contains(&2) || indices.contains(&3) {
+                    in_entries.push(serde_json::json!({
+                        "txid": "2".repeat(64),
+                        "amount": 2_000_000_000_000_u64,
+                        "amounts": [1_000_000_000_000_u64, 1_000_000_000_000_u64],
+                        "confirmations": 5,
+                        "double_spend_seen": false,
+                        "locked": true,
+                        "subaddr_index": { "major": 0, "minor": 2 },
+                        "subaddr_indices": [
+                            { "major": 0, "minor": 2 },
+                            { "major": 0, "minor": 3 }
+                        ]
+                    }));
+                }
+                if indices.contains(&4) {
+                    in_entries.push(serde_json::json!({
+                        "txid": "4".repeat(64),
+                        "amount": 1_000_000_000_000_u64,
+                        "confirmations": 5,
+                        "double_spend_seen": false,
+                        "locked": true,
+                        "subaddr_index": { "major": 0, "minor": 4 }
+                    }));
+                }
+                if indices.contains(&5) {
+                    in_entries.push(serde_json::json!({
+                        "txid": "5".repeat(64),
+                        "amount": 1_000_000_000_000_u64,
+                        "confirmations": 5,
+                        "double_spend_seen": false,
+                        "locked": true,
+                        "subaddr_index": { "major": 0, "minor": 5 }
+                    }));
+                }
+
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "1",
+                    "result": {
+                        "in": in_entries,
+                        "pool": []
+                    }
+                }))
+            }
+        }
+
+        Mock::given(method("POST"))
+            .and(path("/json_rpc"))
+            .and(body_string_contains("get_transfers"))
+            .respond_with(BatchTransferResponder {
+                recorded_batches: recorded_batches.clone(),
+                fail_second_batch: fail_second_batch.clone(),
+            })
+            .mount(&mock_rpc)
+            .await;
+
+        // 1) Normal scan: 5 invoices / batch_size 2 -> strictly 3 RPC calls ([1,2], [3,4], [5])
+        let report = scanner.scan_once().await.unwrap();
+        assert_eq!(report.invoices_scanned, 5);
+        assert_eq!(report.status_transitions, 5);
+
+        let batches = recorded_batches.lock().unwrap().clone();
+        assert_eq!(
+            batches,
+            vec![(0, vec![1, 2]), (0, vec![3, 4]), (0, vec![5])]
+        );
+
+        for inv in &invoices {
+            let loaded = repo.get_invoice_by_id(inv.id).await.unwrap().unwrap();
+            assert_eq!(loaded.status, InvoiceStatus::Confirmed);
+            assert_eq!(
+                loaded.received_piconero,
+                Piconero(1_000_000_000_000),
+                "subaddr {} must not double-count cross-batch tx",
+                inv.address_index
+            );
+        }
+
+        // 2) Partial batch failure (batch 2 returns HTTP 500): scan_once MUST fail closed BEFORE
+        //    mutating any invoice or falsely orphaning transfers from batch 2 or unread batch 3!
+        recorded_batches.lock().unwrap().clear();
+        fail_second_batch.store(true, Ordering::SeqCst);
+
+        let err = scanner.scan_once().await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                GatewayError::RpcTransport(_) | GatewayError::Rpc { .. }
+            ),
+            "expected RPC error on partial batch failure, got: {err:?}"
+        );
+
+        // Batch 3 ([5]) was never even mutated; ALL 5 invoices stay CONFIRMED with 0 orphaned txs!
+        for inv in &invoices {
+            let loaded = repo.get_invoice_by_id(inv.id).await.unwrap().unwrap();
+            assert_eq!(
+                loaded.status,
+                InvoiceStatus::Confirmed,
+                "invoice on subaddr {} must NOT be falsely reorged on partial batch error",
+                inv.address_index
+            );
+            let transfers = repo.list_transfers_for_invoice(inv.id).await.unwrap();
+            assert_eq!(transfers.len(), 1);
+            assert!(
+                !transfers[0].orphaned,
+                "transfer on subaddr {} must NOT be falsely orphaned on partial batch error",
+                inv.address_index
+            );
+        }
     }
 }

@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to package (e.g. v0.1.2; defaults to Cargo.toml version)"
+        description: "Release tag to package (e.g. v0.1.3; defaults to Cargo.toml version)"
         required: false
         default: ""
       dry_run:
@@ -111,7 +111,7 @@ jobs:
           cp admin.sh start.sh .env.example CHANGELOG.md README.md README_RU.md DEPLOY_EN.md DEPLOY_RU.md LICENSE "${STAGE_DIR}/"
           cp -a admin deploy scripts "${STAGE_DIR}/"
           rm -f "${STAGE_DIR}/admin/test_admin.sh"
-          chmod 0755 "${STAGE_DIR}/xmr-gateway" "${STAGE_DIR}/admin.sh" "${STAGE_DIR}/start.sh" "${STAGE_DIR}/scripts/install.sh"
+          chmod 0755 "${STAGE_DIR}/xmr-gateway" "${STAGE_DIR}/admin.sh" "${STAGE_DIR}/start.sh" "${STAGE_DIR}/scripts/install.sh" "${STAGE_DIR}/deploy/systemd/render-wallet-rpc-conf.sh"
           tar -C stage -czf "release-artifacts/${BUNDLE_NAME}.tar.gz" "${BUNDLE_NAME}"
 
           # 2) Debian package (.deb)

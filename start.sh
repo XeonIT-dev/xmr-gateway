@@ -106,14 +106,34 @@ trap cleanup EXIT
 set_env_kv() {
     local key="$1"
     local value="$2"
-    if grep -q "^${key}=" "$ENV_FILE"; then
+    local env_dir had_existing=0 orig_owner=""
+    env_dir="$(dirname "$ENV_FILE")"
+    if [[ -f "$ENV_FILE" ]]; then
+        had_existing=1
+        if [[ "$(id -u)" -eq 0 ]]; then
+            orig_owner="$(stat -c '%u:%g' "$ENV_FILE" 2>/dev/null || true)"
+        fi
+    fi
+    if [[ "$had_existing" -eq 1 ]] && grep -q "^${key}=" "$ENV_FILE"; then
         local tmp_env
-        tmp_env="$(mktemp)"
+        tmp_env="$(mktemp "${env_dir}/.env.tmp.XXXXXX")"
+        chmod 600 "$tmp_env"
         awk -v k="$key" -v v="$value" '
             index($0, k "=") == 1 { print k "=" v; next }
             { print }
         ' "$ENV_FILE" > "$tmp_env"
+        if [[ "$(id -u)" -eq 0 ]]; then
+            if ! chown --reference="$ENV_FILE" "$tmp_env" 2>/dev/null; then
+                if [[ -n "$orig_owner" ]]; then
+                    chown "$orig_owner" "$tmp_env"
+                fi
+            fi
+        fi
+        chmod 600 "$tmp_env"
         mv "$tmp_env" "$ENV_FILE"
+        if [[ "$ENV_FILE" == "/etc/xmr-gateway/.env" ]] && command -v restorecon >/dev/null 2>&1; then
+            restorecon "$ENV_FILE" 2>/dev/null || true
+        fi
     else
         printf '\n%s=%s\n' "$key" "$value" >> "$ENV_FILE"
     fi

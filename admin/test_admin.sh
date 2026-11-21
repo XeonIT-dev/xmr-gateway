@@ -94,6 +94,7 @@ ALL_SCRIPTS=(
     "$REPO_ROOT/admin/dev.sh"
     "$REPO_ROOT/admin/test_admin.sh"
     "$REPO_ROOT/scripts/install.sh"
+    "$REPO_ROOT/deploy/systemd/render-wallet-rpc-conf.sh"
     "$REPO_ROOT/deploy/packaging/xmr-gateway-admin"
     "$REPO_ROOT/deploy/packaging/deb/postinst"
     "$REPO_ROOT/deploy/packaging/deb/prerm"
@@ -280,7 +281,7 @@ class MockHandler(BaseHTTPRequestHandler):
                 self._send(200, {
                     "status": "ok",
                     "service": "xmr-gateway",
-                    "version": "0.1.2",
+                    "version": "0.1.3",
                     "database": "connected",
                     "monero_rpc": {"connected": True, "version": 196619, "error": None},
                     "auto_sweep_enabled": False,
@@ -876,15 +877,15 @@ else
     fail "install.sh --help failed"
 fi
 
-DRY_DEB="$("$INSTALL_SH" --dry-run --method deb --version v0.1.2)"
-assert_contains "$DRY_DEB" "xmr-gateway_0.1.2_" "install.sh --dry-run --method deb computes .deb artifact"
+DRY_DEB="$("$INSTALL_SH" --dry-run --method deb --version v0.1.3)"
+assert_contains "$DRY_DEB" "xmr-gateway_0.1.3_" "install.sh --dry-run --method deb computes .deb artifact"
 assert_contains "$DRY_DEB" "SHA256SUMS" "install.sh --dry-run includes SHA256SUMS check"
 
-DRY_RPM="$("$INSTALL_SH" --dry-run --method rpm --version v0.1.2)"
-assert_contains "$DRY_RPM" "xmr-gateway-0.1.2-1." "install.sh --dry-run --method rpm computes .rpm artifact"
+DRY_RPM="$("$INSTALL_SH" --dry-run --method rpm --version v0.1.3)"
+assert_contains "$DRY_RPM" "xmr-gateway-0.1.3-1." "install.sh --dry-run --method rpm computes .rpm artifact"
 
-DRY_TAR="$("$INSTALL_SH" --dry-run --method tarball --version v0.1.2 --prefix /opt/xmr-custom --require-gpg)"
-assert_contains "$DRY_TAR" "xmr-gateway-v0.1.2-linux-" "install.sh --dry-run --method tarball computes tarball artifact"
+DRY_TAR="$("$INSTALL_SH" --dry-run --method tarball --version v0.1.3 --prefix /opt/xmr-custom --require-gpg)"
+assert_contains "$DRY_TAR" "xmr-gateway-v0.1.3-linux-" "install.sh --dry-run --method tarball computes tarball artifact"
 assert_contains "$DRY_TAR" "/opt/xmr-custom" "install.sh --dry-run --prefix applied"
 assert_contains "$DRY_TAR" "REQUIRED (SHA256SUMS.asc)" "install.sh --require-gpg reflected in plan"
 
@@ -1043,7 +1044,7 @@ else
     assert_contains "$HOT_DOC_JSON" "OPERATOR_API_KEY is required" "XMR-AUDIT-004: config doctor rejects hot_wallet without OPERATOR_API_KEY"
 fi
 
-# 10c) XMR-AUDIT-006: config doctor warns on mainnet cleartext public HTTP webhooks
+# 10c) XMR-AUDIT-006: config doctor FAILS CLOSED on mainnet cleartext public HTTP webhooks
 MAINNET_HTTP_ENV="$TMP_DIR/mainnet_http.env"
 cat > "$MAINNET_HTTP_ENV" <<EOF
 HOST=127.0.0.1
@@ -1066,8 +1067,20 @@ SETTLEMENT_CONFIRMATIONS=10
 SWEEP_PRIORITY=0
 EOF
 chmod 600 "$MAINNET_HTTP_ENV"
-MAINNET_DOC_JSON="$("$ADMIN_SH" --env "$MAINNET_HTTP_ENV" --json config doctor)"
-assert_contains "$MAINNET_DOC_JSON" "XMR-AUDIT-006" "XMR-AUDIT-006: config doctor warns on mainnet REQUIRE_HTTPS_WEBHOOKS=false"
+MAINNET_DOC_JSON=""
+if MAINNET_DOC_JSON="$("$ADMIN_SH" --env "$MAINNET_HTTP_ENV" --json config doctor 2>&1)"; then
+    fail "XMR-AUDIT-006: config doctor MUST fail closed on mainnet ALLOW_PRIVATE_WEBHOOKS=false + REQUIRE_HTTPS_WEBHOOKS=false"
+else
+    assert_contains "$MAINNET_DOC_JSON" '"status": "FAIL"' "XMR-AUDIT-006: config doctor reports FAIL on mainnet public HTTP webhooks"
+    assert_contains "$MAINNET_DOC_JSON" "XMR-AUDIT-006" "XMR-AUDIT-006: config doctor cites mainnet HTTPS policy failure"
+fi
+
+# When REQUIRE_HTTPS_WEBHOOKS is omitted on mainnet + ALLOW_PRIVATE_WEBHOOKS=false, default is true (PASS)
+MAINNET_DEF_ENV="$TMP_DIR/mainnet_default_https.env"
+grep -v '^REQUIRE_HTTPS_WEBHOOKS=' "$MAINNET_HTTP_ENV" > "$MAINNET_DEF_ENV"
+chmod 600 "$MAINNET_DEF_ENV"
+MAINNET_DEF_DOC="$("$ADMIN_SH" --env "$MAINNET_DEF_ENV" --json config doctor)"
+assert_contains "$MAINNET_DEF_DOC" 'REQUIRE_HTTPS_WEBHOOKS=true' "mainnet with omitted REQUIRE_HTTPS_WEBHOOKS defaults to true in config doctor"
 
 # 10d) XMR-AUDIT-003: verify start.sh fail-closed JSON parser logic across RPC responses
 python3 - "$REPO_ROOT/start.sh" <<'PYEOF'
@@ -1130,23 +1143,31 @@ import glob, os, re, sys, tomllib
 
 repo = sys.argv[1]
 
-# 1) No unescaped printf-style %s/%d specifiers in deploy/systemd/*.service
+# 1) No unescaped printf-style %s/%d specifiers OR inline ${...} env expansion in ExecStart* of deploy/systemd/*.service
 for svc in sorted(glob.glob(os.path.join(repo, "deploy/systemd/*.service"))):
     raw = open(svc, encoding="utf-8").read()
-    # Replace escaped %% first; any remaining %s inside Exec* lines is a systemd specifier bug!
     cleaned = raw.replace("%%", "")
     for idx, line in enumerate(cleaned.splitlines(), 1):
-        if line.strip().startswith("#"):
+        stripped = line.strip()
+        if stripped.startswith("#"):
             continue
         assert "%s" not in line, f"Unescaped %s specifier in {svc}:{idx}: {line}"
+        if stripped.startswith("ExecStart"):
+            assert "${" not in line and "$" not in line, (
+                f"Inline shell variable expansion forbidden in systemd ExecStart* ({svc}:{idx}): {line}"
+            )
+            assert "%" not in line, (
+                f"Inline % specifier forbidden in systemd ExecStart* ({svc}:{idx}): {line}"
+            )
 
-# 2) Packaging includes start.sh, CHANGELOG.md, and all 4 Quadlet units
+# 2) Packaging includes start.sh, render-wallet-rpc-conf.sh (0755), CHANGELOG.md, and all 4 Quadlet units
 with open(os.path.join(repo, "Cargo.toml"), "rb") as f:
     cargo = tomllib.load(f)
-deb_sources = {e[0] for e in cargo["package"]["metadata"]["deb"]["assets"]}
-rpm_sources = {e["source"] for e in cargo["package"]["metadata"]["generate-rpm"]["assets"]}
+deb_assets = {e[0]: (e[1], e[2]) for e in cargo["package"]["metadata"]["deb"]["assets"]}
+rpm_assets = {e["source"]: (e["dest"], e["mode"]) for e in cargo["package"]["metadata"]["generate-rpm"]["assets"]}
 required_assets = {
     "start.sh",
+    "deploy/systemd/render-wallet-rpc-conf.sh",
     "CHANGELOG.md",
     "deploy/podman/quadlet/xmr-gateway-internal.network",
     "deploy/podman/quadlet/xmr-gateway-egress.network",
@@ -1154,12 +1175,22 @@ required_assets = {
     "deploy/podman/quadlet/xmr-gateway.container",
 }
 for req in required_assets:
-    assert req in deb_sources, f"Missing {req} in deb assets"
-    assert req in rpm_sources, f"Missing {req} in rpm assets"
+    assert req in deb_assets, f"Missing {req} in deb assets"
+    assert req in rpm_assets, f"Missing {req} in rpm assets"
     assert os.path.isfile(os.path.join(repo, req)), f"Required packaged file missing on disk: {req}"
+
+assert deb_assets["deploy/systemd/render-wallet-rpc-conf.sh"] == (
+    "usr/share/xmr-gateway/scripts/render-wallet-rpc-conf.sh",
+    "755",
+), f"Unexpected deb mapping for render-wallet-rpc-conf.sh: {deb_assets['deploy/systemd/render-wallet-rpc-conf.sh']}"
+assert rpm_assets["deploy/systemd/render-wallet-rpc-conf.sh"] == (
+    "/usr/share/xmr-gateway/scripts/render-wallet-rpc-conf.sh",
+    "0755",
+), f"Unexpected rpm mapping for render-wallet-rpc-conf.sh: {rpm_assets['deploy/systemd/render-wallet-rpc-conf.sh']}"
 
 rel_yml = open(os.path.join(repo, ".github/workflows/release.yml"), encoding="utf-8").read()
 assert "start.sh" in rel_yml, "release.yml tarball stage must include start.sh"
+assert "render-wallet-rpc-conf.sh" in rel_yml, "release.yml tarball stage must enforce 0755 on render-wallet-rpc-conf.sh"
 
 # 3) Quadlet networking, volume isolation, stop timeout, and healthcheck
 rpc_q = open(os.path.join(repo, "deploy/podman/quadlet/monero-wallet-rpc.container"), encoding="utf-8").read()
@@ -1249,55 +1280,28 @@ assert_contains "$TAR_NEXT_STEPS" "/home/tester/xmr-app/admin.sh" "install.sh ta
 assert_not_contains "$TAR_NEXT_STEPS" "/etc/xmr-gateway/.env" "install.sh tarball next-steps does not print systemd /etc/xmr-gateway path"
 
 # ==============================================================================
-# 12. Real Runtime Regression Tests (v0.1.2: ExecStartPre, Containerfile,
-#     setup-rpc target/umask, RPM/DEB DB/wallet path & restore height)
+# 12. Real Runtime Regression Tests (render-wallet-rpc-conf, Containerfile,
+#     setup-rpc target/umask, RPM/DEB paths, SELinux .env, timestamped webhooks)
 # ==============================================================================
 printf '\n=== 12. Runtime Regression Tests (ExecStartPre, Containerfile, setup-rpc, paths) ===\n'
 
-# 12a) Real /bin/sh -ec execution of ExecStartPre extracted from monero-wallet-rpc.service
-python3 - "$REPO_ROOT/deploy/systemd/monero-wallet-rpc.service" "$TMP_DIR" <<'PYEOF'
-import os, re, stat, subprocess, sys
+# 12a) Real /bin/sh execution of standalone deploy/systemd/render-wallet-rpc-conf.sh
+#      + verification that monero-wallet-rpc.service delegates cleanly without inline ${...}
+python3 - "$REPO_ROOT/deploy/systemd/monero-wallet-rpc.service" "$REPO_ROOT/deploy/systemd/render-wallet-rpc-conf.sh" "$TMP_DIR" <<'PYEOF'
+import os, stat, subprocess, sys
 
-unit_path, tmp_dir = sys.argv[1], sys.argv[2]
-raw = open(unit_path, encoding="utf-8").read()
+unit_path, helper_path, tmp_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+unit_raw = open(unit_path, encoding="utf-8").read()
 
-# Reconstruct systemd line continuations (`\\\n`) on ExecStartPre=
-lines = raw.splitlines()
-exec_pre_parts = []
-collecting = False
-for line in lines:
-    if not collecting:
-        if line.startswith("ExecStartPre="):
-            collecting = True
-            chunk = line[len("ExecStartPre="):]
-        else:
-            continue
-    else:
-        chunk = line
-    if chunk.endswith("\\"):
-        exec_pre_parts.append(chunk[:-1])
-    else:
-        exec_pre_parts.append(chunk)
-        break
-
-assert exec_pre_parts, "ExecStartPre= not found in monero-wallet-rpc.service"
-exec_pre_raw = "".join(exec_pre_parts)
-
-# Verify no single unescaped % remains after stripping %% (systemd specifier rule)
-assert "%" not in exec_pre_raw.replace("%%", ""), f"Unescaped single % found in ExecStartPre: {exec_pre_raw}"
-
-# Unescape %% -> % exactly as systemd does before invoking /bin/sh -ec '...'
-exec_pre_expanded = exec_pre_raw.replace("%%", "%")
-m = re.match(r"^/bin/sh\s+-ec\s+'(.*)'\s*$", exec_pre_expanded, re.S)
-assert m is not None, f"Unexpected ExecStartPre format: {exec_pre_expanded}"
-sh_script = m.group(1)
+expected_exec_pre = "ExecStartPre=/usr/share/xmr-gateway/scripts/render-wallet-rpc-conf.sh /run/xmr-gateway/wallet-rpc.conf"
+assert expected_exec_pre in unit_raw, f"monero-wallet-rpc.service missing expected ExecStartPre: {expected_exec_pre}"
+assert os.access(helper_path, os.X_OK), f"{helper_path} must be executable (0755)"
 
 run_dir = os.path.join(tmp_dir, "systemd_run_xmr")
 os.makedirs(run_dir, mode=0o700, exist_ok=True)
-sh_script_local = sh_script.replace("/run/xmr-gateway", run_dir)
 conf_path = os.path.join(run_dir, "wallet-rpc.conf")
 
-# Positive runtime test: valid credentials + stagenet default remote node
+# Positive runtime test 1: valid credentials + stagenet default remote node
 env_ok = {
     "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
     "MONERO_RPC_USER": "u",
@@ -1305,9 +1309,9 @@ env_ok = {
     "MONERO_NETWORK": "stagenet",
     "MONERO_REMOTE_NODE": "",
 }
-res_ok = subprocess.run(["/bin/sh", "-ec", sh_script_local], env=env_ok, capture_output=True, text=True)
-assert res_ok.returncode == 0, f"ExecStartPre positive case failed (rc={res_ok.returncode}): {res_ok.stderr}"
-assert os.path.isfile(conf_path), "ExecStartPre did not create wallet-rpc.conf"
+res_ok = subprocess.run(["/bin/sh", helper_path, conf_path], env=env_ok, capture_output=True, text=True)
+assert res_ok.returncode == 0, f"render-wallet-rpc-conf.sh positive case failed (rc={res_ok.returncode}): {res_ok.stderr}"
+assert os.path.isfile(conf_path), "render-wallet-rpc-conf.sh did not create wallet-rpc.conf"
 mode = stat.S_IMODE(os.stat(conf_path).st_mode)
 assert mode == 0o600, f"wallet-rpc.conf mode expected 0600, got {oct(mode)}"
 conf_body = open(conf_path, encoding="utf-8").read()
@@ -1315,6 +1319,23 @@ assert "rpc-login=u:secret123\n" in conf_body, f"Missing rpc-login in conf: {con
 assert "daemon-address=node.monerodevs.org:38089\n" in conf_body, f"Missing stagenet daemon-address: {conf_body!r}"
 assert "stagenet=1\n" in conf_body, f"Missing stagenet=1: {conf_body!r}"
 assert "untrusted-daemon=1\n" in conf_body, f"Missing untrusted-daemon=1: {conf_body!r}"
+
+# Positive runtime test 2: mainnet + trusted daemon + SOCKS5 proxy
+env_main = {
+    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+    "MONERO_RPC_USER": "xmr_user",
+    "MONERO_RPC_PASS": "s3cr3t$%pass!1234",
+    "MONERO_NETWORK": "mainnet",
+    "MONERO_TRUSTED_DAEMON": "true",
+    "MONERO_RPC_PROXY": "127.0.0.1:9050",
+}
+res_main = subprocess.run(["/bin/sh", helper_path, conf_path], env=env_main, capture_output=True, text=True)
+assert res_main.returncode == 0, f"mainnet positive case failed: {res_main.stderr}"
+main_body = open(conf_path, encoding="utf-8").read()
+assert "rpc-login=xmr_user:s3cr3t$%pass!1234\n" in main_body
+assert "daemon-address=xmr-node.cakewallet.com:18081\n" in main_body
+assert "trusted-daemon=1\n" in main_body
+assert "proxy=127.0.0.1:9050\n" in main_body
 
 # Negative runtime tests: real \n and \r in credentials MUST fail closed
 for label, bad_user, bad_pass in (
@@ -1325,11 +1346,17 @@ for label, bad_user, bad_pass in (
     env_bad = dict(env_ok)
     env_bad["MONERO_RPC_USER"] = bad_user
     env_bad["MONERO_RPC_PASS"] = bad_pass
-    res_bad = subprocess.run(["/bin/sh", "-ec", sh_script_local], env=env_bad, capture_output=True, text=True)
-    assert res_bad.returncode != 0, f"ExecStartPre MUST fail closed for {label}"
+    res_bad = subprocess.run(["/bin/sh", helper_path, conf_path], env=env_bad, capture_output=True, text=True)
+    assert res_bad.returncode != 0, f"render-wallet-rpc-conf.sh MUST fail closed for {label}"
     assert "newlines" in res_bad.stderr.lower(), f"Expected newline error for {label}, got: {res_bad.stderr!r}"
+
+# Negative runtime test: empty password MUST fail closed
+env_empty = dict(env_ok)
+env_empty["MONERO_RPC_PASS"] = ""
+res_empty = subprocess.run(["/bin/sh", helper_path, conf_path], env=env_empty, capture_output=True, text=True)
+assert res_empty.returncode != 0, "render-wallet-rpc-conf.sh MUST reject empty MONERO_RPC_PASS"
 PYEOF
-pass "Runtime test: systemd monero-wallet-rpc.service ExecStartPre succeeds on valid creds & rejects LF/CR"
+pass "Runtime test: deploy/systemd/render-wallet-rpc-conf.sh succeeds on valid creds (incl. $/%) & rejects LF/CR/empty"
 
 # 12b) Real /bin/sh execution of entrypoint-monero-rpc.sh extracted from Containerfile.monero-rpc
 python3 - "$REPO_ROOT/deploy/docker/Containerfile.monero-rpc" "$TMP_DIR" <<'PYEOF'
@@ -1493,6 +1520,34 @@ sed -i 's/^MONERO_NETWORK=stagenet$/MONERO_NETWORK=testnet/' "$TESTNET_NODE_ENV"
 TESTNET_SHOW_JSON="$("$ADMIN_SH" --env "$TESTNET_NODE_ENV" --json config show)"
 assert_contains "$TESTNET_SHOW_JSON" '"monero_remote_node": "testnet.xmr-tw.org:28081"' "testnet auto-selects testnet default MONERO_REMOTE_NODE"
 assert_contains "$TESTNET_SHOW_JSON" '"wallet_restore_height": "2600000"' "testnet auto-selects default WALLET_RESTORE_HEIGHT=2600000 when empty"
+
+# 12e) SELinux-safe same-directory atomic .env rewrite + timestamped webhook verify-sig
+SELINUX_ENV_DIR="$TMP_DIR/selinux_env_dir"
+mkdir -p "$SELINUX_ENV_DIR"
+SELINUX_ENV_FILE="$SELINUX_ENV_DIR/.env"
+printf 'API_SECRET_KEY=old_val\nWEBHOOK_SECRET=%s\n' "$WH_SECRET" > "$SELINUX_ENV_FILE"
+chmod 600 "$SELINUX_ENV_FILE"
+bash -c '
+    set -euo pipefail
+    source "$1"
+    set_env_kv_file "$2" "API_SECRET_KEY" "new_val_12345"
+' _ "$REPO_ROOT/admin/lib/common.sh" "$SELINUX_ENV_FILE"
+assert_eq "$(stat -c '%a' "$SELINUX_ENV_FILE")" "600" "set_env_kv_file preserves 0600 permissions"
+assert_contains "$(cat "$SELINUX_ENV_FILE")" "API_SECRET_KEY=new_val_12345" "set_env_kv_file updates target key atomically in same directory"
+if grep -q '\.env\.tmp\.XXXXXX' "$REPO_ROOT/admin/lib/common.sh" \
+    && grep -q 'restorecon' "$REPO_ROOT/admin/lib/common.sh" \
+    && grep -q '\.env\.tmp\.XXXXXX' "$REPO_ROOT/start.sh"; then
+    pass "set_env_kv_file and start.sh use same-directory mktemp + restorecon for SELinux etc_t preservation"
+else
+    fail "missing same-directory mktemp or restorecon in common.sh / start.sh"
+fi
+
+# Verify timestamped X-Webhook-Signature support in `webhooks verify-sig --timestamp`
+TS_NOW="$(date +%s)"
+TS_SIG="$(python3 -c 'import hashlib,hmac,sys; print(hmac.new(sys.argv[1].encode(), f"{sys.argv[2]}.".encode() + open(sys.argv[3],"rb").read(), hashlib.sha256).hexdigest())' "$WH_SECRET" "$TS_NOW" "$PAYLOAD_FILE")"
+TS_VER_OUT="$("$ADMIN_SH" --env "$TEST_ENV" --json webhooks verify-sig "$TS_SIG" "$PAYLOAD_FILE" --timestamp "$TS_NOW")"
+assert_contains "$TS_VER_OUT" '"valid": true' "webhooks verify-sig --timestamp validates X-Webhook-Signature"
+assert_contains "$TS_VER_OUT" '"header": "X-Webhook-Signature"' "webhooks verify-sig --timestamp reports X-Webhook-Signature header"
 
 printf '\n====================================================================\n'
 printf 'Admin Test Summary: %d PASSED, %d FAILED\n' "$PASS_COUNT" "$FAIL_COUNT"

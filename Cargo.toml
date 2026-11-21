@@ -1,6 +1,6 @@
 [package]
 name = "xmr-gateway"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.94"
 authors = ["xmr-gateway contributors"]
@@ -108,6 +108,7 @@ assets = [
     ["DEPLOY_RU.md", "usr/share/doc/xmr-gateway/DEPLOY_RU.md", "644"],
     ["LICENSE", "usr/share/doc/xmr-gateway/LICENSE", "644"],
     [".env.example", "etc/xmr-gateway/env.example", "640"],
+    ["deploy/systemd/render-wallet-rpc-conf.sh", "usr/share/xmr-gateway/scripts/render-wallet-rpc-conf.sh", "755"],
     ["deploy/systemd/xmr-gateway.service", "usr/lib/systemd/system/xmr-gateway.service", "644"],
     ["deploy/systemd/monero-wallet-rpc.service", "usr/lib/systemd/system/monero-wallet-rpc.service", "644"],
     ["deploy/systemd/xmr-gateway-backup.service", "usr/lib/systemd/system/xmr-gateway-backup.service", "644"],
@@ -149,6 +150,7 @@ assets = [
     { source = "DEPLOY_RU.md", dest = "/usr/share/doc/xmr-gateway/DEPLOY_RU.md", mode = "0644", doc = true },
     { source = "LICENSE", dest = "/usr/share/doc/xmr-gateway/LICENSE", mode = "0644", doc = true },
     { source = ".env.example", dest = "/etc/xmr-gateway/env.example", mode = "0640", config = true },
+    { source = "deploy/systemd/render-wallet-rpc-conf.sh", dest = "/usr/share/xmr-gateway/scripts/render-wallet-rpc-conf.sh", mode = "0755" },
     { source = "deploy/systemd/xmr-gateway.service", dest = "/usr/lib/systemd/system/xmr-gateway.service", mode = "0644" },
     { source = "deploy/systemd/monero-wallet-rpc.service", dest = "/usr/lib/systemd/system/monero-wallet-rpc.service", mode = "0644" },
     { source = "deploy/systemd/xmr-gateway-backup.service", dest = "/usr/lib/systemd/system/xmr-gateway-backup.service", mode = "0644" },

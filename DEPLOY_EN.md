@@ -29,15 +29,15 @@ sudo bash install.sh
 Common options:
 ```bash
 # Pin method and release version:
-sudo bash install.sh --method deb --version v0.1.2
-sudo bash install.sh --method rpm --version v0.1.2
-sudo bash install.sh --method tarball --prefix /opt/xmr-gateway --version v0.1.2
+sudo bash install.sh --method deb --version v0.1.3
+sudo bash install.sh --method rpm --version v0.1.3
+sudo bash install.sh --method tarball --prefix /opt/xmr-gateway --version v0.1.3
 
 # Unprivileged tarball install into your home directory (no sudo required):
-bash install.sh --method tarball --prefix "$HOME/xmr-gateway" --version v0.1.2
+bash install.sh --method tarball --prefix "$HOME/xmr-gateway" --version v0.1.3
 
 # Enforce fail-closed GPG verification of SHA256SUMS.asc:
-sudo bash install.sh --version v0.1.2 --gpg-key ./RELEASE_SIGNING_KEY.asc --require-gpg
+sudo bash install.sh --version v0.1.3 --gpg-key ./RELEASE_SIGNING_KEY.asc --require-gpg
 ```
 
 ### 2.2. Manual Cryptographic Release Verification
@@ -51,7 +51,7 @@ gpg --import RELEASE_SIGNING_KEY.asc
 gpg --verify SHA256SUMS.asc SHA256SUMS
 
 # 3. Verify GitHub Build Provenance Attestation (requires GitHub CLI `gh`)
-gh attestation verify xmr-gateway_0.1.2_amd64.deb --owner XeonIT-dev
+gh attestation verify xmr-gateway_0.1.3_amd64.deb --owner XeonIT-dev
 ```
 
 ---
@@ -61,16 +61,16 @@ gh attestation verify xmr-gateway_0.1.2_amd64.deb --owner XeonIT-dev
 ### 3.1. Installing `.deb` or `.rpm`
 ```bash
 # Debian / Ubuntu:
-sudo apt-get install -y ./xmr-gateway_0.1.2_amd64.deb
+sudo apt-get install -y ./xmr-gateway_0.1.3_amd64.deb
 
 # Fedora / RHEL / Rocky:
-sudo dnf install -y ./xmr-gateway-0.1.2-1.x86_64.rpm
+sudo dnf install -y ./xmr-gateway-0.1.3-1.x86_64.rpm
 ```
 The package automatically:
 - creates system group & user `xmr-gateway` (`/usr/sbin/nologin`);
 - creates `/var/lib/xmr-gateway`, `/var/lib/xmr-gateway/wallet`, `/var/lib/xmr-gateway/backups` (`0700`, `xmr-gateway:xmr-gateway`) and `/etc/xmr-gateway` (`0750`, `root:xmr-gateway`);
 - seeds `/etc/xmr-gateway/.env` (`0600`) from `/etc/xmr-gateway/env.example` **only if it does not already exist** (upgrades never overwrite your `.env`!);
-- installs `/usr/bin/xmr-gateway`, `/usr/bin/xmr-gateway-admin` (`/usr/share/xmr-gateway/`, including `start.sh`), and hardened units in `/usr/lib/systemd/system/`.
+- installs `/usr/bin/xmr-gateway`, `/usr/bin/xmr-gateway-admin`, `/usr/share/xmr-gateway/` (including `start.sh` and `scripts/render-wallet-rpc-conf.sh` `0755`), and hardened units in `/usr/lib/systemd/system/`.
 
 ### 3.2. Configuring `/etc/xmr-gateway/.env` & Wallet Initialization
 1. Generate all 4 fresh distinct secrets (`API_SECRET_KEY`, `OPERATOR_API_KEY`, `WEBHOOK_SECRET`, `MONERO_RPC_PASS`):
@@ -111,7 +111,7 @@ sudo systemctl enable --now xmr-gateway-backup.timer   # daily 0600 online SQLit
 sudo systemctl status monero-wallet-rpc.service xmr-gateway.service xmr-gateway-backup.timer
 sudo -u xmr-gateway xmr-gateway-admin --env /etc/xmr-gateway/.env dev health-rbac
 ```
-> **Systemd hardening highlights:** `monero-wallet-rpc.service` renders `/run/xmr-gateway/wallet-rpc.conf` (`0600`, RAM-only via `RuntimeDirectory=xmr-gateway`) so `MONERO_RPC_PASS` never appears in `ps aux`. Both services enforce `UMask=0077`, `ProtectSystem=strict`, `NoNewPrivileges=true`, and `KillSignal=SIGTERM` / `TimeoutStopSec=30` so SQLite `PRAGMA wal_checkpoint(TRUNCATE)` finishes cleanly on stop.
+> **Systemd hardening highlights:** `monero-wallet-rpc.service` delegates `ExecStartPre` to `/usr/share/xmr-gateway/scripts/render-wallet-rpc-conf.sh` (`0755` POSIX helper) to render `/run/xmr-gateway/wallet-rpc.conf` (`0600`, RAM-only via `RuntimeDirectory=xmr-gateway`) so `MONERO_RPC_PASS` never appears in `ps aux`. Both services enforce `UMask=0077`, `ProtectSystem=strict`, `NoNewPrivileges=true`, and `KillSignal=SIGTERM` / `TimeoutStopSec=30` so SQLite `PRAGMA wal_checkpoint(TRUNCATE)` finishes cleanly on stop.
 
 ### 3.4. Reverse Proxy (Caddy / Nginx) & Firewall
 Production templates live in `deploy/reverse-proxy/` (and `/usr/share/xmr-gateway/reverse-proxy/` when installed via package):
@@ -237,10 +237,15 @@ loginctl enable-linger "$USER"
   1. Take a hot online backup: `sudo -u xmr-gateway xmr-gateway-admin db backup`.
   2. Install the new package (`apt-get install ./xmr-gateway_...deb` or `dnf upgrade ./xmr-gateway-...rpm`) — `/etc/xmr-gateway/.env` and `/var/lib/xmr-gateway/` are never overwritten or deleted.
   3. Restart & audit: `sudo systemctl restart xmr-gateway.service && sudo -u xmr-gateway xmr-gateway-admin db audit-invariants`.
-- **Secret Rotation:** `sudo -u xmr-gateway xmr-gateway-admin --env /etc/xmr-gateway/.env config rotate-keys all` (creates `0600` `.env.bak.<UTC>`), then `sudo systemctl restart monero-wallet-rpc.service xmr-gateway.service`.
+- **Secret Rotation & SELinux Context:** `sudo xmr-gateway-admin --env /etc/xmr-gateway/.env config rotate-keys all` (creates a `0600` `.env.bak.<UTC>` backup, writes atomically inside `/etc/xmr-gateway/`, preserves owner and `etc_t` SELinux label via `restorecon`), then `sudo systemctl restart monero-wallet-rpc.service xmr-gateway.service`.
 - **SQLite Backup Restore:** stop `xmr-gateway.service`, remove stale `xmr_gateway.db-wal` and `xmr_gateway.db-shm`, copy verified backup to `xmr_gateway.db` (`chmod 600`, `chown xmr-gateway:xmr-gateway`), run `xmr-gateway-admin db audit-invariants`, and start the service.
-- **Stagenet → Mainnet Cutover:** isolate `.env` and SQLite path, set `MONERO_NETWORK=mainnet`, `ALLOW_PRIVATE_WEBHOOKS=false`, `REQUIRE_HTTPS_WEBHOOKS=true` (leaving `REQUIRE_HTTPS_WEBHOOKS=false` on mainnet with `ALLOW_PRIVATE_WEBHOOKS=false` emits a startup & `config doctor` security warning), rotate distinct `API_SECRET_KEY`/`OPERATOR_API_KEY` (`OPERATOR_API_KEY` is strictly required for `WALLET_MODE=hot_wallet` / `ENABLE_AUTO_SWEEP=true`), and pass `config doctor` + `dev health-rbac`.
-- **Zero-Argv-Leak RPC & Unlocked Settlement:** systemd units, containers, `start.sh`, `admin/service.sh`, and `demo-stagenet.sh` all pass `monero-wallet-rpc` credentials via a `0600` `--config-file` (never `--rpc-login` in `argv`). `SETTLED`/`COMPLETED` finality requires unlocked covering outputs `>= invoice amount` at `>= SETTLEMENT_CONFIRMATIONS` (blocking custom `unlock_time` attacks while remaining immune to mempool dust DoS).
+- **Trust Model & Architectural Boundaries:**
+  - **Self-hosted, single-instance / single-merchant:** `xmr-gateway` runs without a third-party payment processor intermediary, using one SQLite WAL database and one `monero-wallet-rpc` wallet per instance (strictly enforced via `<db_path>.lock`).
+  - **View-only vs. hot-wallet:** In `WALLET_MODE=view_only` (recommended default), no private spend key resides on the host. In `WALLET_MODE=hot_wallet`, the spend key resides inside `monero-wallet-rpc` — keep only minimal operational transit balances, strictly isolate the host/RPC, require distinct `OPERATOR_API_KEY`, and sweep promptly to an offline/hardware `COLD_WALLET_ADDRESS`.
+  - **Opaque `order_id` without PII:** Never embed emails, usernames, or customer PII in `order_id` because it is persisted in operational logs, `monero:` URIs, and wallet labels.
+- **Webhook Verification Contract (Retries & Freshness):** Each delivery attempt (initial send, automatic backoff retry, and manual `webhooks retry`) emits a fresh Unix epoch `X-Webhook-Timestamp` and freshly computed `X-Webhook-Signature = HMAC-SHA256(WEBHOOK_SECRET, "{X-Webhook-Timestamp}.{raw_body}")`, while keeping `X-Webhook-Event-Id` (`payload.event_id`) and the JSON payload bytes immutable. Consumers should verify `abs(now - ts) <= 300s`, check `X-Webhook-Signature` in constant time, and deduplicate by `event_id` (legacy `X-Signature-256` is also sent).
+- **Stagenet → Mainnet Cutover:** isolate `.env` and SQLite path, set `MONERO_NETWORK=mainnet`, `ALLOW_PRIVATE_WEBHOOKS=false`, `REQUIRE_HTTPS_WEBHOOKS=true` (setting `REQUIRE_HTTPS_WEBHOOKS=false` with `ALLOW_PRIVATE_WEBHOOKS=false` on mainnet **fails closed** at startup and in `config doctor`), tune `SCANNER_SUBADDRESS_BATCH_SIZE=100` (`1..=1000`), rotate distinct `API_SECRET_KEY`/`OPERATOR_API_KEY` (`OPERATOR_API_KEY` is strictly required for `WALLET_MODE=hot_wallet` / `ENABLE_AUTO_SWEEP=true`), and pass `config doctor` + `dev health-rbac`.
+- **Zero-Argv-Leak RPC & Unlocked Settlement:** systemd units (`render-wallet-rpc-conf.sh`), containers, `start.sh`, `admin/service.sh`, and `demo-stagenet.sh` all pass `monero-wallet-rpc` credentials via a `0600` `--config-file` (never `--rpc-login` in `argv`). `SETTLED`/`COMPLETED` finality requires unlocked covering outputs `>= invoice amount` at `>= SETTLEMENT_CONFIRMATIONS` (blocking custom `unlock_time` attacks while remaining immune to mempool dust DoS).
 
 ---
 
@@ -259,13 +264,13 @@ Configure repository secrets:
 
 ### Cutting a New Release (3 Commands)
 ```bash
-# 1. Confirm Cargo.toml version matches the tag (e.g. 0.1.2) on up-to-date main:
+# 1. Confirm Cargo.toml version matches the tag (e.g. 0.1.3) on up-to-date main:
 git checkout main && git pull --ff-only
 
 # 2. Create a (signed) annotated tag:
-git tag -s v0.1.2 -m "Release v0.1.2"
+git tag -s v0.1.3 -m "Release v0.1.3"
 
 # 3. Push the tag to trigger the automated Release workflow:
-git push origin v0.1.2
+git push origin v0.1.3
 ```
 To test packaging end-to-end without publishing a release, trigger **Actions → Release → Run workflow** with `dry_run: true`.

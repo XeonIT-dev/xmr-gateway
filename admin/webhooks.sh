@@ -168,8 +168,26 @@ cmd_retry_invoice() {
 cmd_verify_sig() {
     load_env
     local sig_header="${1:-}"
-    local payload_src="${2:--}"
-    [[ -n "$sig_header" ]] || die "Usage: ./admin.sh webhooks verify-sig <signature_hex> [payload_file|-]"
+    local payload_src="-"
+    local ts_header=""
+    shift || true
+    if [[ $# -gt 0 && "$1" != "--timestamp" ]]; then
+        payload_src="$1"
+        shift || true
+    fi
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --timestamp)
+                [[ $# -ge 2 ]] || die "--timestamp requires a Unix timestamp value"
+                ts_header="$2"
+                shift 2
+                ;;
+            *)
+                die "Usage: ./admin.sh webhooks verify-sig <signature_hex> [payload_file|-] [--timestamp <unix_ts>]"
+                ;;
+        esac
+    done
+    [[ -n "$sig_header" ]] || die "Usage: ./admin.sh webhooks verify-sig <signature_hex> [payload_file|-] [--timestamp <unix_ts>]"
     [[ -n "${WEBHOOK_SECRET:-}" ]] || die "WEBHOOK_SECRET is not set in $ACTIVE_ENV_FILE."
 
     # Use `python3 -c` (not heredoc on stdin) so `payload_src == "-"` reads the caller's real stdin!
@@ -179,6 +197,7 @@ import hashlib, hmac, json, os, sys
 sig_header = sys.argv[1].strip().lower()
 payload_src = sys.argv[2]
 as_json = sys.argv[3] == "1"
+ts_header = sys.argv[4].strip()
 secret = os.environ["WEBHOOK_SECRET"].encode("utf-8")
 
 if payload_src == "-":
@@ -187,24 +206,33 @@ else:
     with open(payload_src, "rb") as f:
         raw_body = f.read()
 
-expected = hmac.new(secret, raw_body, hashlib.sha256).hexdigest()
+if ts_header:
+    signing_input = f"{ts_header}.".encode("utf-8") + raw_body
+    header_name = "X-Webhook-Signature"
+else:
+    signing_input = raw_body
+    header_name = "X-Signature-256"
+
+expected = hmac.new(secret, signing_input, hashlib.sha256).hexdigest()
 valid = hmac.compare_digest(expected, sig_header)
 
 if as_json:
     print(json.dumps({
         "valid": valid,
+        "header": header_name,
+        "timestamp": ts_header or None,
         "bytes_checked": len(raw_body),
         "presented_signature": sig_header,
         "expected_signature": expected if valid else None,
     }, indent=2))
 else:
     if valid:
-        print(f"VALID X-Signature-256 ({len(raw_body)} bytes verified)")
+        print(f"VALID {header_name} ({len(raw_body)} bytes verified)")
     else:
-        print(f"INVALID X-Signature-256 ({len(raw_body)} bytes checked)", file=sys.stderr)
+        print(f"INVALID {header_name} ({len(raw_body)} bytes checked)", file=sys.stderr)
 
 sys.exit(0 if valid else 1)
-' "$sig_header" "$payload_src" "$ADMIN_JSON"
+' "$sig_header" "$payload_src" "$ADMIN_JSON" "$ts_header"
 }
 
 cmd_test_receiver() {
@@ -216,11 +244,12 @@ cmd_test_receiver() {
 
     log_info "$(t webhooks.receiver_start "$port")"
     python3 -u - "$port" <<'PYEOF'
-import hashlib, hmac, json, os, sys
+import hashlib, hmac, json, os, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 port = int(sys.argv[1])
 secret = os.environ["WEBHOOK_SECRET"].encode("utf-8")
+MAX_SKEW_SECS = 300
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -229,21 +258,46 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length)
-        sig = self.headers.get("X-Signature-256", "").strip().lower()
+        wh_sig = self.headers.get("X-Webhook-Signature", "").strip().lower()
+        legacy_sig = self.headers.get("X-Signature-256", "").strip().lower()
         event_hdr = self.headers.get("X-Webhook-Event", "?")
-        delivery_id = self.headers.get("X-Delivery-Id", "?")
-        ts_hdr = self.headers.get("X-Webhook-Timestamp", "?")
-        expected = hmac.new(secret, raw, hashlib.sha256).hexdigest()
+        event_id = self.headers.get("X-Webhook-Event-Id") or self.headers.get("X-Delivery-Id", "?")
+        ts_hdr = self.headers.get("X-Webhook-Timestamp", "").strip()
 
-        if not hmac.compare_digest(expected, sig):
-            print(f"[REJECTED] {self.path} | event={event_hdr} | delivery={delivery_id} | invalid X-Signature-256", flush=True)
+        if wh_sig:
+            try:
+                ts_int = int(ts_hdr)
+            except ValueError:
+                print(f"[REJECTED] {self.path} | event={event_hdr} | event_id={event_id} | invalid X-Webhook-Timestamp={ts_hdr!r}", flush=True)
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error":"invalid timestamp"}')
+                return
+            if abs(int(time.time()) - ts_int) > MAX_SKEW_SECS:
+                print(f"[REJECTED] {self.path} | event={event_hdr} | event_id={event_id} | stale X-Webhook-Timestamp={ts_int}", flush=True)
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error":"stale timestamp"}')
+                return
+            expected = hmac.new(secret, f"{ts_hdr}.".encode("utf-8") + raw, hashlib.sha256).hexdigest()
+            sig_ok = hmac.compare_digest(expected, wh_sig)
+            sig_label = "X-Webhook-Signature"
+        else:
+            expected = hmac.new(secret, raw, hashlib.sha256).hexdigest()
+            sig_ok = hmac.compare_digest(expected, legacy_sig)
+            sig_label = "X-Signature-256"
+
+        if not sig_ok:
+            print(f"[REJECTED] {self.path} | event={event_hdr} | event_id={event_id} | invalid {sig_label}", flush=True)
             self.send_response(401)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(b'{"error":"invalid signature"}')
             return
 
-        print(f"[VERIFIED] {self.path} | event={event_hdr} | delivery={delivery_id} | ts={ts_hdr}", flush=True)
+        print(f"[VERIFIED {sig_label}] {self.path} | event={event_hdr} | event_id={event_id} | ts={ts_hdr}", flush=True)
         try:
             print(json.dumps(json.loads(raw.decode("utf-8")), indent=2), flush=True)
         except Exception:

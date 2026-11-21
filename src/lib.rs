@@ -106,6 +106,7 @@ mod integration_tests {
             settlement_confirmations: 10,
             invoice_ttl_seconds: 3600,
             scan_interval_seconds: 10,
+            scanner_subaddress_batch_size: crate::config::DEFAULT_SCANNER_SUBADDRESS_BATCH_SIZE,
             webhook_poll_interval_seconds: 5,
             subaddress_monitor_days: 0,
             log_format: LogFormat::Json,
@@ -127,6 +128,7 @@ mod integration_tests {
         let scanner = ScannerService::new(repo.clone(), rpc.clone(), cfg.clone());
         let dispatcher = WebhookDispatcher::new_with_policy(
             repo.clone(),
+            cfg.webhook_secret.clone(),
             cfg.enable_auto_sweep,
             Duration::from_secs(5),
             cfg.webhook_url_policy(),
@@ -442,6 +444,7 @@ mod integration_tests {
         let scanner = ScannerService::new(repo.clone(), rpc.clone(), cfg.clone());
         let dispatcher = WebhookDispatcher::new_with_policy(
             repo.clone(),
+            cfg.webhook_secret.clone(),
             cfg.enable_auto_sweep,
             Duration::from_secs(5),
             cfg.webhook_url_policy(),

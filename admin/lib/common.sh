@@ -458,20 +458,25 @@ find_monero_bin() {
     return 1
 }
 
-# Safely updates or appends KEY=VALUE in a target .env file preserving 0600 permissions
-# and original ownership (e.g. xmr-gateway:xmr-gateway under /etc/xmr-gateway/.env).
+# Safely updates or appends KEY=VALUE in a target .env file preserving 0600 permissions,
+# original ownership (e.g. xmr-gateway:xmr-gateway under /etc/xmr-gateway/.env), and
+# SELinux context (same-directory mktemp for atomic rename + optional restorecon).
 set_env_kv_file() {
     local target_file="$1"
     local key="$2"
     local value="$3"
-    local orig_owner=""
-    if [[ -f "$target_file" && "$(id -u)" -eq 0 ]]; then
-        orig_owner="$(stat -c '%u:%g' "$target_file" 2>/dev/null || true)"
+    local target_dir had_existing=0 orig_owner=""
+    target_dir="$(dirname "$target_file")"
+    if [[ -f "$target_file" ]]; then
+        had_existing=1
+        if [[ "$(id -u)" -eq 0 ]]; then
+            orig_owner="$(stat -c '%u:%g' "$target_file" 2>/dev/null || true)"
+        fi
     fi
     local tmp_env
-    tmp_env="$(mktemp)"
+    tmp_env="$(mktemp "${target_dir}/.env.tmp.XXXXXX")"
     chmod 600 "$tmp_env"
-    if [[ -f "$target_file" ]] && grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$target_file"; then
+    if [[ "$had_existing" -eq 1 ]] && grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$target_file"; then
         awk -v k="$key" -v v="$value" '
             BEGIN { replaced = 0 }
             $0 ~ "^[[:space:]]*(export[[:space:]]+)?" k "=" {
@@ -484,16 +489,23 @@ set_env_kv_file() {
             { print }
         ' "$target_file" > "$tmp_env"
     else
-        if [[ -f "$target_file" ]]; then
+        if [[ "$had_existing" -eq 1 ]]; then
             cat "$target_file" > "$tmp_env"
         fi
         printf '\n%s=%s\n' "$key" "$value" >> "$tmp_env"
     fi
-    mv "$tmp_env" "$target_file"
-    if [[ -n "$orig_owner" ]]; then
-        chown "$orig_owner" "$target_file"
+    if [[ "$(id -u)" -eq 0 && "$had_existing" -eq 1 ]]; then
+        if ! chown --reference="$target_file" "$tmp_env" 2>/dev/null; then
+            if [[ -n "$orig_owner" ]]; then
+                chown "$orig_owner" "$tmp_env"
+            fi
+        fi
     fi
-    chmod 600 "$target_file"
+    chmod 600 "$tmp_env"
+    mv "$tmp_env" "$target_file"
+    if [[ "$target_file" == "/etc/xmr-gateway/.env" ]] && command -v restorecon >/dev/null 2>&1; then
+        restorecon "$target_file" 2>/dev/null || true
+    fi
 }
 
 # ==============================================================================

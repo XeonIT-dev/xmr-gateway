@@ -1,16 +1,22 @@
 //! HMAC-SHA256 webhook signing and durable exponential-backoff delivery worker.
 //!
-//! # Cryptographic Integrity & Retry Determinism
-//! - Outbound payloads are serialized to canonical JSON bytes **once** at enqueue time and
-//!   persisted in SQLite along with their lowercase hex HMAC-SHA256 signature (`X-Signature-256`).
-//! - Retries transmit the exact persisted byte sequence without re-serialization, guaranteeing
-//!   consistent signatures across restarts and transient merchant downtime.
+//! # Cryptographic Integrity, Fresh Timestamps & Retry Idempotency
+//! - Outbound business events are serialized to canonical JSON bytes **once** at enqueue time and
+//!   persisted in SQLite so `event_id` and the JSON payload remain byte-for-byte identical across
+//!   all automatic and manual retries for consumer idempotency.
+//! - On **every delivery attempt** (initial dispatch, exponential backoff retry, and manual
+//!   operator retry), [`WebhookDispatcher`] generates a fresh Unix epoch `X-Webhook-Timestamp`
+//!   and computes `X-Webhook-Signature` (`HMAC-SHA256(WEBHOOK_SECRET, "{timestamp}.{payload}")`)
+//!   on the fly so deliveries after transient merchant downtime pass strict replay freshness
+//!   windows (`<= 300s`). Stable `X-Webhook-Event-Id` (`X-Delivery-Id`) and backwards-compatible
+//!   body-only `X-Signature-256` are also included.
 //! - In View-Only Zero-Trust mode (`ENABLE_AUTO_SWEEP=false`), successful 2xx delivery of a
 //!   `SETTLED` webhook atomically transitions the invoice from `SETTLED` to `COMPLETED`, while
 //!   `CONFIRMED` leaves the invoice active for reorg monitoring until `SETTLEMENT_CONFIRMATIONS`.
 
 use std::{
     collections::{BTreeMap, HashSet},
+    fmt,
     sync::Arc,
     time::Duration,
 };
@@ -139,6 +145,83 @@ pub fn verify_payload_hmac_sha256(secret: &str, raw_body: &[u8], signature_hex: 
     }
 
     bool::from(presented_bytes.ct_eq(&expected_bytes))
+}
+
+/// Computes the lowercase hex HMAC-SHA256 signature binding a per-attempt Unix epoch timestamp
+/// (`X-Webhook-Timestamp`) to the raw HTTP body bytes (`"{attempt_timestamp}.{raw_body}"`),
+/// transmitted in `X-Webhook-Signature`.
+///
+/// # Errors
+/// Returns [`GatewayError::Webhook`] if HMAC key initialization fails.
+pub fn sign_timestamped_webhook_hmac_sha256(
+    secret: &str,
+    attempt_timestamp: i64,
+    raw_body: &[u8],
+) -> GatewayResult<String> {
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .map_err(|e| GatewayError::Webhook(format!("invalid HMAC secret key: {e}")))?;
+    let ts_str = attempt_timestamp.to_string();
+    mac.update(ts_str.as_bytes());
+    mac.update(b".");
+    mac.update(raw_body);
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+/// Verifies a hex-encoded `X-Webhook-Signature` digest computed over
+/// `"{attempt_timestamp}.{raw_body}"` in constant time.
+#[must_use]
+pub fn verify_timestamped_webhook_hmac_sha256(
+    secret: &str,
+    attempt_timestamp: i64,
+    raw_body: &[u8],
+    signature_hex: &str,
+) -> bool {
+    if secret.is_empty() {
+        return false;
+    }
+    let Ok(expected_hex) =
+        sign_timestamped_webhook_hmac_sha256(secret, attempt_timestamp, raw_body)
+    else {
+        return false;
+    };
+    let Ok(presented_bytes) = hex::decode(signature_hex.trim()) else {
+        return false;
+    };
+    let Ok(expected_bytes) = hex::decode(expected_hex) else {
+        return false;
+    };
+
+    if presented_bytes.len() != expected_bytes.len() {
+        return false;
+    }
+
+    bool::from(presented_bytes.ct_eq(&expected_bytes))
+}
+
+/// Verifies both timestamp freshness (`|now_timestamp - attempt_timestamp| <= max_skew_seconds`)
+/// and the constant-time `X-Webhook-Signature` HMAC-SHA256 digest.
+#[must_use]
+pub fn verify_timestamped_webhook_with_freshness(
+    secret: &str,
+    attempt_timestamp: i64,
+    raw_body: &[u8],
+    signature_hex: &str,
+    now_timestamp: i64,
+    max_skew_seconds: i64,
+) -> bool {
+    if max_skew_seconds < 0 {
+        return false;
+    }
+    let Some(abs_delta) = now_timestamp
+        .checked_sub(attempt_timestamp)
+        .and_then(i64::checked_abs)
+    else {
+        return false;
+    };
+    if abs_delta > max_skew_seconds {
+        return false;
+    }
+    verify_timestamped_webhook_hmac_sha256(secret, attempt_timestamp, raw_body, signature_hex)
 }
 
 /// Builds a signed [`NewWebhookDelivery`] ready to enqueue atomically in SQLite.
@@ -377,26 +460,41 @@ pub fn compute_backoff_seconds(failed_attempts: u32) -> i64 {
 }
 
 /// Asynchronous outbox worker dispatching signed webhooks with bounded per-invoice concurrency.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WebhookDispatcher {
     repo: InvoiceRepository,
     http: reqwest::Client,
+    webhook_secret: String,
     enable_auto_sweep: bool,
     poll_interval: Duration,
     url_policy: WebhookUrlPolicy,
     in_flight_ids: Arc<Mutex<HashSet<Uuid>>>,
 }
 
+impl fmt::Debug for WebhookDispatcher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WebhookDispatcher")
+            .field("webhook_secret", &"[REDACTED]")
+            .field("enable_auto_sweep", &self.enable_auto_sweep)
+            .field("poll_interval", &self.poll_interval)
+            .field("url_policy", &self.url_policy)
+            .finish_non_exhaustive()
+    }
+}
+
 impl WebhookDispatcher {
     /// Constructs a new [`WebhookDispatcher`] enforcing an explicit [`WebhookUrlPolicy`].
     ///
     /// Configures `redirect::Policy::none()` so HTTP 3xx responses cannot pivot webhook traffic to
-    /// internal hosts, and validates + pins DNS answers on every dispatch attempt (`XMR-016`).
+    /// internal hosts, validates + pins DNS answers on every dispatch attempt (`XMR-016`), and
+    /// computes fresh per-attempt `X-Webhook-Timestamp` + `X-Webhook-Signature` headers using
+    /// `webhook_secret`.
     ///
     /// # Errors
     /// Returns [`GatewayError::Config`] if the HTTP client fails TLS initialization.
     pub fn new(
         repo: InvoiceRepository,
+        webhook_secret: String,
         enable_auto_sweep: bool,
         poll_interval: Duration,
         url_policy: WebhookUrlPolicy,
@@ -411,6 +509,7 @@ impl WebhookDispatcher {
         Ok(Self {
             repo,
             http,
+            webhook_secret,
             enable_auto_sweep,
             poll_interval,
             url_policy,
@@ -424,11 +523,18 @@ impl WebhookDispatcher {
     /// Returns [`GatewayError::Config`] if the HTTP client fails TLS initialization.
     pub fn new_with_policy(
         repo: InvoiceRepository,
+        webhook_secret: String,
         enable_auto_sweep: bool,
         poll_interval: Duration,
         url_policy: WebhookUrlPolicy,
     ) -> GatewayResult<Self> {
-        Self::new(repo, enable_auto_sweep, poll_interval, url_policy)
+        Self::new(
+            repo,
+            webhook_secret,
+            enable_auto_sweep,
+            poll_interval,
+            url_policy,
+        )
     }
 
     /// Runs the background retry loop until a shutdown signal arrives.
@@ -598,6 +704,25 @@ impl WebhookDispatcher {
             }
         };
 
+        let attempt_timestamp = now.timestamp();
+        let timestamped_sig = match sign_timestamped_webhook_hmac_sha256(
+            &self.webhook_secret,
+            attempt_timestamp,
+            delivery.payload_json.as_bytes(),
+        ) {
+            Ok(sig) => sig,
+            Err(err) => {
+                let err_msg = format!("failed to sign webhook delivery attempt: {err}");
+                self.schedule_retry_or_fail(delivery, None, &err_msg, now)
+                    .await?;
+                return Ok(());
+            }
+        };
+        let body_sig =
+            sign_payload_hmac_sha256(&self.webhook_secret, delivery.payload_json.as_bytes())
+                .unwrap_or_else(|_| delivery.signature_hex.clone());
+        let event_id_str = delivery.id.to_string();
+
         let send_result = client
             .post(validated.url)
             .header(header::CONTENT_TYPE, "application/json")
@@ -605,10 +730,12 @@ impl WebhookDispatcher {
                 header::USER_AGENT,
                 concat!("xmr-gateway/", env!("CARGO_PKG_VERSION")),
             )
-            .header("X-Signature-256", &delivery.signature_hex)
+            .header("X-Webhook-Timestamp", attempt_timestamp.to_string())
+            .header("X-Webhook-Signature", &timestamped_sig)
+            .header("X-Signature-256", &body_sig)
             .header("X-Webhook-Event", delivery.event_type.as_str())
-            .header("X-Delivery-Id", delivery.id.to_string())
-            .header("X-Webhook-Timestamp", delivery.created_at.to_rfc3339())
+            .header("X-Webhook-Event-Id", &event_id_str)
+            .header("X-Delivery-Id", &event_id_str)
             .body(delivery.payload_json.clone())
             .send()
             .await;
@@ -844,6 +971,7 @@ mod tests {
 
         let dispatcher = WebhookDispatcher::new(
             repo.clone(),
+            secret.to_string(),
             false,
             Duration::from_secs(5),
             WebhookUrlPolicy {
@@ -959,6 +1087,7 @@ mod tests {
 
         let dispatcher = WebhookDispatcher::new(
             repo.clone(),
+            "webhook-secret-key-0123456789abcdef".to_string(),
             true,
             Duration::from_secs(5),
             WebhookUrlPolicy {
@@ -1022,6 +1151,7 @@ mod tests {
 
         let strict_dispatcher = WebhookDispatcher::new_with_policy(
             repo.clone(),
+            "webhook-secret-key-0123456789abcdef".to_string(),
             true,
             Duration::from_secs(5),
             WebhookUrlPolicy {
@@ -1084,6 +1214,7 @@ mod tests {
 
         let permissive_dispatcher = WebhookDispatcher::new_with_policy(
             repo.clone(),
+            "webhook-secret-key-0123456789abcdef".to_string(),
             true,
             Duration::from_secs(5),
             WebhookUrlPolicy {
@@ -1113,9 +1244,14 @@ mod tests {
             allow_private_webhooks: false,
             require_https_webhooks: false,
         };
-        let dispatcher =
-            WebhookDispatcher::new(repo.clone(), true, Duration::from_secs(5), strict_policy)
-                .unwrap();
+        let dispatcher = WebhookDispatcher::new(
+            repo.clone(),
+            "webhook-secret-key-0123456789abcdef".to_string(),
+            true,
+            Duration::from_secs(5),
+            strict_policy,
+        )
+        .unwrap();
 
         let targets = [
             "http://127.0.0.1:9000/hook",
@@ -1214,6 +1350,7 @@ mod tests {
 
         let dispatcher = WebhookDispatcher::new(
             repo.clone(),
+            "webhook-secret-key-0123456789abcdef".to_string(),
             true,
             Duration::from_secs(5),
             WebhookUrlPolicy {
@@ -1229,5 +1366,221 @@ mod tests {
         assert_eq!(hooks[0].last_status_code, Some(500));
         let err_msg = hooks[0].last_error.as_deref().unwrap();
         assert_eq!(err_msg, format!("HTTP 500: {}", "E".repeat(256)));
+    }
+
+    #[tokio::test]
+    async fn retry_refreshes_webhook_timestamp_and_signature_while_preserving_event_id_and_payload()
+    {
+        use wiremock::{Request as WireRequest, Respond};
+
+        #[derive(Debug, Clone)]
+        struct CapturedWebhook {
+            body: Vec<u8>,
+            timestamp: i64,
+            webhook_sig: String,
+            legacy_sig: String,
+            event_id_hdr: String,
+            delivery_id_hdr: String,
+        }
+
+        struct RetryCaptureResponder {
+            captured: Arc<std::sync::Mutex<Vec<CapturedWebhook>>>,
+            fail_first_n: usize,
+        }
+
+        impl Respond for RetryCaptureResponder {
+            fn respond(&self, request: &WireRequest) -> ResponseTemplate {
+                let hdr = |name: &str| {
+                    request
+                        .headers
+                        .get(name)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string()
+                };
+                let ts: i64 = hdr("x-webhook-timestamp")
+                    .parse()
+                    .expect("X-Webhook-Timestamp must be Unix epoch seconds");
+                let record = CapturedWebhook {
+                    body: request.body.clone(),
+                    timestamp: ts,
+                    webhook_sig: hdr("x-webhook-signature"),
+                    legacy_sig: hdr("x-signature-256"),
+                    event_id_hdr: hdr("x-webhook-event-id"),
+                    delivery_id_hdr: hdr("x-delivery-id"),
+                };
+                let mut guard = self.captured.lock().unwrap();
+                guard.push(record);
+                if guard.len() <= self.fail_first_n {
+                    ResponseTemplate::new(503).set_body_string("merchant temporarily down")
+                } else {
+                    ResponseTemplate::new(200)
+                }
+            }
+        }
+
+        let pool = init_sqlite_pool("sqlite::memory:").await.unwrap();
+        let repo = InvoiceRepository::new(pool);
+        let mock_server = MockServer::start().await;
+        let secret = "retry-fresh-timestamp-secret-0123456789abcdef";
+
+        let mut inv = sample_invoice(InvoiceStatus::Confirmed);
+        inv.order_id = "ord-webhook-retry-fresh".to_string();
+        let hook_url = format!("{}/fresh-retry", mock_server.uri());
+        inv.callback_url = Some(hook_url.clone());
+        repo.insert_invoice(&inv).await.unwrap();
+
+        // Simulate an event created 15 minutes ago (900s > typical 300s freshness window)
+        let stale_created_at = Utc::now() - ChronoDuration::seconds(900);
+        let mut delivery = build_webhook_delivery(
+            secret,
+            &inv,
+            WebhookEventType::Confirmed,
+            &hook_url,
+            stale_created_at,
+        )
+        .unwrap();
+        let delivery_id = delivery.id;
+        // max_attempts = 1 so attempt 1 transitions to FAILED, allowing us to exercise manual
+        // `reset_webhook_delivery_for_retry` (same delivery path as automatic backoff retries)
+        delivery.max_attempts = 1;
+
+        repo.apply_scan_update(crate::db::repository::ApplyScanUpdateParams {
+            invoice_id: inv.id,
+            received_piconero: inv.received_piconero,
+            confirmations: 2,
+            unlocked: false,
+            double_spend_seen: false,
+            next_status: InvoiceStatus::Confirmed,
+            transfers: Vec::new(),
+            webhook: Some(delivery),
+            now: stale_created_at,
+        })
+        .await
+        .unwrap();
+
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(path("/fresh-retry"))
+            .respond_with(RetryCaptureResponder {
+                captured: captured.clone(),
+                fail_first_n: 1,
+            })
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let dispatcher = WebhookDispatcher::new(
+            repo.clone(),
+            secret.to_string(),
+            true,
+            Duration::from_secs(5),
+            WebhookUrlPolicy {
+                allow_private_webhooks: true,
+                require_https_webhooks: false,
+            },
+        )
+        .unwrap();
+
+        // Debug redacts webhook_secret
+        assert!(!format!("{dispatcher:?}").contains(secret));
+
+        // Attempt 1 (fails 503 -> FAILED)
+        assert_eq!(dispatcher.process_due_deliveries().await.unwrap(), 1);
+        let after_fail = repo
+            .get_webhook_delivery_by_id(delivery_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_fail.status,
+            crate::db::repository::WebhookDeliveryStatus::Failed
+        );
+
+        // Wait > 1s so Unix epoch timestamp strictly advances before manual retry
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        repo.reset_webhook_delivery_for_retry(delivery_id, Utc::now())
+            .await
+            .unwrap()
+            .expect("reset FAILED delivery for retry");
+
+        // Attempt 2 (succeeds 200 -> DELIVERED)
+        assert_eq!(dispatcher.process_due_deliveries().await.unwrap(), 1);
+        let after_ok = repo
+            .get_webhook_delivery_by_id(delivery_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_ok.status,
+            crate::db::repository::WebhookDeliveryStatus::Delivered
+        );
+
+        let attempts = captured.lock().unwrap().clone();
+        assert_eq!(attempts.len(), 2);
+        let a1 = &attempts[0];
+        let a2 = &attempts[1];
+
+        // 1) Payload bytes and event_id remain strictly immutable across retries for idempotency
+        assert_eq!(a1.body, a2.body, "payload bytes must be identical on retry");
+        assert_eq!(a1.event_id_hdr, delivery_id.to_string());
+        assert_eq!(a2.event_id_hdr, delivery_id.to_string());
+        assert_eq!(a1.delivery_id_hdr, delivery_id.to_string());
+        assert_eq!(a2.delivery_id_hdr, delivery_id.to_string());
+        let p1: WebhookPayload = serde_json::from_slice(&a1.body).unwrap();
+        let p2: WebhookPayload = serde_json::from_slice(&a2.body).unwrap();
+        assert_eq!(p1.event_id, delivery_id);
+        assert_eq!(p2.event_id, delivery_id);
+
+        // 2) Timestamp is fresh on attempt 1 (NOT 900s stale created_at!) and advances on retry
+        let now_ts = Utc::now().timestamp();
+        assert!(
+            a1.timestamp > stale_created_at.timestamp() + 600,
+            "attempt 1 timestamp must reflect delivery time, not stale event creation time"
+        );
+        assert!(
+            a2.timestamp > a1.timestamp,
+            "retry attempt timestamp ({}) must be newer than first attempt ({})",
+            a2.timestamp,
+            a1.timestamp
+        );
+
+        // 3) New HMAC signature verifies cleanly for the new timestamp & freshness window (300s)
+        assert_ne!(a1.webhook_sig, a2.webhook_sig);
+        assert!(verify_timestamped_webhook_with_freshness(
+            secret,
+            a1.timestamp,
+            &a1.body,
+            &a1.webhook_sig,
+            now_ts,
+            300
+        ));
+        assert!(verify_timestamped_webhook_with_freshness(
+            secret,
+            a2.timestamp,
+            &a2.body,
+            &a2.webhook_sig,
+            now_ts,
+            300
+        ));
+        // Signature is cryptographically bound to attempt 2's timestamp (fails against attempt 1's ts)
+        assert!(!verify_timestamped_webhook_hmac_sha256(
+            secret,
+            a1.timestamp,
+            &a2.body,
+            &a2.webhook_sig
+        ));
+        // Freshness check rejects stale timestamp (> 300s skew)
+        assert!(!verify_timestamped_webhook_with_freshness(
+            secret,
+            stale_created_at.timestamp(),
+            &a2.body,
+            &sign_timestamped_webhook_hmac_sha256(secret, stale_created_at.timestamp(), &a2.body)
+                .unwrap(),
+            now_ts,
+            300
+        ));
+        // Backwards-compatible X-Signature-256 also verifies against raw body
+        assert!(verify_payload_hmac_sha256(secret, &a2.body, &a2.legacy_sig));
     }
 }

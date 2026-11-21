@@ -7,7 +7,7 @@
 
 **A self-hosted, non-custodial Monero (XMR) payment gateway and isolated subaddress auto-sweep engine written in Rust.**
 
-Designed for sovereign merchants, Telegram commerce bots, and privacy-first infrastructure operators who require zero third-party custody, zero KYC, deterministic atomic accounting, and verifiable cryptographic settlement.
+Designed for sovereign merchants, Telegram commerce bots, and privacy-first infrastructure operators who want a self-hosted gateway with no third-party payment processor intermediary, deterministic atomic accounting, and verifiable cryptographic settlement.
 
 ---
 
@@ -18,7 +18,7 @@ Designed for sovereign merchants, Telegram commerce bots, and privacy-first infr
 - **Strict Piconero Integer Accounting:** Floating-point arithmetic (`f32`/`f64`) is strictly banned across the entire codebase. Every amount, transfer, fee, and SQLite column uses atomic integer `Piconero(u64)` ($1\text{ XMR} = 10^{12}\text{ piconero}$) in SQLite WAL mode with `synchronous = FULL`, `0700`/`0600` filesystem hardening, and multi-output batched transaction accuracy (`UNIQUE(invoice_id, txid)`).
 - **Reorg-Safe Payment State Machine & Continuous Subaddress Accounting:** Tracks `PENDING`, `UNDERPAID`, `MEMPOOL` (`0-conf`), `CONFIRMING` (`1..REQUIRED_CONFIRMATIONS`), `CONFIRMED` (`>= REQUIRED_CONFIRMATIONS`, default `10`), `SETTLED` (covering set of **unlocked** outputs `>= invoice amount` at `>= SETTLEMENT_CONFIRMATIONS`, default `10`, immune to mempool dust DoS; `XMR-AUDIT-001`), `REORGED`, `COMPLETED`, `SWEPT`, and `EXPIRED`, plus `LATE_PAYMENT` and `OVERPAYMENT` ledger tracking across all subaddresses (`SUBADDRESS_MONITOR_DAYS=0` continuous monitoring by default), epoch-scoped webhook recovery after reorgs, and `ACTIVE` / `ORPHANED` / `SWEPT` audit states.
 - **Double-Spend Protection & Crash-Safe Sweeps:** Outputs flagged `double_spend_seen == true` in mempool (`confirmations == 0`) stay excluded until canonically mined (`confirmations > 0 && !double_spend_seen`), which cleanly restores `ACTIVE` balance state. Isolated `sweep_all` operations record durable `sweep_attempts` (`PREPARED` → `SUBMITTED` → `CONFIRMED` (`>= SETTLEMENT_CONFIRMATIONS`) / `RECONCILED` | `FAILED` | `REORGED`) so crashed sweeps recover via `get_transfers(out, pending)`, and any disappeared or double-spent outbound sweep escalates `SWEPT -> REORGED` (`SWEEP_REORG_DETECTED`) while blocking automatic re-sweep.
-- **SSRF-Hardened Durable HMAC-SHA256 Webhooks:** Outbound `callback_url` targets undergo IP/DNS SSRF filtering (`ALLOW_PRIVATE_WEBHOOKS=false`, `REQUIRE_HTTPS_WEBHOOKS`), connection-time socket pinning against DNS rebinding, zero redirect following, and SQLite WAL outbox retries (`5s` up to `3600s`, 10 attempts).
+- **SSRF-Hardened Durable HMAC-SHA256 Webhooks:** Outbound `callback_url` targets undergo IP/DNS SSRF filtering (`ALLOW_PRIVATE_WEBHOOKS=false`, fail-closed `REQUIRE_HTTPS_WEBHOOKS=true` for public mainnet webhooks), connection-time socket pinning against DNS rebinding, zero redirect following, fresh per-attempt `X-Webhook-Timestamp` + `X-Webhook-Signature` signing across retries (with immutable `event_id` payload), and SQLite WAL outbox retries (`5s` up to `3600s`, 10 attempts).
 - **Constant-Time API Authentication:** `/api/v1/*` routes verify `X-API-Key` by hashing both presented and expected secrets with SHA-256 before `subtle::ConstantTimeEq` comparison, preventing length timing side-channels.
 
 ---
@@ -30,7 +30,7 @@ Designed for sovereign merchants, Telegram commerce bots, and privacy-first infr
 |                       | --------------------------------------------> |                           |
 |   Merchant Backend    |                                               |     xmr-gateway     |
 | (Bot / Storefront)    | <-------------------------------------------- |      (Axum REST API)      |
-|                       |   POST Webhook + X-Signature-256 (HMAC-SHA256)|       127.0.0.1:8080      |
+|                       |   POST Webhook + X-Webhook-Signature / TS     |       127.0.0.1:8080      |
 +-----------------------+                                               +-------------+-------------+
                                                                                       |
                                           +-------------------------------------------+-------------------------------------------+
@@ -124,6 +124,13 @@ Designed for sovereign merchants, Telegram commerce bots, and privacy-first infr
 | **Settlement Flow** | Stays active in `CONFIRMED` for reorg checks until `SETTLED` webhook 2xx (`COMPLETED`); `COMPLETED` stays monitored for deep reorgs | Crash-safe `sweep_attempts` (`PREPARED`→`SUBMITTED`→`CONFIRMED` at `>= SETTLEMENT_CONFIRMATIONS` / `RECONCILED` / `REORGED`) |
 | **Terminal State** | `COMPLETED` (monitored for deep reorg `COMPLETED->REORGED->CONFIRMED->SETTLED->COMPLETED`) | `SWEPT` (`SWEPT->REORGED` on outbound sweep reorg with auto re-sweep blocked; `EXPIRED` preserves `EXPIRED`) |
 
+### Trust Boundaries & Architectural Scope
+
+- **View-Only Mode (`WALLET_MODE=view_only`, recommended default):** The server holds only the private view key and primary public address; no private spend key ever touches the gateway host. Even a full server compromise cannot steal funds (only view incoming amounts and metadata).
+- **Hot-Wallet Mode (`WALLET_MODE=hot_wallet`):** The private spend key resides inside `monero-wallet-rpc` on the host so the gateway can sign `sweep_all` transactions. Treat it strictly as an **ephemeral operational transit wallet**: keep only minimal operational transit balances, strictly isolate the host/network and `127.0.0.1:18082` RPC endpoint, enforce a distinct `OPERATOR_API_KEY`, and sweep promptly to an offline or hardware `COLD_WALLET_ADDRESS`.
+- **Single-Instance SQLite / Single-Merchant Model:** `xmr-gateway` is designed for **self-hosted, single-merchant operation** backed by a single SQLite WAL database and a single `monero-wallet-rpc` wallet. An exclusive `<db_path>.lock` file enforces strictly one active gateway process per database and wallet (do not horizontally scale multiple instances against the same SQLite file or wallet).
+- **Opaque `order_id` Values (No PII):** Pass opaque internal identifiers (e.g., UUIDs or random order tokens such as `ord_7f9a2c`) as `order_id` rather than emails, usernames, phone numbers, or customer names — `order_id` is recorded in operational logs, `monero:` URI `tx_description` fields, and `monero-wallet-rpc` subaddress labels (`inv_<order_id>`).
+
 ---
 
 ## Prerequisites & Quickstart
@@ -207,7 +214,7 @@ curl -s -H "X-Operator-Key: ${OPERATOR_API_KEY}" http://127.0.0.1:8080/health | 
 {
   "status": "ok",
   "service": "xmr-gateway",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "database": "connected",
   "monero_rpc": {
     "connected": true,
@@ -220,7 +227,7 @@ curl -s -H "X-Operator-Key: ${OPERATOR_API_KEY}" http://127.0.0.1:8080/health | 
 
 ### `POST /api/v1/invoices`
 
-Creates a dedicated subaddress invoice and Base64-encoded PNG QR code. Enforces atomic per-`order_id` serialization and parameter-verified idempotency (`XMR-019` / `XMR-029`): retrying with identical `(order_id, amount_piconero, ttl_seconds, effective callback_url)` returns `200 OK` with the existing invoice without allocating a second subaddress, whereas reusing an `order_id` with different parameters (including changed `ttl_seconds`) returns `409 Conflict`. Note: first-request parameters remain bound even after `EXPIRED`.
+Creates a dedicated subaddress invoice and Base64-encoded PNG QR code. Use opaque, PII-free values for `order_id` (it appears in operational logs, `monero:` URIs, and wallet labels). Enforces atomic per-`order_id` serialization and parameter-verified idempotency (`XMR-019` / `XMR-029`): retrying with identical `(order_id, amount_piconero, ttl_seconds, effective callback_url)` returns `200 OK` with the existing invoice without allocating a second subaddress, whereas reusing an `order_id` with different parameters (including changed `ttl_seconds`) returns `409 Conflict`. Note: first-request parameters remain bound even after `EXPIRED`.
 
 ```bash
 curl -s -X POST http://127.0.0.1:8080/api/v1/invoices \
@@ -313,7 +320,7 @@ sudo bash install.sh
 ### Deployment Artifacts Included
 
 - **GitHub Releases (`.deb`, `.rpm`, `.tar.gz`):** Prebuilt native Linux `x86_64` & `aarch64` packages installing `/usr/bin/xmr-gateway`, `/usr/bin/xmr-gateway-admin`, and hardened `systemd` units (never overwriting `/etc/xmr-gateway/.env` or deleting `/var/lib/xmr-gateway`).
-- **Systemd Units (`deploy/systemd/`):** `monero-wallet-rpc.service` (RAM-only `0600` `/run/xmr-gateway/wallet-rpc.conf` preventing password leaks in `ps`), `xmr-gateway.service` (`KillSignal=SIGTERM`, `TimeoutStopSec=30`), and daily hot SQLite backup timer (`xmr-gateway-backup.service` + `xmr-gateway-backup.timer`).
+- **Systemd Units (`deploy/systemd/`):** `monero-wallet-rpc.service` (delegates to standalone `0755` POSIX helper `/usr/share/xmr-gateway/scripts/render-wallet-rpc-conf.sh` to render RAM-only `0600` `/run/xmr-gateway/wallet-rpc.conf`, preventing password leaks in `ps`), `xmr-gateway.service` (`KillSignal=SIGTERM`, `TimeoutStopSec=30`), and daily hot SQLite backup timer (`xmr-gateway-backup.service` + `xmr-gateway-backup.timer`).
 - **Reverse Proxy (`deploy/reverse-proxy/`):** Ready-to-use `Caddyfile` (automatic Let's Encrypt HTTPS) and `nginx-xmr-gateway.conf` (TLS 1.2/1.3 + operator route IP allowlist examples).
 - **Docker Compose (`Containerfile`, `deploy/docker/`):** Multi-stage rootless-UID (`10001`) gateway image + SHA256-verified `Containerfile.monero-rpc`, isolated `xmr_internal` network (port `18082` never published), loopback-only `127.0.0.1:8080`, `read_only: true`, `cap_drop: [ALL]`, optional `--profile caddy`.
 - **Rootless Podman Quadlet (`deploy/podman/quadlet/`):** Native `systemd --user` Quadlet units with `UserNS=keep-id:uid=10001,gid=10001` and Fedora/RHEL SELinux `:Z` volume relabeling.
@@ -326,10 +333,12 @@ sudo bash install.sh
 
 | Header | Description |
 | :--- | :--- |
-| `X-Signature-256` | Lowercase hex `HMAC-SHA256` digest of the raw UTF-8 request body signed with `WEBHOOK_SECRET` |
+| `X-Webhook-Timestamp` | Fresh Unix epoch timestamp (seconds) generated for **this delivery attempt** (updated on every automatic and manual retry) |
+| `X-Webhook-Signature` | **Recommended primary signature:** lowercase hex `HMAC-SHA256(WEBHOOK_SECRET, "{X-Webhook-Timestamp}.{raw_body}")` freshly computed per delivery attempt to prevent replay attacks while keeping retries fresh |
+| `X-Webhook-Event-Id` | Stable event UUID matching `payload.event_id` (constant across all retries for consumer idempotency) |
+| `X-Delivery-Id` | Backwards-compatible alias of `X-Webhook-Event-Id` (`webhook_deliveries.id`) |
+| `X-Signature-256` | Backwards-compatible legacy lowercase hex `HMAC-SHA256(WEBHOOK_SECRET, raw_body)` digest |
 | `X-Webhook-Event` | Event type: `UNDERPAID`, `MEMPOOL`, `CONFIRMED`, `SETTLED`, `REORGED`, `SWEPT`, `EXPIRED`, `LATE_PAYMENT`, or `OVERPAYMENT` |
-| `X-Delivery-Id` | Unique UUID of this webhook delivery record |
-| `X-Webhook-Timestamp` | RFC 3339 UTC timestamp matching `payload.timestamp` |
 
 ### JSON Payload Schema
 
@@ -356,39 +365,63 @@ sudo bash install.sh
 }
 ```
 
-### Retry & Replay Policy
+### Retry, Freshness & Idempotency Policy
 
 - **Exponential Backoff & Bounded Response Reads:** Failed or non-`2xx` deliveries read at most `1024` bytes from the response body stream (truncating diagnostics to 256 chars) to prevent response-body memory exhaustion, and are persisted in SQLite WAL outbox for retry (`5 * 2^(attempt - 1)` seconds up to `3600` seconds, max `10` attempts before `FAILED`).
-- **Signature & Replay Verification:** Consumers MUST verify `X-Signature-256` over the **exact raw request bytes** in constant time, enforce a freshness window on `timestamp`, and deduplicate by `event_id` (or `order_id` + `event`).
+- **Fresh Per-Attempt Signatures & Immutable Event Identity:** The business event (`event_id` / `X-Webhook-Event-Id` and exact raw JSON body bytes) never changes between retries. On **every delivery attempt** (initial send, exponential-backoff retry, and operator `webhooks retry`), `xmr-gateway` mints a fresh `X-Webhook-Timestamp` (Unix seconds) and computes `X-Webhook-Signature = HMAC-SHA256(WEBHOOK_SECRET, "{X-Webhook-Timestamp}.{raw_body}")` live so delayed retries after merchant downtime cleanly pass strict replay freshness checks.
+- **Consumer Verification Contract:** Consumers MUST:
+  1. Parse `X-Webhook-Timestamp` as an integer Unix epoch timestamp and reject requests outside a freshness window (recommended `abs(now - ts) <= 300` seconds).
+  2. Verify `X-Webhook-Signature` over `f"{X-Webhook-Timestamp}.".encode() + raw_body` in constant time using `WEBHOOK_SECRET`.
+  3. Deduplicate processed events idempotently by `event_id` (also sent in `X-Webhook-Event-Id`) so retried deliveries never credit an order twice.
 
 #### Python Verification Example
 
 ```python
 import hashlib
 import hmac
+import time
 
-def verify_gateway_webhook(secret: str, raw_body: bytes, signature_header: str) -> bool:
-    expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+def verify_gateway_webhook(
+    secret: str,
+    raw_body: bytes,
+    timestamp_header: str,
+    signature_header: str,
+    max_skew_seconds: int = 300,
+) -> bool:
+    try:
+        ts = int(timestamp_header.strip())
+    except ValueError:
+        return False
+    if abs(int(time.time()) - ts) > max_skew_seconds:
+        return False
+    signing_input = f"{ts}.".encode("utf-8") + raw_body
+    expected = hmac.new(secret.encode("utf-8"), signing_input, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature_header.strip().lower())
 ```
 
 #### Rust Verification Example
 
 ```rust
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-use subtle::ConstantTimeEq;
+use chrono::Utc;
+use xmr_gateway::services::webhook::verify_timestamped_webhook_with_freshness;
 
-pub fn verify_webhook(secret: &str, raw_body: &[u8], signature_hex: &str) -> bool {
-    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
+pub fn verify_webhook(
+    secret: &str,
+    timestamp_header: &str,
+    raw_body: &[u8],
+    signature_hex: &str,
+) -> bool {
+    let Ok(ts) = timestamp_header.trim().parse::<i64>() else {
         return false;
     };
-    mac.update(raw_body);
-    let expected = hex::encode(mac.finalize().into_bytes());
-    let (Ok(a), Ok(b)) = (hex::decode(expected), hex::decode(signature_hex.trim())) else {
-        return false;
-    };
-    a.len() == b.len() && bool::from(a.ct_eq(&b))
+    verify_timestamped_webhook_with_freshness(
+        secret,
+        ts,
+        raw_body,
+        signature_hex,
+        Utc::now().timestamp(),
+        300,
+    )
 }
 ```
 
@@ -397,7 +430,8 @@ pub fn verify_webhook(secret: &str, raw_body: &[u8], signature_hex: &str) -> boo
 ## Security Best Practices
 
 - **Keep Loopback Bindings:** Leave `HOST=127.0.0.1` and expose the API only to local services or behind a TLS reverse proxy (Caddy/Nginx). Never expose `monero-wallet-rpc` (`127.0.0.1:18082`) to public interfaces.
-- **SSRF & DNS Rebinding Defense (`XMR-001` / `XMR-AUDIT-006`):** Leave `ALLOW_PRIVATE_WEBHOOKS=false` in production and set `REQUIRE_HTTPS_WEBHOOKS=true` on mainnet (running mainnet with `REQUIRE_HTTPS_WEBHOOKS=false` and `ALLOW_PRIVATE_WEBHOOKS=false` logs a startup security warning and a `config doctor` warning) so webhook callbacks cannot target loopback, RFC1918 subnets, cloud metadata endpoints (`169.254.169.254`), HTTP `3xx` redirects, or plaintext public HTTP.
+- **SSRF, DNS Rebinding & Mainnet HTTPS Enforcement (`XMR-001` / `XMR-AUDIT-006`):** Leave `ALLOW_PRIVATE_WEBHOOKS=false` and `REQUIRE_HTTPS_WEBHOOKS=true` in production. On `MONERO_NETWORK=mainnet` with `ALLOW_PRIVATE_WEBHOOKS=false`, `REQUIRE_HTTPS_WEBHOOKS` defaults to `true` when unset and explicitly setting `REQUIRE_HTTPS_WEBHOOKS=false` **fails closed at startup** (and reports `FAIL` in `config doctor`), blocking plaintext public HTTP webhooks alongside loopback, RFC1918 subnets, cloud metadata (`169.254.169.254`), DNS rebinding, and HTTP `3xx` redirects. Cleartext HTTP remains allowed on `stagenet`/`testnet` or when `ALLOW_PRIVATE_WEBHOOKS=true` for a local loopback bot (`127.0.0.1`).
+- **Bounded Scanner Batching:** Configure `SCANNER_SUBADDRESS_BATCH_SIZE` (`1..=1000`, default `100`) so `get_transfers` queries stay safely below the `16 MiB` RPC response cap as monitored invoices grow; partial batch failures fail closed before database mutation.
 - **Enforce Fail-Closed View-Only Mode (`XMR-002` / `XMR-AUDIT-003`) & Hot-Wallet RBAC (`XMR-AUDIT-004`):** Unless you require automated hot treasury sweeping, set `WALLET_MODE=view_only` and `ENABLE_AUTO_SWEEP=false`, providing `MONERO_VIEW_ONLY_ADDRESS` and `MONERO_VIEW_ONLY_KEY` in `.env`. Both `start.sh` and `xmr-gateway` fail closed if `query_key(spend_key)` returns a spend key, malformed data, or any non-watch-only JSON-RPC error. In `WALLET_MODE=hot_wallet` (or `ENABLE_AUTO_SWEEP=true`), a distinct `OPERATOR_API_KEY` is strictly required at startup.
 - **Zero-Argv-Leak RPC Credentials (`XMR-AUDIT-005`):** `start.sh`, `admin/service.sh`, `demo-stagenet.sh`, and the systemd/container units write `rpc-login=...` into a `0600` `--config-file` (in `$XDG_RUNTIME_DIR` / `/run/xmr-gateway` when available) and remove it on shutdown so `MONERO_RPC_PASS` never appears in `ps` / `/proc/<pid>/cmdline`.
 - **Untrusted Remote Nodes (`XMR-005`):** `MONERO_TRUSTED_DAEMON=false` passes `--untrusted-daemon` by default. Route traffic through Tor (`MONERO_RPC_PROXY=127.0.0.1:9050`) when connecting to third-party public nodes.

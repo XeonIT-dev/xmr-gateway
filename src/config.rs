@@ -17,6 +17,23 @@ use crate::{
 /// Monero Base58 alphabet used in standard, integrated, and subaddress strings.
 const MONERO_BASE58_ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
+/// Default maximum number of subaddress indices queried per `monero-wallet-rpc` `get_transfers` batch.
+pub const DEFAULT_SCANNER_SUBADDRESS_BATCH_SIZE: usize = 100;
+
+/// Maximum permitted value for `SCANNER_SUBADDRESS_BATCH_SIZE` to stay safely below the 16 MiB RPC limit.
+pub const MAX_SCANNER_SUBADDRESS_BATCH_SIZE: usize = 1000;
+
+/// Computes the default value for `REQUIRE_HTTPS_WEBHOOKS` when the environment variable is unset.
+///
+/// Mainnet deployments without `ALLOW_PRIVATE_WEBHOOKS=true` default to `true` (fail-closed HTTPS).
+#[must_use]
+pub const fn default_require_https_webhooks(
+    monero_network: MoneroNetwork,
+    allow_private_webhooks: bool,
+) -> bool {
+    matches!(monero_network, MoneroNetwork::Mainnet) && !allow_private_webhooks
+}
+
 /// Structured logging output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFormat {
@@ -192,6 +209,8 @@ pub struct Config {
     pub invoice_ttl_seconds: u64,
     /// Interval in seconds between background scanner polls against `monero-wallet-rpc`.
     pub scan_interval_seconds: u64,
+    /// Maximum subaddress indices queried per `monero-wallet-rpc` `get_transfers` batch (`1..=1000`).
+    pub scanner_subaddress_batch_size: usize,
     /// Interval in seconds between background webhook retry polls.
     pub webhook_poll_interval_seconds: u64,
     /// Retention window in days for scanning terminal (`COMPLETED`/`SWEPT`/`EXPIRED`) subaddresses
@@ -246,6 +265,10 @@ impl fmt::Debug for Config {
             .field("invoice_ttl_seconds", &self.invoice_ttl_seconds)
             .field("scan_interval_seconds", &self.scan_interval_seconds)
             .field(
+                "scanner_subaddress_batch_size",
+                &self.scanner_subaddress_batch_size,
+            )
+            .field(
                 "webhook_poll_interval_seconds",
                 &self.webhook_poll_interval_seconds,
             )
@@ -278,8 +301,11 @@ impl Config {
         let webhook_secret = require_non_empty_env("WEBHOOK_SECRET")?;
         let default_webhook_url = optional_non_empty_env("DEFAULT_WEBHOOK_URL");
         let allow_private_webhooks = parse_env_bool("ALLOW_PRIVATE_WEBHOOKS", false)?;
-        let require_https_webhooks = parse_env_bool("REQUIRE_HTTPS_WEBHOOKS", false)?;
         let monero_network = MoneroNetwork::parse(&env_or_default("MONERO_NETWORK", "mainnet"))?;
+        let require_https_webhooks = parse_env_bool(
+            "REQUIRE_HTTPS_WEBHOOKS",
+            default_require_https_webhooks(monero_network, allow_private_webhooks),
+        )?;
         let monero_rpc_url = env_or_default("MONERO_RPC_URL", "http://127.0.0.1:18082/json_rpc");
         let monero_daemon_rpc_url = optional_non_empty_env("MONERO_DAEMON_RPC_URL");
         let monero_daemon_rpc_user = optional_non_empty_env("MONERO_DAEMON_RPC_USER");
@@ -313,6 +339,10 @@ impl Config {
         };
         let invoice_ttl_seconds = parse_env_u64("INVOICE_TTL_SECONDS", 3600)?;
         let scan_interval_seconds = parse_env_u64("SCAN_INTERVAL_SECONDS", 10)?;
+        let scanner_subaddress_batch_size = parse_env_usize(
+            "SCANNER_SUBADDRESS_BATCH_SIZE",
+            DEFAULT_SCANNER_SUBADDRESS_BATCH_SIZE,
+        )?;
         let webhook_poll_interval_seconds = parse_env_u64("WEBHOOK_POLL_INTERVAL_SECONDS", 5)?;
         let subaddress_monitor_days = parse_env_u64("SUBADDRESS_MONITOR_DAYS", 0)?;
         let log_format = LogFormat::parse(&env_or_default("LOG_FORMAT", "json"))?;
@@ -347,6 +377,7 @@ impl Config {
             settlement_confirmations,
             invoice_ttl_seconds,
             scan_interval_seconds,
+            scanner_subaddress_batch_size,
             webhook_poll_interval_seconds,
             subaddress_monitor_days,
             log_format,
@@ -437,6 +468,16 @@ impl Config {
             ));
         }
 
+        if self.monero_network == MoneroNetwork::Mainnet
+            && !self.allow_private_webhooks
+            && !self.require_https_webhooks
+        {
+            return Err(GatewayError::Config(
+                "REQUIRE_HTTPS_WEBHOOKS=false is forbidden on mainnet when ALLOW_PRIVATE_WEBHOOKS=false; public mainnet webhooks require HTTPS (set REQUIRE_HTTPS_WEBHOOKS=true, or ALLOW_PRIVATE_WEBHOOKS=true only for local/private loopback bots)"
+                    .to_string(),
+            ));
+        }
+
         if let Some(ref webhook_url) = self.default_webhook_url {
             validate_webhook_url_static(
                 webhook_url,
@@ -468,6 +509,15 @@ impl Config {
             return Err(GatewayError::Config(
                 "SCAN_INTERVAL_SECONDS must be >= 1".to_string(),
             ));
+        }
+
+        if self.scanner_subaddress_batch_size == 0
+            || self.scanner_subaddress_batch_size > MAX_SCANNER_SUBADDRESS_BATCH_SIZE
+        {
+            return Err(GatewayError::Config(format!(
+                "SCANNER_SUBADDRESS_BATCH_SIZE must be between 1 and {MAX_SCANNER_SUBADDRESS_BATCH_SIZE}, got {}",
+                self.scanner_subaddress_batch_size
+            )));
         }
 
         if self.webhook_poll_interval_seconds == 0 {
@@ -970,6 +1020,15 @@ fn parse_env_u64(key: &str, default: u64) -> GatewayResult<u64> {
     }
 }
 
+fn parse_env_usize(key: &str, default: usize) -> GatewayResult<usize> {
+    match optional_non_empty_env(key) {
+        Some(raw) => raw
+            .parse::<usize>()
+            .map_err(|err| GatewayError::Config(format!("invalid {key} '{raw}': {err}"))),
+        None => Ok(default),
+    }
+}
+
 fn parse_env_bool(key: &str, default: bool) -> GatewayResult<bool> {
     match optional_non_empty_env(key) {
         Some(raw) => match raw.to_ascii_lowercase().as_str() {
@@ -998,7 +1057,7 @@ mod tests {
             webhook_secret: "b".repeat(32),
             default_webhook_url: Some("https://bot.example.org/webhook".to_string()),
             allow_private_webhooks: false,
-            require_https_webhooks: false,
+            require_https_webhooks: true,
             monero_network: MoneroNetwork::Mainnet,
             monero_rpc_url: "http://127.0.0.1:18082/json_rpc".to_string(),
             monero_daemon_rpc_url: None,
@@ -1018,6 +1077,7 @@ mod tests {
             settlement_confirmations: 10,
             invoice_ttl_seconds: 3600,
             scan_interval_seconds: 10,
+            scanner_subaddress_batch_size: DEFAULT_SCANNER_SUBADDRESS_BATCH_SIZE,
             webhook_poll_interval_seconds: 5,
             subaddress_monitor_days: 0,
             log_format: LogFormat::Json,
@@ -1252,5 +1312,89 @@ mod tests {
         let mut distinct = sample_valid_config();
         distinct.operator_api_key = Some("c".repeat(32));
         assert!(distinct.validate().is_ok());
+    }
+
+    #[test]
+    fn mainnet_forbids_public_http_webhooks_fail_closed() {
+        // Default helper enforces HTTPS on mainnet when private webhooks are disabled
+        assert!(default_require_https_webhooks(
+            MoneroNetwork::Mainnet,
+            false
+        ));
+        assert!(!default_require_https_webhooks(
+            MoneroNetwork::Mainnet,
+            true
+        ));
+        assert!(!default_require_https_webhooks(
+            MoneroNetwork::Stagenet,
+            false
+        ));
+        assert!(!default_require_https_webhooks(
+            MoneroNetwork::Testnet,
+            false
+        ));
+
+        // Mainnet + public webhooks + REQUIRE_HTTPS_WEBHOOKS=false MUST fail closed
+        let mut bad = sample_valid_config();
+        bad.monero_network = MoneroNetwork::Mainnet;
+        bad.allow_private_webhooks = false;
+        bad.require_https_webhooks = false;
+        let err = bad.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("REQUIRE_HTTPS_WEBHOOKS=false is forbidden on mainnet"),
+            "unexpected error: {err}"
+        );
+
+        // Mainnet + public webhooks + REQUIRE_HTTPS_WEBHOOKS=true passes for https:// and rejects http://
+        let mut ok_https = sample_valid_config();
+        ok_https.monero_network = MoneroNetwork::Mainnet;
+        ok_https.allow_private_webhooks = false;
+        ok_https.require_https_webhooks = true;
+        ok_https.default_webhook_url = Some("https://merchant.example.com/hook".to_string());
+        assert!(ok_https.validate().is_ok());
+
+        ok_https.default_webhook_url = Some("http://merchant.example.com/hook".to_string());
+        assert!(ok_https.validate().is_err());
+
+        // Mainnet + ALLOW_PRIVATE_WEBHOOKS=true (e.g. local loopback bot) permits HTTP
+        let mut local_bot = sample_valid_config();
+        local_bot.monero_network = MoneroNetwork::Mainnet;
+        local_bot.allow_private_webhooks = true;
+        local_bot.require_https_webhooks = false;
+        local_bot.default_webhook_url = Some("http://127.0.0.1:9000/webhooks/monero".to_string());
+        assert!(local_bot.validate().is_ok());
+
+        // Stagenet & testnet permit public HTTP webhooks when REQUIRE_HTTPS_WEBHOOKS=false
+        for net in [MoneroNetwork::Stagenet, MoneroNetwork::Testnet] {
+            let mut non_main = sample_valid_config();
+            non_main.monero_network = net;
+            non_main.allow_private_webhooks = false;
+            non_main.require_https_webhooks = false;
+            non_main.default_webhook_url = Some("http://merchant.example.com/hook".to_string());
+            assert!(
+                non_main.validate().is_ok(),
+                "{net} should permit HTTP webhooks when REQUIRE_HTTPS_WEBHOOKS=false"
+            );
+        }
+    }
+
+    #[test]
+    fn scanner_subaddress_batch_size_bounds_enforced() {
+        let mut cfg = sample_valid_config();
+        cfg.scanner_subaddress_batch_size = 0;
+        assert!(cfg.validate().is_err());
+
+        cfg.scanner_subaddress_batch_size = MAX_SCANNER_SUBADDRESS_BATCH_SIZE + 1;
+        assert!(cfg.validate().is_err());
+
+        for valid in [
+            1,
+            DEFAULT_SCANNER_SUBADDRESS_BATCH_SIZE,
+            MAX_SCANNER_SUBADDRESS_BATCH_SIZE,
+        ] {
+            cfg.scanner_subaddress_batch_size = valid;
+            assert!(cfg.validate().is_ok());
+        }
     }
 }

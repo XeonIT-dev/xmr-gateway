@@ -436,6 +436,7 @@ Recommended commands (review before executing as root):
   sudo install -m 0600 -o xmr-gateway -g xmr-gateway .env.example /etc/xmr-gateway/.env
   sudo install -m 0755 target/release/xmr-gateway /usr/bin/xmr-gateway
   sudo install -m 0755 deploy/packaging/xmr-gateway-admin /usr/bin/xmr-gateway-admin
+  sudo install -D -m 0755 "${systemd_src}/render-wallet-rpc-conf.sh" /usr/share/xmr-gateway/scripts/render-wallet-rpc-conf.sh
   sudo install -m 0755 bin/monero-wallet-rpc /usr/local/bin/monero-wallet-rpc
   sudo cp "${systemd_src}"/monero-wallet-rpc.service \
           "${systemd_src}"/xmr-gateway.service \

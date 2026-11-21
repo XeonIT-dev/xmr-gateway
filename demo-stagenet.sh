@@ -229,7 +229,7 @@ main() {
     # 2) Start inline Python HMAC-SHA256 webhook listener on 127.0.0.1:9000
     demo_log "Starting Python HMAC-SHA256 webhook listener on 127.0.0.1:9000..."
     python3 -u -c '
-import hashlib, hmac, json, os, sys
+import hashlib, hmac, json, os, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SECRET = os.environ["WEBHOOK_SECRET"].encode("utf-8")
@@ -241,11 +241,35 @@ class WebhookHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
         raw_body = self.rfile.read(length)
-        sig_header = self.headers.get("X-Signature-256", "").strip().lower()
-        expected = hmac.new(SECRET, raw_body, hashlib.sha256).hexdigest()
+        wh_sig = self.headers.get("X-Webhook-Signature", "").strip().lower()
+        ts_hdr = self.headers.get("X-Webhook-Timestamp", "").strip()
+        legacy_sig = self.headers.get("X-Signature-256", "").strip().lower()
 
-        if not hmac.compare_digest(expected, sig_header):
-            print(f"REJECTED webhook on {self.path}: invalid X-Signature-256", flush=True)
+        if wh_sig:
+            try:
+                ts_int = int(ts_hdr)
+            except ValueError:
+                print(f"REJECTED webhook on {self.path}: invalid X-Webhook-Timestamp", flush=True)
+                self.send_response(401)
+                self.end_headers()
+                self.wfile.write(b"{\"error\":\"invalid timestamp\"}")
+                return
+            if abs(int(time.time()) - ts_int) > 300:
+                print(f"REJECTED webhook on {self.path}: stale X-Webhook-Timestamp", flush=True)
+                self.send_response(401)
+                self.end_headers()
+                self.wfile.write(b"{\"error\":\"stale timestamp\"}")
+                return
+            expected = hmac.new(SECRET, f"{ts_hdr}.".encode("utf-8") + raw_body, hashlib.sha256).hexdigest()
+            sig_ok = hmac.compare_digest(expected, wh_sig)
+            sig_label = "X-Webhook-Signature"
+        else:
+            expected = hmac.new(SECRET, raw_body, hashlib.sha256).hexdigest()
+            sig_ok = hmac.compare_digest(expected, legacy_sig)
+            sig_label = "X-Signature-256"
+
+        if not sig_ok:
+            print(f"REJECTED webhook on {self.path}: invalid {sig_label}", flush=True)
             self.send_response(401)
             self.end_headers()
             self.wfile.write(b"{\"error\":\"invalid signature\"}")
@@ -259,7 +283,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         confs = data.get("confirmations", 0)
         swept = data.get("sweep_tx_hashes", [])
         print(
-            f"VERIFIED X-Signature-256 | event={event} | order_id={order_id} | "
+            f"VERIFIED {sig_label} (ts={ts_hdr}) | event={event} | order_id={order_id} | "
             f"status={status} | received={rx_xmr} XMR | confirmations={confs} | sweep_txs={swept}",
             flush=True,
         )
