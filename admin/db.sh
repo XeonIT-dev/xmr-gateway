@@ -300,17 +300,78 @@ cmd_backup() {
     [[ -n "${DB_PATH:-}" ]] || die "DATABASE_URL is in-memory; cannot back up."
     [[ -f "$DB_PATH" ]] || die "SQLite database not found: $DB_PATH"
 
-    mkdir -p "$dest_dir"
-    chmod 700 "$dest_dir"
+    if [[ -L "$dest_dir" ]]; then
+        die "Refusing backup into symlinked destination directory: $dest_dir"
+    fi
+    if [[ ! -e "$dest_dir" ]]; then
+        install -d -m 0700 "$dest_dir"
+    elif [[ ! -d "$dest_dir" ]]; then
+        die "Backup destination is not a directory: $dest_dir"
+    fi
 
-    local ts backup_file
+    local ts
     ts="$(date -u +%Y%m%dT%H%M%SZ)"
-    backup_file="${dest_dir%/}/xmr_gateway.backup.${ts}.db"
 
-    python3 - "$DB_PATH" "$backup_file" "$ADMIN_JSON" <<'PYEOF'
-import json, os, sqlite3, sys
+    python3 - "$DB_PATH" "${dest_dir%/}" "$ts" "$ADMIN_JSON" <<'PYEOF'
+import json, os, secrets, sqlite3, stat, sys, tempfile
 
-src_path, dst_path, as_json = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+src_path, dest_dir, ts, as_json = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1"
+
+try:
+    dir_st = os.lstat(dest_dir)
+except OSError as exc:
+    sys.stderr.write(f"Backup destination check failed for {dest_dir}: {exc}\n")
+    sys.exit(1)
+
+if stat.S_ISLNK(dir_st.st_mode) or not stat.S_ISDIR(dir_st.st_mode):
+    sys.stderr.write(f"Refusing backup: destination {dest_dir} is not a real directory\n")
+    sys.exit(1)
+
+# Fail closed if any symlink matching xmr_gateway.backup* exists inside dest_dir
+for entry in os.listdir(dest_dir):
+    if entry.startswith("xmr_gateway.backup"):
+        entry_path = os.path.join(dest_dir, entry)
+        if os.path.islink(entry_path):
+            sys.stderr.write(
+                f"Refusing backup: symlink detected in backup destination ({entry_path})\n"
+            )
+            sys.exit(1)
+
+# Never chmod an already-existing directory (e.g. /tmp must keep 1777). If the target directory
+# is world-writable, isolate the backup inside a freshly created 0700 subdirectory.
+if (dir_st.st_mode & stat.S_IWOTH) != 0:
+    actual_dir = tempfile.mkdtemp(prefix=f"xmr-gateway-backup-{ts}-", dir=dest_dir)
+    os.chmod(actual_dir, 0o700)
+else:
+    actual_dir = dest_dir
+
+forced_name = os.environ.get("XMR_BACKUP_FILENAME", "").strip()
+if forced_name:
+    if "/" in forced_name or "\\" in forced_name or forced_name in (".", ".."):
+        sys.stderr.write("Invalid XMR_BACKUP_FILENAME\n")
+        sys.exit(1)
+    backup_name = forced_name
+else:
+    backup_name = f"xmr_gateway.backup.{ts}.{secrets.token_hex(6)}.db"
+
+dst_path = os.path.join(actual_dir, backup_name)
+open_flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+try:
+    fd = os.open(dst_path, open_flags, 0o600)
+except OSError as exc:
+    sys.stderr.write(f"Refusing to create backup target {dst_path} exclusively: {exc}\n")
+    sys.exit(1)
+
+try:
+    if hasattr(os, "fchmod"):
+        os.fchmod(fd, 0o600)
+finally:
+    os.close(fd)
+
+dst_st = os.lstat(dst_path)
+if stat.S_ISLNK(dst_st.st_mode) or not stat.S_ISREG(dst_st.st_mode):
+    sys.stderr.write(f"Refusing backup: target {dst_path} is not a regular file\n")
+    sys.exit(1)
 
 # Safe hot online backup via SQLite Online Backup API (WAL-safe, never raw file copy)
 src = sqlite3.connect(f"file:{src_path}?mode=ro", uri=True, timeout=10.0)
@@ -323,7 +384,12 @@ finally:
     src.close()
     dst.close()
 
-os.chmod(dst_path, 0o600)
+verify_fd = os.open(dst_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    if hasattr(os, "fchmod"):
+        os.fchmod(verify_fd, 0o600)
+finally:
+    os.close(verify_fd)
 
 # Verify integrity of resulting backup file
 chk = sqlite3.connect(f"file:{dst_path}?mode=ro", uri=True)

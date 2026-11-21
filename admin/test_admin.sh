@@ -1549,6 +1549,77 @@ TS_VER_OUT="$("$ADMIN_SH" --env "$TEST_ENV" --json webhooks verify-sig "$TS_SIG"
 assert_contains "$TS_VER_OUT" '"valid": true' "webhooks verify-sig --timestamp validates X-Webhook-Signature"
 assert_contains "$TS_VER_OUT" '"header": "X-Webhook-Signature"' "webhooks verify-sig --timestamp reports X-Webhook-Signature header"
 
+# ==============================================================================
+# 16. v0.1.4 Hardening Regression Tests (db backup symlink/chmod & install_tarball 0755)
+# ==============================================================================
+printf '\n=== 16. v0.1.4 Hardening Regression Tests ===\n'
+
+# 16a) db backup MUST preserve existing directory permissions (e.g. 0755 and 1777)
+EXISTING_BAK_DIR="$TMP_DIR/existing_backups_0755"
+mkdir -p "$EXISTING_BAK_DIR"
+chmod 0755 "$EXISTING_BAK_DIR"
+"$ADMIN_SH" --env "$TEST_ENV" --json db backup "$EXISTING_BAK_DIR" >/dev/null
+assert_eq "$(stat -c '%a' "$EXISTING_BAK_DIR")" "755" "db backup preserves 0755 on existing backup directory"
+
+WORLD_WRITABLE_DIR="$TMP_DIR/world_writable_1777"
+mkdir -p "$WORLD_WRITABLE_DIR"
+chmod 1777 "$WORLD_WRITABLE_DIR"
+WW_JSON="$("$ADMIN_SH" --env "$TEST_ENV" --json db backup "$WORLD_WRITABLE_DIR")"
+assert_eq "$(stat -c '%a' "$WORLD_WRITABLE_DIR")" "1777" "db backup preserves 1777 on world-writable directory (/tmp safety)"
+WW_BAK_FILE="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["backup_file"])' <<< "$WW_JSON")"
+assert_eq "$(stat -c '%a' "$WW_BAK_FILE")" "600" "db backup file inside isolated subdirectory has 0600 mode"
+assert_eq "$(stat -c '%a' "$(dirname "$WW_BAK_FILE")")" "700" "db backup isolates world-writable target inside 0700 mkdtemp subdirectory"
+
+# 16b) db backup MUST refuse pre-created symlinks without overwriting or chmodding the target file
+SYMLINK_TEST_DIR="$TMP_DIR/symlink_backup_dir"
+mkdir -p "$SYMLINK_TEST_DIR"
+chmod 0700 "$SYMLINK_TEST_DIR"
+VICTIM_FILE="$TMP_DIR/victim_sentinel.db"
+printf 'DO_NOT_OVERWRITE_ME\n' > "$VICTIM_FILE"
+chmod 0644 "$VICTIM_FILE"
+
+ln -s "$VICTIM_FILE" "$SYMLINK_TEST_DIR/xmr_gateway.backup.trap.db"
+if "$ADMIN_SH" --env "$TEST_ENV" --json db backup "$SYMLINK_TEST_DIR" >/dev/null 2>&1; then
+    fail "db backup MUST reject backup directory containing a pre-created xmr_gateway.backup* symlink"
+else
+    pass "db backup rejects pre-created xmr_gateway.backup* symlink (fail-closed)"
+fi
+rm -f "$SYMLINK_TEST_DIR/xmr_gateway.backup.trap.db"
+
+ln -s "$VICTIM_FILE" "$SYMLINK_TEST_DIR/forced_collision.db"
+if XMR_BACKUP_FILENAME="forced_collision.db" "$ADMIN_SH" --env "$TEST_ENV" --json db backup "$SYMLINK_TEST_DIR" >/dev/null 2>&1; then
+    fail "db backup MUST reject direct filename collision on a symlink via O_CREAT|O_EXCL|O_NOFOLLOW"
+else
+    pass "db backup rejects direct symlink collision via O_CREAT|O_EXCL|O_NOFOLLOW"
+fi
+assert_eq "$(cat "$VICTIM_FILE")" "DO_NOT_OVERWRITE_ME" "symlink target file contents remained untouched"
+assert_eq "$(stat -c '%a' "$VICTIM_FILE")" "644" "symlink target file permissions remained untouched"
+
+# 16c) scripts/install.sh install_tarball under umask 077 enforces 0755 on admin/*.sh and render-wallet-rpc-conf.sh
+TARBALL_STAGE="$TMP_DIR/tar_stage/xmr-gateway-0.1.4-linux-x86_64"
+mkdir -p "$TARBALL_STAGE/admin/lib" "$TARBALL_STAGE/admin/i18n" "$TARBALL_STAGE/deploy/systemd"
+printf '#!/bin/sh\nexit 0\n' > "$TARBALL_STAGE/xmr-gateway"
+chmod 0755 "$TARBALL_STAGE/xmr-gateway"
+cp "$REPO_ROOT/admin.sh" "$TARBALL_STAGE/admin.sh"
+cp "$REPO_ROOT/start.sh" "$TARBALL_STAGE/start.sh"
+cp "$REPO_ROOT/admin/"*.sh "$TARBALL_STAGE/admin/"
+cp "$REPO_ROOT/admin/lib/"*.sh "$TARBALL_STAGE/admin/lib/"
+cp "$REPO_ROOT/admin/i18n/"*.sh "$TARBALL_STAGE/admin/i18n/"
+cp "$REPO_ROOT/deploy/systemd/render-wallet-rpc-conf.sh" "$TARBALL_STAGE/deploy/systemd/render-wallet-rpc-conf.sh"
+# Simulate restrictive source permissions prior to archiving
+chmod 0600 "$TARBALL_STAGE/admin/"*.sh "$TARBALL_STAGE/deploy/systemd/render-wallet-rpc-conf.sh"
+TEST_TARBALL="$TMP_DIR/xmr-gateway-test.tar.gz"
+tar -czf "$TEST_TARBALL" -C "$TMP_DIR/tar_stage" "xmr-gateway-0.1.4-linux-x86_64"
+
+TAR_PREFIX="$TMP_DIR/installed_prefix"
+TAR_USR_SHARE="$TMP_DIR/installed_usr_share"
+bash -c 'umask 077; source <(sed "/^main \"\$@\"$/d" "$1"); PREFIX="$2"; TMP_DIR="$3"; XMR_USR_SHARE_DIR="$4"; INSTALL_LANG=en; install_tarball "$5"' \
+    _ "$INSTALL_SH" "$TAR_PREFIX" "$TMP_DIR/tar_work" "$TAR_USR_SHARE" "$TEST_TARBALL" >/dev/null
+assert_eq "$(stat -c '%a' "$TAR_PREFIX/admin/db.sh")" "755" "install_tarball sets 0755 on admin/db.sh under umask 077"
+assert_eq "$(stat -c '%a' "$TAR_PREFIX/admin/service.sh")" "755" "install_tarball sets 0755 on admin/service.sh under umask 077"
+assert_eq "$(stat -c '%a' "$TAR_PREFIX/deploy/systemd/render-wallet-rpc-conf.sh")" "755" "install_tarball sets 0755 on deploy/systemd/render-wallet-rpc-conf.sh"
+assert_eq "$(stat -c '%a' "$TAR_USR_SHARE/scripts/render-wallet-rpc-conf.sh")" "755" "install_tarball installs 0755 render-wallet-rpc-conf.sh into usr/share scripts dir"
+
 printf '\n====================================================================\n'
 printf 'Admin Test Summary: %d PASSED, %d FAILED\n' "$PASS_COUNT" "$FAIL_COUNT"
 printf '====================================================================\n'

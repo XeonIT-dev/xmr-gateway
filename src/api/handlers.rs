@@ -27,7 +27,7 @@ use crate::{
         invoice::{Invoice, InvoiceStatus, build_monero_uri, validate_order_id},
     },
     error::{GatewayError, GatewayResult},
-    security::url_policy::resolve_and_validate_webhook_url,
+    security::url_policy::{resolve_and_validate_webhook_url, validate_webhook_url_static},
     services::qr::generate_qr_png_base64,
 };
 
@@ -181,13 +181,16 @@ pub async fn create_invoice(
         }
         None => match state.config.default_webhook_url.as_deref() {
             Some(default_url) => {
-                let validated = resolve_and_validate_webhook_url(
+                // Static validation only (`v0.1.4`): operator-configured DEFAULT_WEBHOOK_URL is
+                // already validated at startup and undergoes live DNS resolution + IP pinning in
+                // WebhookDispatcher before every delivery, so transient external DNS outages
+                // never block invoice creation (`POST /api/v1/invoices`).
+                let validated_url = validate_webhook_url_static(
                     default_url,
                     "DEFAULT_WEBHOOK_URL",
                     state.config.webhook_url_policy(),
-                )
-                .await?;
-                Some(validated.url.to_string())
+                )?;
+                Some(validated_url.to_string())
             }
             None => None,
         },

@@ -626,6 +626,7 @@ impl InvoiceRepository {
     ) -> GatewayResult<Vec<Invoice>> {
         let rows: Vec<InvoiceRow> = match cutoff {
             Some(cutoff_ts) => {
+                let cutoff_str = cutoff_ts.to_rfc3339();
                 sqlx::query_as(
                     r#"
                     SELECT
@@ -636,11 +637,19 @@ impl InvoiceRepository {
                         created_at, updated_at, expires_at, confirmed_at, settled_at, swept_at, completed_at
                     FROM invoices
                     WHERE status IN ('PENDING', 'UNDERPAID', 'MEMPOOL', 'CONFIRMING', 'CONFIRMED', 'SETTLED', 'REORGED')
-                       OR created_at >= ?
+                    UNION
+                    SELECT
+                        id, order_id, account_index, address_index, subaddress,
+                        amount_piconero, received_piconero, confirmations, unlocked, double_spend_seen,
+                        reorg_epoch, status, callback_url, monero_uri, qr_code_base64,
+                        sweep_tx_hashes, sweep_amount_piconero, sweep_fee_piconero, last_sweep_error,
+                        created_at, updated_at, expires_at, confirmed_at, settled_at, swept_at, completed_at
+                    FROM invoices
+                    WHERE created_at >= ?
                     ORDER BY created_at ASC
                     "#,
                 )
-                .bind(cutoff_ts.to_rfc3339())
+                .bind(cutoff_str)
                 .fetch_all(&self.pool)
                 .await?
             }

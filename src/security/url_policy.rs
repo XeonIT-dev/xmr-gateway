@@ -92,8 +92,14 @@ fn is_prohibited_ipv6(v6: Ipv6Addr) -> bool {
 
     let is_unique_local = (segments[0] & 0xfe00) == 0xfc00; // fc00::/7
     let is_link_local = (segments[0] & 0xffc0) == 0xfe80; // fe80::/10
+    let is_site_local = (segments[0] & 0xffc0) == 0xfec0; // fec0::/10 (deprecated RFC 3879 site-local)
 
-    v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || is_unique_local || is_link_local
+    v6.is_loopback()
+        || v6.is_unspecified()
+        || v6.is_multicast()
+        || is_unique_local
+        || is_link_local
+        || is_site_local
 }
 
 /// Validates syntactic properties, scheme, embedded credentials, and static host/IP rules for
@@ -290,6 +296,8 @@ mod tests {
             "http://[fc00::1]/hook",
             "http://[fd12:3456:789a::1]/hook",
             "http://[fe80::1]/hook",
+            "http://[fec0::1]/hook",
+            "http://[feff::ffff]/hook",
             "http://[::ffff:127.0.0.1]:9000/hook",
             "http://[::ffff:169.254.169.254]/latest/meta-data/",
             "http://localhost:9000/hook",
@@ -377,6 +385,21 @@ mod tests {
         assert!(
             validate_resolved_addrs("callback_url", "evil.example.com", &v6_rebind, https_only)
                 .is_err()
+        );
+
+        let v6_site_local_rebind = [SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 1)),
+            443,
+        )];
+        assert!(
+            validate_resolved_addrs(
+                "callback_url",
+                "evil.example.com",
+                &v6_site_local_rebind,
+                https_only
+            )
+            .is_err(),
+            "DNS resolution to deprecated IPv6 site-local fec0::/10 MUST be blocked"
         );
 
         let public_addrs = [SocketAddr::new(

@@ -2,7 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::invoice::MONERO_UNLOCK_CONFIRMATIONS;
+use crate::{
+    domain::invoice::MONERO_UNLOCK_CONFIRMATIONS,
+    error::{DomainError, GatewayError, GatewayResult},
+};
 
 /// Generic JSON-RPC 2.0 request envelope.
 #[derive(Debug, Clone, Serialize)]
@@ -349,23 +352,45 @@ impl TransferEntry {
     ///
     /// Handles single-output transfers (`subaddr_index` + `amount`), batched multi-subaddress
     /// payouts (`subaddr_indices` + `amounts`), and multiple outputs targeting the **same**
-    /// subaddress within one transaction (`XMR-039`), summing per-subaddress amounts cleanly.
-    #[must_use]
-    pub fn subaddress_amounts(&self, account_index: u32) -> Vec<(u32, u64)> {
-        if !self.amounts.is_empty() && self.amounts.len() == self.subaddr_indices.len() {
+    /// subaddress within one transaction (`XMR-039`), summing per-subaddress amounts with checked
+    /// arithmetic and failing closed if `amounts` is non-empty with a length different from
+    /// `subaddr_indices` (`v0.1.4`).
+    ///
+    /// # Errors
+    /// Returns [`GatewayError::Rpc`] if `!amounts.is_empty() && amounts.len() != subaddr_indices.len()`,
+    /// or [`GatewayError::Domain`] (`AmountOverflow`) if summing multiple outputs to the same
+    /// subaddress overflows `u64`.
+    pub fn subaddress_amounts(&self, account_index: u32) -> GatewayResult<Vec<(u32, u64)>> {
+        if !self.amounts.is_empty() {
+            if self.amounts.len() != self.subaddr_indices.len() {
+                return Err(GatewayError::Rpc {
+                    code: None,
+                    message: format!(
+                        "malformed get_transfers entry for txid {}: amounts.len() ({}) != subaddr_indices.len() ({})",
+                        self.txid,
+                        self.amounts.len(),
+                        self.subaddr_indices.len()
+                    ),
+                });
+            }
             let mut summed: std::collections::BTreeMap<u32, u64> =
                 std::collections::BTreeMap::new();
             for (idx, &amt) in self.subaddr_indices.iter().zip(self.amounts.iter()) {
                 if idx.major == account_index {
                     let entry = summed.entry(idx.minor).or_insert(0);
-                    *entry = entry.saturating_add(amt);
+                    *entry = entry.checked_add(amt).ok_or_else(|| {
+                        GatewayError::Domain(DomainError::AmountOverflow(format!(
+                            "subaddress transfer amount overflow in txid {} for subaddress ({}, {})",
+                            self.txid, idx.major, idx.minor
+                        )))
+                    })?;
                 }
             }
-            summed.into_iter().collect()
+            Ok(summed.into_iter().collect())
         } else if self.subaddr_index.major == account_index {
-            vec![(self.subaddr_index.minor, self.amount)]
+            Ok(vec![(self.subaddr_index.minor, self.amount)])
         } else {
-            Vec::new()
+            Ok(Vec::new())
         }
     }
 }

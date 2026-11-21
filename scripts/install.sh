@@ -111,7 +111,7 @@ validate_version() {
         return 0
     fi
     if [[ ! "$v" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-        die "$(msg "Invalid --version '${v}': must be 'latest' or semantic tag like 'v0.1.3'." "Некорректная версия --version '${v}': ожидается 'latest' или тег вида 'v0.1.3'.")"
+        die "$(msg "Invalid --version '${v}': must be 'latest' or semantic tag like 'v0.1.4'." "Некорректная версия --version '${v}': ожидается 'latest' или тег вида 'v0.1.4'.")"
     fi
 }
 
@@ -243,14 +243,26 @@ install_tarball() {
     top_dir="$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
     [[ -n "$top_dir" && -x "$top_dir/xmr-gateway" ]] || die "Invalid tarball layout: missing xmr-gateway binary."
 
-    local parent_dir
+    local parent_dir sh_file
     parent_dir="$(dirname "$PREFIX")"
     if [[ "$(id -u)" -ne 0 ]] && { [[ -d "$PREFIX" && -w "$PREFIX" ]] || [[ -d "$parent_dir" && -w "$parent_dir" ]]; }; then
         install -d -m 0755 "$PREFIX" "$PREFIX/admin" "$PREFIX/admin/lib" "$PREFIX/admin/i18n"
         cp -a "$top_dir/." "$PREFIX/"
         chmod 0755 "$PREFIX/xmr-gateway" "$PREFIX/admin.sh"
+        for sh_file in "$PREFIX/admin/"*.sh; do
+            if [[ -f "$sh_file" ]]; then
+                chmod 0755 "$sh_file"
+            fi
+        done
         if [[ -f "$PREFIX/start.sh" ]]; then
             chmod 0755 "$PREFIX/start.sh"
+        fi
+        if [[ -f "$PREFIX/deploy/systemd/render-wallet-rpc-conf.sh" ]]; then
+            chmod 0755 "$PREFIX/deploy/systemd/render-wallet-rpc-conf.sh"
+            if [[ -n "${XMR_USR_SHARE_DIR:-}" ]]; then
+                install -D -m 0755 "$PREFIX/deploy/systemd/render-wallet-rpc-conf.sh" \
+                    "$XMR_USR_SHARE_DIR/scripts/render-wallet-rpc-conf.sh"
+            fi
         fi
         if [[ -w /usr/local/bin ]]; then
             ln -sfn "$PREFIX/xmr-gateway" /usr/local/bin/xmr-gateway
@@ -261,8 +273,18 @@ install_tarball() {
         run_as_root install -d -m 0755 "$PREFIX" "$PREFIX/admin" "$PREFIX/admin/lib" "$PREFIX/admin/i18n"
         run_as_root cp -a "$top_dir/." "$PREFIX/"
         run_as_root chmod 0755 "$PREFIX/xmr-gateway" "$PREFIX/admin.sh"
+        for sh_file in "$PREFIX/admin/"*.sh; do
+            if [[ -f "$sh_file" ]]; then
+                run_as_root chmod 0755 "$sh_file"
+            fi
+        done
         if [[ -f "$PREFIX/start.sh" ]]; then
             run_as_root chmod 0755 "$PREFIX/start.sh"
+        fi
+        if [[ -f "$PREFIX/deploy/systemd/render-wallet-rpc-conf.sh" ]]; then
+            run_as_root chmod 0755 "$PREFIX/deploy/systemd/render-wallet-rpc-conf.sh"
+            run_as_root install -D -m 0755 "$PREFIX/deploy/systemd/render-wallet-rpc-conf.sh" \
+                "${XMR_USR_SHARE_DIR:-/usr/share/xmr-gateway}/scripts/render-wallet-rpc-conf.sh"
         fi
         run_as_root ln -sfn "$PREFIX/xmr-gateway" /usr/local/bin/xmr-gateway
         run_as_root ln -sfn "$PREFIX/admin.sh" /usr/local/bin/xmr-gateway-admin

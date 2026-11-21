@@ -2,6 +2,18 @@
 
 All notable changes to `xmr-gateway` are documented in this file.
 
+## [0.1.4] - 2026-11-21
+
+### Fixed
+- **Strict `sweep_all` Array Length Validation (`src/services/scanner.rs`, `src/rpc/types.rs`):** Fails closed when `sweep_all` returns a non-empty `tx_hash_list` with missing or mismatched `amount_list` / `fee_list` lengths, retaining the attempt in `PREPARED` and recording a diagnostic sweep error for outgoing-transfer reconciliation instead of persisting zero-piconero `SWEPT` totals.
+- **Hardened `db backup` Against Symlink & Directory Permission Clobbering (`admin/db.sh`):** Never invokes `chmod 700` on an already-existing destination directory (preserving `/tmp`'s `1777` or existing backup folder permissions), isolates backups targeting world-writable directories inside a `0700` `mkdtemp` subdirectory, rejects pre-existing symlinks, adds a random `secrets.token_hex(6)` filename suffix, and opens the target file exclusively with `O_CREAT | O_EXCL | O_NOFOLLOW | O_RDWR` (`0600`) and `os.fchmod`.
+- **Batched `get_outgoing_transfers` in `reconcile_in_flight_sweeps` (`src/services/scanner.rs`):** Groups monitored sweep attempt subaddresses by `account_index` and queries `get_outgoing_transfers` in chunks of `SCANNER_SUBADDRESS_BATCH_SIZE` (instead of $O(N)$ individual RPC calls per attempt), while bounding default `CONFIRMED` sweep reorg polling to a 30-day window when `SUBADDRESS_MONITOR_DAYS=0`.
+- **Non-Blocking Static `DEFAULT_WEBHOOK_URL` Validation on Invoice Creation (`src/api/handlers.rs`):** Uses synchronous `validate_webhook_url_static` for operator-configured `DEFAULT_WEBHOOK_URL` when a request omits `callback_url` so transient external DNS outages never fail `POST /api/v1/invoices` with `400 Bad Request` (while preserving live DNS validation for client-supplied `callback_url` and connection-time DNS/IP pinning in `WebhookDispatcher`).
+- **Fail-Closed `TransferEntry::subaddress_amounts` & Multi-Batch Chain Height Consistency (`src/rpc/types.rs`, `src/services/scanner.rs`):** Rejects malformed `get_transfers` entries where `!amounts.is_empty() && amounts.len() != subaddr_indices.len()`, replaces `saturating_add` with checked addition returning `AmountOverflow`, and verifies `get_height` consistency before and after multi-batch `get_transfers` loops to prevent split-height evaluation across chunks.
+- **Deprecated IPv6 Site-Local (`fec0::/10`) SSRF Blocking (`src/security/url_policy.rs`):** Blocks `fec0::/10` (RFC 3879 site-local) across static URL literals and DNS-resolved webhook addresses.
+- **SQLite Query Plan & Index Optimizations (`src/db/repository.rs`, `migrations/20260304000000_sweep_attempts_invoice_status_idx.sql`):** Rewrote `list_monitored_invoices(Some(cutoff))` using `UNION` so SQLite uses `idx_invoices_status` and a range scan on `idx_invoices_created_at` instead of a full index scan, and added composite index `idx_sweep_attempts_invoice_status(invoice_id, status)`.
+- **Tarball Installer Script Permissions (`scripts/install.sh`):** Explicitly enforces `0755` permissions on `$PREFIX/admin/*.sh` and `$PREFIX/deploy/systemd/render-wallet-rpc-conf.sh` under `umask 077`, and installs `/usr/share/xmr-gateway/scripts/render-wallet-rpc-conf.sh` during system tarball installations.
+
 ## [0.1.3] - 2026-11-21
 
 ### Fixed

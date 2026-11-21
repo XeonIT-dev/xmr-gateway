@@ -156,7 +156,7 @@ PENDING ----------+-----------------------------> MEMPOOL (0-conf, не исте
 | Заголовок | Значение |
 |---|---|
 | `Content-Type` | `application/json` |
-| `User-Agent` | `xmr-gateway/0.1.3` |
+| `User-Agent` | `xmr-gateway/0.1.4` |
 | `X-Webhook-Timestamp` | Свежий Unix epoch timestamp (секунды) текущей попытки доставки (обновляется при каждом retry) |
 | `X-Webhook-Signature` | **Рекомендуемая основная подпись:** lowercase hex `HMAC-SHA256(WEBHOOK_SECRET, "{X-Webhook-Timestamp}.{raw_body}")` |
 | `X-Webhook-Event-Id` | Стабильный UUID бизнес-события (`payload.event_id`, неизменен между ретраями для идемпотентности) |
@@ -569,7 +569,7 @@ RUST_LOG=info,xmr_gateway=debug
    {
      "status": "ok",
      "service": "xmr-gateway",
-     "version": "0.1.3",
+     "version": "0.1.4",
      "database": "connected",
      "monero_rpc": {
        "connected": true,

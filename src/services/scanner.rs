@@ -57,6 +57,11 @@ use crate::{
 /// never prematurely retried (`AUDIT-003`).
 pub const PREPARED_INDEXING_GRACE_SECS: i64 = 60;
 
+/// Default maximum monitoring age (in days) for already-finalized `CONFIRMED` sweep attempts when
+/// `SUBADDRESS_MONITOR_DAYS=0` (`v0.1.4`). Active/unfinalized attempts (`PREPARED`, `SUBMITTED`,
+/// `RECONCILED`) remain monitored unconditionally regardless of age (`A4-4`).
+const DEFAULT_CONFIRMED_SWEEP_MONITOR_DAYS: i64 = 30;
+
 /// Returns `true` ONLY for Monero Wallet RPC / JSON-RPC error codes proven to be emitted before
 /// `wallet2::commit_tx` broadcasts a transaction (`A3-1`, verified against `monero-wallet-rpc`
 /// `v0.18.5.4` `on_sweep_all` / `handle_rpc_exception`).
@@ -173,6 +178,12 @@ impl ScannerService {
         }
     }
 
+    fn sweep_attempt_monitor_cutoff(&self) -> Option<DateTime<Utc>> {
+        self.monitor_cutoff().or_else(|| {
+            Some(Utc::now() - ChronoDuration::days(DEFAULT_CONFIRMED_SWEEP_MONITOR_DAYS))
+        })
+    }
+
     fn min_sweep_confs(&self) -> u64 {
         self.config
             .settlement_confirmations
@@ -214,6 +225,24 @@ impl ScannerService {
         }
 
         let batch_size = self.config.scanner_subaddress_batch_size.max(1);
+        let requires_multi_batch = indices_by_account
+            .values()
+            .map(|s| s.len().div_ceil(batch_size))
+            .sum::<usize>()
+            > 1;
+        let height_before = if requires_multi_batch {
+            Some(self.rpc.get_height().await?.height.ok_or_else(|| {
+                GatewayError::Rpc {
+                    code: None,
+                    message:
+                        "monero-wallet-rpc get_height returned missing height before batch scan"
+                            .to_string(),
+                }
+            })?)
+        } else {
+            None
+        };
+
         let mut grouped: HashMap<(u32, u32), Vec<ObservedTransfer>> = HashMap::new();
         let mut total_subaddresses = 0_usize;
         let mut total_batches = 0_usize;
@@ -235,6 +264,28 @@ impl ScannerService {
                     let transfers = batch_grouped.remove(&minor_idx).unwrap_or_default();
                     grouped.insert((*account_index, minor_idx), transfers);
                 }
+            }
+        }
+
+        if let Some(h_before) = height_before {
+            let h_after = self
+                .rpc
+                .get_height()
+                .await?
+                .height
+                .ok_or_else(|| GatewayError::Rpc {
+                    code: None,
+                    message:
+                        "monero-wallet-rpc get_height returned missing height after batch scan"
+                            .to_string(),
+                })?;
+            if h_after != h_before {
+                return Err(GatewayError::Rpc {
+                    code: None,
+                    message: format!(
+                        "wallet chain height changed across get_transfers batches ({h_before} -> {h_after}); aborting scan tick fail-closed to prevent split-height evaluation"
+                    ),
+                });
             }
         }
 
@@ -949,17 +1000,59 @@ impl ScannerService {
     pub async fn reconcile_in_flight_sweeps(&self) -> GatewayResult<usize> {
         let attempts = self
             .repo
-            .list_monitored_sweep_attempts(self.monitor_cutoff())
+            .list_monitored_sweep_attempts(self.sweep_attempt_monitor_cutoff())
             .await?;
         if attempts.is_empty() {
             return Ok(0);
         }
 
+        // Batch `get_outgoing_transfers` by `account_index` in chunks of
+        // `scanner_subaddress_batch_size` instead of issuing N individual RPC calls (`v0.1.4`).
+        let mut account_by_invoice: HashMap<Uuid, u32> = HashMap::new();
+        let mut indices_by_account: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+        for attempt in &attempts {
+            let account_index = if let Some(&acct) = account_by_invoice.get(&attempt.invoice_id) {
+                acct
+            } else if let Some(inv) = self.repo.get_invoice_by_id(attempt.invoice_id).await? {
+                account_by_invoice.insert(inv.id, inv.account_index);
+                inv.account_index
+            } else {
+                continue;
+            };
+            indices_by_account
+                .entry(account_index)
+                .or_default()
+                .insert(attempt.address_index);
+        }
+
+        let batch_size = self.config.scanner_subaddress_batch_size.max(1);
+        let mut outgoing_by_subaddr: HashMap<(u32, u32), Arc<GetTransfersResponse>> =
+            HashMap::new();
+        for (account_index, subaddr_set) in &indices_by_account {
+            let sorted_indices: Vec<u32> = subaddr_set.iter().copied().collect();
+            for batch in sorted_indices.chunks(batch_size) {
+                let batch_resp = Arc::new(
+                    self.rpc
+                        .get_outgoing_transfers(*account_index, batch)
+                        .await?,
+                );
+                for &minor_idx in batch {
+                    outgoing_by_subaddr.insert((*account_index, minor_idx), batch_resp.clone());
+                }
+            }
+        }
+
         let mut reconciled_count = 0_usize;
         for attempt in attempts {
+            let prefetched = account_by_invoice
+                .get(&attempt.invoice_id)
+                .and_then(|&acct| outgoing_by_subaddr.get(&(acct, attempt.address_index)))
+                .map(Arc::as_ref);
             let lock = self.acquire_invoice_lock(attempt.invoice_id).await;
             let guard = lock.lock().await;
-            let res = self.reconcile_single_attempt_locked(&attempt).await;
+            let res = self
+                .reconcile_single_attempt_locked_with_outgoing(&attempt, prefetched)
+                .await;
             drop(guard);
             self.release_invoice_lock(attempt.invoice_id, lock).await;
             if res?.is_some() {
@@ -973,6 +1066,15 @@ impl ScannerService {
     async fn reconcile_single_attempt_locked(
         &self,
         stale_attempt: &SweepAttempt,
+    ) -> GatewayResult<Option<Invoice>> {
+        self.reconcile_single_attempt_locked_with_outgoing(stale_attempt, None)
+            .await
+    }
+
+    async fn reconcile_single_attempt_locked_with_outgoing(
+        &self,
+        stale_attempt: &SweepAttempt,
+        prefetched_out: Option<&GetTransfersResponse>,
     ) -> GatewayResult<Option<Invoice>> {
         // Re-fetch authoritative attempt state inside the per-invoice lock (`AUDIT-003`) so a
         // concurrent manual/auto sweep completion is never overwritten by a stale pre-lock snapshot.
@@ -997,10 +1099,16 @@ impl ScannerService {
             return Ok(None);
         };
 
-        let out_resp = self
-            .rpc
-            .get_outgoing_transfers(invoice.account_index, &[attempt.address_index])
-            .await?;
+        let owned_out;
+        let out_resp = if let Some(prefetched) = prefetched_out {
+            prefetched
+        } else {
+            owned_out = self
+                .rpc
+                .get_outgoing_transfers(invoice.account_index, &[attempt.address_index])
+                .await?;
+            &owned_out
+        };
 
         if matches!(
             attempt.status,
@@ -1009,7 +1117,7 @@ impl ScannerService {
                 | SweepAttemptStatus::Reconciled
         ) {
             return self
-                .reconcile_tracked_sweep_attempt(&invoice, &attempt, &out_resp)
+                .reconcile_tracked_sweep_attempt(&invoice, &attempt, out_resp)
                 .await;
         }
 
@@ -1469,6 +1577,27 @@ impl ScannerService {
             let err = GatewayError::Rpc {
                 code: None,
                 message: "sweep_all returned empty tx_hash_list".to_string(),
+            };
+            let _ = self
+                .repo
+                .record_sweep_error(invoice_id, &err.to_string(), Utc::now())
+                .await;
+            return Err(err);
+        }
+
+        let expected_len = sweep_res.tx_hash_list.len();
+        if sweep_res.amount_list.len() != expected_len || sweep_res.fee_list.len() != expected_len {
+            // Fail-closed (`v0.1.4`): never finalize a non-empty sweep with missing or mismatched
+            // amount_list/fee_list (which would record 0-piconero SWEPT accounting totals).
+            // Retain PREPARED so out/pending reconciliation recovers verified amounts & fees.
+            let err = GatewayError::Rpc {
+                code: None,
+                message: format!(
+                    "sweep_all returned mismatched array lengths: tx_hash_list={}, amount_list={}, fee_list={}",
+                    expected_len,
+                    sweep_res.amount_list.len(),
+                    sweep_res.fee_list.len()
+                ),
             };
             let _ = self
                 .repo
@@ -2033,7 +2162,7 @@ fn group_transfers_by_subaddress(
     let mut per_subaddr_by_txid: HashMap<u32, HashMap<String, ObservedTransfer>> = HashMap::new();
 
     for entry in &resp.pool {
-        for (minor_idx, amt) in entry.subaddress_amounts(account_index) {
+        for (minor_idx, amt) in entry.subaddress_amounts(account_index)? {
             let tx_map = per_subaddr_by_txid.entry(minor_idx).or_default();
             if let Some(existing) = tx_map.get_mut(&entry.txid) {
                 let summed = existing
@@ -2067,7 +2196,7 @@ fn group_transfers_by_subaddress(
 
     for entry in &resp.in_transfers {
         let is_unlocked = entry.is_unlocked(false);
-        for (minor_idx, amt) in entry.subaddress_amounts(account_index) {
+        for (minor_idx, amt) in entry.subaddress_amounts(account_index)? {
             let tx_map = per_subaddr_by_txid.entry(minor_idx).or_default();
             match tx_map.get_mut(&entry.txid) {
                 Some(existing) if existing.in_pool => {
@@ -3521,6 +3650,17 @@ mod tests {
                 }))
             }
         }
+
+        Mock::given(method("POST"))
+            .and(path("/json_rpc"))
+            .and(body_string_contains("get_height"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "h1",
+                "result": { "height": 1000_u64 }
+            })))
+            .mount(&mock_rpc)
+            .await;
 
         Mock::given(method("POST"))
             .and(path("/json_rpc"))

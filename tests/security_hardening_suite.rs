@@ -191,7 +191,7 @@ async fn regression_xmr_022_039_batch_tx_multi_invoice_and_multi_output_same_sub
     }))
     .unwrap();
     assert_eq!(
-        multi_same_subaddr.subaddress_amounts(0),
+        multi_same_subaddr.subaddress_amounts(0).unwrap(),
         vec![(1, 1_000_000_000_000)]
     );
 
@@ -11086,4 +11086,482 @@ async fn regression_external_audit_hardening_xmr_audit_001_003_004() {
             .all(|h| h.event_type != WebhookEventType::Reorged),
         "mempool dust MUST NOT emit a REORGED webhook"
     );
+}
+
+#[tokio::test]
+async fn regression_v014_sweep_all_mismatched_amount_or_fee_list_stays_prepared() {
+    let pool = init_sqlite_pool("sqlite::memory:").await.unwrap();
+    let repo = InvoiceRepository::new(pool);
+    let mock_rpc = MockServer::start().await;
+    let cfg = test_config(format!("{}/json_rpc", mock_rpc.uri()), None, true, 10, 15);
+    let rpc = MoneroRpcClient::new(&cfg.monero_rpc_url, None, None).unwrap();
+    let scanner = ScannerService::new(repo.clone(), rpc, cfg);
+
+    let mut inv = make_invoice(401, 1_000_000_000_000, None);
+    inv.status = InvoiceStatus::Settled;
+    inv.received_piconero = Piconero(1_000_000_000_000);
+    inv.confirmations = 15;
+    inv.unlocked = true;
+    repo.insert_invoice(&inv).await.unwrap();
+
+    // Case 1: non-empty tx_hash_list, but amount_list is missing/empty -> MUST NOT finalize as SWEPT
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains(r#""in":true"#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "in_401",
+            "result": {
+                "in": [{
+                    "txid": "41".repeat(32),
+                    "amount": 1_000_000_000_000_u64,
+                    "confirmations": 15,
+                    "double_spend_seen": false,
+                    "locked": false,
+                    "subaddr_index": { "major": 0, "minor": 401 }
+                }],
+                "pool": []
+            }
+        })))
+        .mount(&mock_rpc)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("sweep_all"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "sw_bad_amt",
+            "result": {
+                "tx_hash_list": ["a1".repeat(32)],
+                "fee_list": [100_000_000_u64]
+            }
+        })))
+        .expect(1)
+        .mount(&mock_rpc)
+        .await;
+
+    let res = scanner.manual_sweep(inv.id).await;
+    assert!(
+        res.is_err(),
+        "sweep_all with missing amount_list MUST return an error"
+    );
+
+    let inv_after = repo.get_invoice_by_id(inv.id).await.unwrap().unwrap();
+    assert_eq!(
+        inv_after.status,
+        InvoiceStatus::Settled,
+        "invoice MUST NOT transition to SWEPT when amount_list/fee_list is missing or shorter"
+    );
+    assert!(
+        inv_after
+            .last_sweep_error
+            .as_deref()
+            .is_some_and(|e| e.contains("mismatched array lengths")),
+        "diagnostic error must be recorded on invoice: {:?}",
+        inv_after.last_sweep_error
+    );
+
+    let attempts = repo.list_sweep_attempts_for_invoice(inv.id).await.unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(
+        attempts[0].status,
+        SweepAttemptStatus::Prepared,
+        "attempt MUST remain PREPARED for reconciliation"
+    );
+
+    // Case 2: two tx hashes in tx_hash_list, but fee_list has only 1 entry -> MUST also fail closed
+    let mut inv2 = make_invoice(402, 2_000_000_000_000, None);
+    inv2.status = InvoiceStatus::Settled;
+    inv2.received_piconero = Piconero(2_000_000_000_000);
+    inv2.confirmations = 15;
+    inv2.unlocked = true;
+    repo.insert_invoice(&inv2).await.unwrap();
+
+    mock_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains(r#""in":true"#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "in_402",
+            "result": {
+                "in": [{
+                    "txid": "42".repeat(32),
+                    "amount": 2_000_000_000_000_u64,
+                    "confirmations": 15,
+                    "double_spend_seen": false,
+                    "locked": false,
+                    "subaddr_index": { "major": 0, "minor": 402 }
+                }],
+                "pool": []
+            }
+        })))
+        .mount(&mock_rpc)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("sweep_all"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "sw_short_fee",
+            "result": {
+                "tx_hash_list": ["b1".repeat(32), "b2".repeat(32)],
+                "amount_list": [999_900_000_000_u64, 999_900_000_000_u64],
+                "fee_list": [100_000_000_u64]
+            }
+        })))
+        .expect(1)
+        .mount(&mock_rpc)
+        .await;
+
+    assert!(scanner.manual_sweep(inv2.id).await.is_err());
+    let inv2_after = repo.get_invoice_by_id(inv2.id).await.unwrap().unwrap();
+    assert_eq!(inv2_after.status, InvoiceStatus::Settled);
+    let attempts2 = repo.list_sweep_attempts_for_invoice(inv2.id).await.unwrap();
+    assert_eq!(attempts2.len(), 1);
+    assert_eq!(attempts2[0].status, SweepAttemptStatus::Prepared);
+}
+
+#[tokio::test]
+async fn regression_v014_reconcile_in_flight_sweeps_batches_get_outgoing_transfers() {
+    use wiremock::{Request as WireRequest, Respond};
+
+    let pool = init_sqlite_pool("sqlite::memory:").await.unwrap();
+    let repo = InvoiceRepository::new(pool);
+    let mock_rpc = MockServer::start().await;
+
+    let mut cfg_owned =
+        (*test_config(format!("{}/json_rpc", mock_rpc.uri()), None, true, 10, 15)).clone();
+    cfg_owned.scanner_subaddress_batch_size = 2;
+    let cfg = Arc::new(cfg_owned);
+    let cold_addr = cfg.cold_wallet_address.as_deref().unwrap().to_string();
+    let rpc = MoneroRpcClient::new(&cfg.monero_rpc_url, None, None).unwrap();
+    let scanner = ScannerService::new(repo.clone(), rpc, cfg);
+
+    // Create 5 SUBMITTED sweep attempts across subaddresses 1..=5
+    for idx in 1_u32..=5 {
+        let mut inv = make_invoice(idx, 1_000_000_000_000, None);
+        inv.status = InvoiceStatus::Settled;
+        inv.received_piconero = Piconero(1_000_000_000_000);
+        inv.confirmations = 15;
+        inv.unlocked = true;
+        repo.insert_invoice(&inv).await.unwrap();
+
+        let att = repo
+            .create_prepared_sweep_attempt(inv.id, idx, &cold_addr, Utc::now())
+            .await
+            .unwrap();
+        let tx_hash = format!("{idx:064x}");
+        repo.complete_sweep_attempt(CompleteSweepAttemptParams {
+            attempt_id: att.id,
+            invoice_id: inv.id,
+            attempt_status: SweepAttemptStatus::Submitted,
+            sweep_tx_hashes: vec![tx_hash],
+            sweep_amount_piconero: Piconero(999_900_000_000),
+            sweep_fee_piconero: Piconero(100_000_000),
+            webhook: None,
+            now: Utc::now(),
+        })
+        .await
+        .unwrap();
+    }
+
+    let recorded_out_batches: Arc<std::sync::Mutex<Vec<Vec<u32>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    struct OutgoingBatchResponder {
+        recorded: Arc<std::sync::Mutex<Vec<Vec<u32>>>>,
+        cold_addr: String,
+    }
+
+    impl Respond for OutgoingBatchResponder {
+        fn respond(&self, request: &WireRequest) -> ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let indices: Vec<u32> = body["params"]["subaddr_indices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| u32::try_from(v.as_u64().unwrap()).unwrap())
+                .collect();
+            self.recorded.lock().unwrap().push(indices.clone());
+
+            let out_entries: Vec<serde_json::Value> = indices
+                .iter()
+                .map(|&idx| {
+                    serde_json::json!({
+                        "txid": format!("{idx:064x}"),
+                        "amount": 999_900_000_000_u64,
+                        "fee": 100_000_000_u64,
+                        "confirmations": 20,
+                        "double_spend_seen": false,
+                        "subaddr_index": { "major": 0, "minor": idx },
+                        "destinations": [
+                            { "amount": 999_900_000_000_u64, "address": self.cold_addr }
+                        ]
+                    })
+                })
+                .collect();
+
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "out_batch",
+                "result": { "out": out_entries, "pending": [] }
+            }))
+        }
+    }
+
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains(r#""out":true"#))
+        .respond_with(OutgoingBatchResponder {
+            recorded: recorded_out_batches.clone(),
+            cold_addr,
+        })
+        .mount(&mock_rpc)
+        .await;
+
+    scanner.reconcile_in_flight_sweeps().await.unwrap();
+
+    let batches = recorded_out_batches.lock().unwrap().clone();
+    assert_eq!(
+        batches,
+        vec![vec![1, 2], vec![3, 4], vec![5]],
+        "5 monitored sweep attempts with batch_size=2 MUST execute ceil(5/2)=3 batched get_outgoing_transfers calls"
+    );
+}
+
+#[tokio::test]
+async fn regression_v014_create_invoice_does_not_block_on_default_webhook_url_dns() {
+    let pool = init_sqlite_pool("sqlite::memory:").await.unwrap();
+    let repo = InvoiceRepository::new(pool);
+    let mock_rpc = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("create_address"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "ca1",
+            "result": {
+                "address": "55LTR8KniP4LQGJSPtbYDacR7dz8RBFnsfAKMaMuwUNYX6aQbBcovzDPyrQF9KXF9tVU6Xk3K8no1BywnJX6GvZX8yJsXvt",
+                "address_index": 1
+            }
+        })))
+        .mount(&mock_rpc)
+        .await;
+
+    // Configure DEFAULT_WEBHOOK_URL with an unresolvable domain (.invalid RFC 2606) under strict SSRF policy
+    let mut cfg_owned = (*test_config(
+        format!("{}/json_rpc", mock_rpc.uri()),
+        Some("https://offline-webhook-target.invalid/hook".to_string()),
+        false,
+        2,
+        10,
+    ))
+    .clone();
+    cfg_owned.allow_private_webhooks = false;
+    cfg_owned.require_https_webhooks = true;
+    let cfg = Arc::new(cfg_owned);
+    let rpc = MoneroRpcClient::new(&cfg.monero_rpc_url, None, None).unwrap();
+    let scanner = ScannerService::new(repo.clone(), rpc.clone(), cfg.clone());
+    let app = build_router(AppState {
+        config: cfg.clone(),
+        repo: repo.clone(),
+        rpc,
+        scanner,
+    });
+
+    // 1) Omitting callback_url uses static validation on DEFAULT_WEBHOOK_URL -> MUST succeed (201 Created)
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/invoices")
+                .header("content-type", "application/json")
+                .header("X-API-Key", cfg.api_secret_key.as_str())
+                .body(Body::from(
+                    serde_json::json!({
+                        "order_id": "ord-dns-outage-1",
+                        "amount_piconero": 500_000_000_000_u64
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "POST /api/v1/invoices without callback_url MUST NOT fail when DEFAULT_WEBHOOK_URL DNS is unreachable"
+    );
+
+    // 2) Client-supplied callback_url with unresolvable domain STILL undergoes live DNS validation -> 400 Bad Request
+    let resp_client_url = app
+        .oneshot(
+            Request::post("/api/v1/invoices")
+                .header("content-type", "application/json")
+                .header("X-API-Key", cfg.api_secret_key.as_str())
+                .body(Body::from(
+                    serde_json::json!({
+                        "order_id": "ord-dns-outage-2",
+                        "amount_piconero": 500_000_000_000_u64,
+                        "callback_url": "https://unresolvable-client.invalid/hook"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_client_url.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn regression_v014_cross_batch_size_1_subaddress_amounts_and_height_consistency() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use wiremock::{Request as WireRequest, Respond};
+
+    // Part A: TransferEntry::subaddress_amounts rejects mismatched lengths and u64 overflow
+    let mismatched: TransferEntry = serde_json::from_value(serde_json::json!({
+        "txid": "c".repeat(64),
+        "amount": 1_000_000_000_000_u64,
+        "amounts": [500_000_000_000_u64, 500_000_000_000_u64],
+        "subaddr_index": { "major": 0, "minor": 1 },
+        "subaddr_indices": [
+            { "major": 0, "minor": 1 }
+        ]
+    }))
+    .unwrap();
+    assert!(
+        mismatched.subaddress_amounts(0).is_err(),
+        "mismatched amounts.len() != subaddr_indices.len() MUST fail closed"
+    );
+
+    let overflow_entry: TransferEntry = serde_json::from_value(serde_json::json!({
+        "txid": "d".repeat(64),
+        "amount": u64::MAX,
+        "amounts": [u64::MAX, 1_u64],
+        "subaddr_index": { "major": 0, "minor": 1 },
+        "subaddr_indices": [
+            { "major": 0, "minor": 1 },
+            { "major": 0, "minor": 1 }
+        ]
+    }))
+    .unwrap();
+    assert!(
+        overflow_entry.subaddress_amounts(0).is_err(),
+        "u64 overflow across duplicate subaddr_indices MUST fail closed with AmountOverflow"
+    );
+
+    // Part B: Multi-output txid paying 2 invoices across 2 separate batches with batch_size = 1,
+    // plus fail-closed abort when get_height drifts between batch 1 and batch 2.
+    let pool = init_sqlite_pool("sqlite::memory:").await.unwrap();
+    let repo = InvoiceRepository::new(pool);
+    let mock_rpc = MockServer::start().await;
+
+    let inv1 = make_invoice(1, 1_000_000_000_000, None);
+    let inv2 = make_invoice(2, 2_000_000_000_000, None);
+    repo.insert_invoice(&inv1).await.unwrap();
+    repo.insert_invoice(&inv2).await.unwrap();
+
+    let mut cfg_owned =
+        (*test_config(format!("{}/json_rpc", mock_rpc.uri()), None, false, 2, 10)).clone();
+    cfg_owned.scanner_subaddress_batch_size = 1;
+    let cfg = Arc::new(cfg_owned);
+    let rpc = MoneroRpcClient::new(&cfg.monero_rpc_url, None, None).unwrap();
+    let scanner = ScannerService::new(repo.clone(), rpc, cfg);
+
+    let current_height = Arc::new(AtomicU64::new(5000));
+    let drift_on_get_height = Arc::new(AtomicU64::new(0));
+
+    struct HeightAndBatchResponder {
+        height: Arc<AtomicU64>,
+        drift_step: Arc<AtomicU64>,
+    }
+
+    impl Respond for HeightAndBatchResponder {
+        fn respond(&self, request: &WireRequest) -> ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let method_name = body["method"].as_str().unwrap();
+            if method_name == "get_height" {
+                let delta = self.drift_step.load(Ordering::SeqCst);
+                let h = self.height.fetch_add(delta, Ordering::SeqCst);
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "h",
+                    "result": { "height": h }
+                }));
+            }
+            assert_eq!(method_name, "get_transfers");
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "gt",
+                "result": {
+                    "in": [{
+                        "txid": "e".repeat(64),
+                        "amount": 3_000_000_000_000_u64,
+                        "amounts": [1_000_000_000_000_u64, 2_000_000_000_000_u64],
+                        "confirmations": 12,
+                        "double_spend_seen": false,
+                        "locked": false,
+                        "subaddr_index": { "major": 0, "minor": 1 },
+                        "subaddr_indices": [
+                            { "major": 0, "minor": 1 },
+                            { "major": 0, "minor": 2 }
+                        ]
+                    }],
+                    "pool": []
+                }
+            }))
+        }
+    }
+
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .respond_with(HeightAndBatchResponder {
+            height: current_height.clone(),
+            drift_step: drift_on_get_height.clone(),
+        })
+        .mount(&mock_rpc)
+        .await;
+
+    // 1) Simulate chain height advancing mid-cycle (5000 before batch 1 -> 5001 after batch 2):
+    //    scan_once MUST fail closed BEFORE mutating either invoice!
+    drift_on_get_height.store(1, Ordering::SeqCst);
+    let drift_err = scanner.scan_once().await.unwrap_err();
+    assert!(
+        drift_err
+            .to_string()
+            .contains("wallet chain height changed across get_transfers batches"),
+        "expected height drift error, got: {drift_err}"
+    );
+    assert_eq!(
+        repo.get_invoice_by_id(inv1.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        InvoiceStatus::Pending
+    );
+    assert_eq!(
+        repo.get_invoice_by_id(inv2.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        InvoiceStatus::Pending
+    );
+
+    // 2) Stable chain height with batch_size = 1: both invoices transition Pending -> Confirmed -> Completed
+    //    with exact per-subaddress amounts!
+    drift_on_get_height.store(0, Ordering::SeqCst);
+    scanner.scan_once().await.unwrap();
+    scanner.scan_once().await.unwrap();
+
+    let loaded1 = repo.get_invoice_by_id(inv1.id).await.unwrap().unwrap();
+    let loaded2 = repo.get_invoice_by_id(inv2.id).await.unwrap().unwrap();
+    assert_eq!(loaded1.status, InvoiceStatus::Completed);
+    assert_eq!(loaded1.received_piconero, Piconero(1_000_000_000_000));
+    assert_eq!(loaded2.status, InvoiceStatus::Completed);
+    assert_eq!(loaded2.received_piconero, Piconero(2_000_000_000_000));
 }
