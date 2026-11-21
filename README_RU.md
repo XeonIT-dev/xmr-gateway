@@ -164,6 +164,11 @@ PENDING ----------+-----------------------------> MEMPOOL (0-conf, не исте
 | `X-Signature-256` | Обратно совместимая подпись тела `HMAC-SHA256(WEBHOOK_SECRET, raw_body_bytes)` |
 | `X-Webhook-Event` | Имя события (`MEMPOOL`, `CONFIRMED`, `SETTLED`, `SWEPT`, `REORGED`, `EXPIRED`, `UNDERPAID`, `LATE_PAYMENT`, `OVERPAYMENT`) |
 
+> [!NOTE]
+> **Эксплуатационные причины ложных `REORGED` и `OVERPAYMENT`:**
+> - **Ложный `REORGED` при приёме платежей до завершения синхронизации кошелька (`lag > 0`):** даже если `wallet_height` отстаёт от `daemon_height`, `monero-wallet-rpc` сразу видит 0-conf транзакцию в мемпуле (`pool`), и шлюз отправляет вебхук `MEMPOOL`. Когда транзакция включается в блок выше текущего `wallet_height`, она исчезает из `pool`, но ещё не появляется в `in` — сканер fail-closed переводит инвойс в `REORGED` (`reorg_epoch + 1`) и шлёт вебхук `REORGED`. Когда кошелёк догонит сеть (`lag=0`), инвойс автоматически восстановится в `CONFIRMED` / `SETTLED` / `COMPLETED`. Чтобы исключить ложные `REORGED`, открывайте трафик строго после `lag=0` в `config doctor` (`wallet_daemon_sync`).
+> - **Мгновенный `CONFIRMED` / `COMPLETED` / `OVERPAYMENT` на только что созданном инвойсе без оплаты:** возникает при подключении к новой или очищенной БД `xmr_gateway.db` уже использовавшегося кошелька с историей входящих переводов на субадресах (`account=0, index=1, 2...`). Всегда используйте выделенный чистый кошелёк.
+
 - **Контракт проверки на стороне получателя:**
   1. Проверить окно свежести `abs(now_unix - int(X-Webhook-Timestamp)) <= 300` сек.
   2. Проверить `X-Webhook-Signature` в constant-time по строке `f"{X-Webhook-Timestamp}.".encode() + raw_body` с ключом `WEBHOOK_SECRET`.
@@ -197,6 +202,12 @@ PENDING ----------+-----------------------------> MEMPOOL (0-conf, не исте
    - Ждёт готовности до 60 секунд (120 попыток по `0.5s`, запрос `get_version` с Digest-авторизацией).
    - Сразу проверяет режим кошелька вызовом `query_key({"key_type":"spend_key"})` — при несоответствии `WALLET_MODE` аварийно завершается до запуска `xmr-gateway`.
 5. **Сборка и запуск `xmr-gateway`:** при необходимости запускает `cargo build --release` и стартует `./target/release/xmr-gateway`.
+
+> [!WARNING]
+> **Два обязательных правила перед открытием боевого приёма платежей** (подробно в [DEPLOY_RU.md](DEPLOY_RU.md#32-настройка-etcxmr-gatewayenv-и-инициализация-кошелька) и [admin/GUIDE_RU.md](admin/GUIDE_RU.md)):
+> 1. **Не открывайте приём платежей при `lag > 0`:** после создания, импорта (`view_only`) или пересканирования (`rescan`) кошелька дождитесь полной синхронизации (`lag=0`). Пока `wallet_height < daemon_height`, платежи видны в мемпуле (`pool` $\rightarrow$ `MEMPOOL`), но в момент включения в блок пропадают из `pool` до того, как кошелёк досканирует до этого блока (`in`), что вызывает fail-closed переход в `REORGED` и отправку **ложного вебхука `REORGED`** (средства не теряются и статус автоматически восстановится при `lag=0`, но ложный `REORGED` может нарушить логику заказов). Команда проверки:
+>    `./admin.sh config doctor` (или `sudo xmr-gateway-admin --env /etc/xmr-gateway/.env config doctor | grep wallet_daemon_sync`) $\rightarrow$ `[PASS] wallet_daemon_sync ... (lag=0, daemon_synchronized=true)`.
+> 2. **Всегда используйте выделенный чистый кошелёк (не подключайте кошелёк с историей к новой БД):** субадреса Monero детерминированы (`account=0, index=1, 2, 3...`). Чистая база `xmr_gateway.db` выдаёт субадреса начиная с `index=1`: если на этих субадресах кошелька уже были старые входящие переводы, сканер засчитает их в счёт новых инвойсов и автоматически закроет заказы (`CONFIRMED` / `COMPLETED` + `OVERPAYMENT`) без реальной оплаты. Никогда не удаляйте `xmr_gateway.db`, оставляя старый кошелёк, и всегда восстанавливайте кошелёк и БД вместе из согласованного бэкапа.
 
 ### 3.2. Интерактивное демо `demo-stagenet.sh`
 
@@ -782,4 +793,5 @@ cargo test --locked --release --all-targets
 - [ ] **Вебхуки:** `ALLOW_PRIVATE_WEBHOOKS=false`, `REQUIRE_HTTPS_WEBHOOKS=true` (обязательно на `mainnet` fail-closed), на стороне получателя проверяются свежесть `X-Webhook-Timestamp` (`<= 300s`), подпись `X-Webhook-Signature` и идемпотентность по `event_id` (`X-Webhook-Event-Id`).
 - [ ] **Собственный `monerod` и инциденты:** для максимальной надёжности подключите собственный локальный `monerod` (`MONERO_REMOTE_NODE=127.0.0.1:18081`, `MONERO_TRUSTED_DAEMON=true`) и задайте `MONERO_DAEMON_RPC_URL` (+ логин/пароль), чтобы при инциденте работал `POST /api/v1/invoices/{id}/sweep/resolve` (`allow_resweep`).
 - [ ] **Подтверждения и мониторинг:** `REQUIRED_CONFIRMATIONS=10` (и `SETTLEMENT_CONFIRMATIONS=15` для крупных заказов), `SUBADDRESS_MONITOR_DAYS=0`, `LOG_FORMAT=json`.
-- [ ] **Бэкапы и `systemd`:** настроены юниты из `deploy/systemd/` и регулярный онлайн-бэкап SQLite (`sqlite3 ... ".backup ..."`).
+- [ ] **Выделенный чистый кошелёк и синхронизация `lag=0`:** используется новый, выделенный исключительно под шлюз кошелёк Monero без истории старых входящих переводов на субадресах (`account=0, index=1, 2...`); перед открытием боевого трафика проверка `wallet_daemon_sync` в `config doctor` подтверждает `lag=0, daemon_synchronized=true`.
+- [ ] **Бэкапы и `systemd`:** настроены юниты из `deploy/systemd/` и регулярный онлайн-бэкап SQLite (`sqlite3 ... ".backup ..."`), файлы кошелька и `xmr_gateway.db` архивируются и восстанавливаются строго в паре.

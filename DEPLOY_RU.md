@@ -101,6 +101,28 @@ sudo dnf install -y ./xmr-gateway-0.1.4-1.x86_64.rpm
    sudo xmr-gateway-admin --env /etc/xmr-gateway/.env config doctor
    ```
 
+> [!WARNING]
+> **Критические эксплуатационные требования перед открытием приёма платежей**
+>
+> **1. Запрет открытия приёма платежей при `lag > 0` (`wallet_daemon_sync`):**
+> - **Правило:** после создания или импорта кошелька (особенно в `WALLET_MODE=view_only`, а также после любого `wallet rescan`) **нельзя открывать боевой трафик и создавать инвойсы, пока `config doctor` показывает `lag > 0`** в проверке `wallet_daemon_sync`.
+> - **Механизм:** `monero-wallet-rpc` видит неподтверждённые транзакции из мемпула (`pool`) напрямую от демона даже при отставании `wallet_height` от `daemon_height` — шлюз сразу переводит инвойс в `MEMPOOL` и отправляет вебхук `MEMPOOL`. Как только транзакция включается в блок выше текущего `wallet_height`, она уходит из `pool`, но ещё отсутствует в `in`, поскольку кошелёк не досканировал до высоты этого блока. Сканер `xmr-gateway` фиксирует одновременное исчезновение перевода из `pool` и `in` и fail-closed переводит инвойс в `REORGED`, увеличивая `reorg_epoch` и отправляя **ложный вебхук `REORGED`**.
+> - **Восстановление:** средства не теряются — когда кошелёк догоняет цепь (`lag=0`), сканер автоматически восстанавливает инвойс из `REORGED` в `CONFIRMED` / `SETTLED` / `COMPLETED` и досылает подписанные вебхуки. Однако ложный `REORGED` может нарушить логику биллинга мерчанта (преждевременная отмена заказа или ложный инцидент), поэтому приём платежей открывают строго после достижения `lag=0`.
+> - **Команда проверки перед открытием трафика:**
+>   ```bash
+>   # Системная установка (.deb / .rpm / systemd):
+>   sudo xmr-gateway-admin --env /etc/xmr-gateway/.env config doctor | grep wallet_daemon_sync
+>   # Локальный запуск / tarball:
+>   ./admin.sh config doctor
+>   # Целевой вывод:
+>   # [PASS] wallet_daemon_sync ... (lag=0, daemon_synchronized=true)
+>   ```
+>
+> **2. Всегда используйте выделенный чистый кошелёк (запрет переиспользования кошелька с историей на чистой БД):**
+> - **Правило:** для `xmr-gateway` (как в `view_only`, так и в `hot_wallet`) необходимо использовать **новый, выделенный исключительно под шлюз кошелёк Monero**. Категорически запрещено удалять или обнулять `xmr_gateway.db`, оставляя прежний уже использовавшийся кошелёк.
+> - **Почему это критично (риск бесплатного закрытия инвойсов):** субадреса Monero детерминированы (`account=0, index=1, 2, 3...`). Свежая база `xmr_gateway.db` начинает выдавать субадреса с `index=1`. Если на этих субадресах кошелька уже были исторические входящие транзакции, после сканирования блокчейна сканер засчитает старые поступления в счёт новых инвойсов, автоматически переведя их в `CONFIRMED` / `COMPLETED` (и отправив `OVERPAYMENT`) без реальной оплаты со стороны покупателя.
+> - **Правило миграции и бэкапа:** при переносе или восстановлении шлюза всегда сохраняйте и восстанавливайте файлы кошелька (`gateway_wallet*`) и `xmr_gateway.db` **вместе** из согласованного бэкапа.
+
 ### 3.3. Запуск `systemd` и ежедневный горячий бэкап
 ```bash
 sudo systemctl daemon-reload
@@ -238,13 +260,13 @@ loginctl enable-linger "$USER"
   2. Установите новый пакет (`apt-get install ./xmr-gateway_...deb` или `dnf upgrade ./xmr-gateway-...rpm`) — `/etc/xmr-gateway/.env` и `/var/lib/xmr-gateway/` сохранятся нетронутыми.
   3. Перезапустите: `sudo systemctl restart xmr-gateway.service` и проверьте `xmr-gateway-admin db audit-invariants`.
 - **Ротация секретов и SELinux:** `sudo xmr-gateway-admin --env /etc/xmr-gateway/.env config rotate-keys all` (создаёт `0600`-бэкап `.env.bak.<UTC>`, атомарно обновляет `.env` внутри `/etc/xmr-gateway/`, сохраняет владельца и SELinux-контекст `etc_t` через `restorecon`), затем `sudo systemctl restart monero-wallet-rpc.service xmr-gateway.service`.
-- **Восстановление БД из бэкапа:** остановите `xmr-gateway.service`, удалите старые `xmr_gateway.db-wal` и `xmr_gateway.db-shm`, скопируйте проверенный бэкап (`chmod 600`, `chown xmr-gateway:xmr-gateway`), проверьте `xmr-gateway-admin db audit-invariants` и запустите сервис.
+- **Восстановление БД из бэкапа:** остановите `xmr-gateway.service`, удалите старые `xmr_gateway.db-wal` и `xmr_gateway.db-shm`, скопируйте проверенный бэкап (`chmod 600`, `chown xmr-gateway:xmr-gateway`), проверьте `xmr-gateway-admin db audit-invariants` и запустите сервис. Всегда восстанавливайте файлы кошелька и `xmr_gateway.db` в паре — никогда не подключайте кошелёк с историей входящих переводов на субадресах к пустой БД.
 - **Модель доверия и границы архитектуры:**
-  - **Self-hosted single-instance / single-merchant:** шлюз работает без стороннего платёжного посредника в модели одного мерчанта, одной БД SQLite (WAL) и одного кошелька `monero-wallet-rpc` (эксклюзивная блокировка `<db_path>.lock` запрещает второй процесс).
+  - **Self-hosted single-instance / single-merchant:** шлюз работает без стороннего платёжного посредника в модели одного мерчанта, одной БД SQLite (WAL) и одного выделенного кошелька `monero-wallet-rpc` (эксклюзивная блокировка `<db_path>.lock` запрещает второй процесс).
   - **View-Only vs Hot-Wallet:** в `WALLET_MODE=view_only` (рекомендуется) приватный spend-ключ физически отсутствует на сервере. В `WALLET_MODE=hot_wallet` spend-ключ находится в `monero-wallet-rpc` — держите только минимальный операционный транзитный остаток, строго изолируйте хост/RPC, задавайте отдельный `OPERATOR_API_KEY` и выводите средства на холодный/аппаратный `COLD_WALLET_ADDRESS`.
   - **Непрозрачный `order_id` без PII:** не передавайте email, логины или персональные данные в `order_id`, т.к. он попадает в операционные логи, `monero:` URI и метки кошелька.
 - **Контракт подписи вебхуков (ретраи и свежесть):** при каждой попытке доставки (первичная отправка, автоматический retry и ручной `webhooks retry`) формируются свежий Unix-timestamp `X-Webhook-Timestamp` и новая подпись `X-Webhook-Signature = HMAC-SHA256(WEBHOOK_SECRET, "{X-Webhook-Timestamp}.{raw_body}")`, тогда как `X-Webhook-Event-Id` (`payload.event_id`) и тело JSON остаются неизменными. Получатель обязан проверять окно свежести (`<= 300s`), подпись `X-Webhook-Signature` в constant-time и идемпотентность по `event_id` (обратно совместимый `X-Signature-256` также передаётся).
-- **Переход Stagenet → Mainnet:** используйте отдельный файл окружения и отдельную БД (`/var/lib/xmr-gateway`), выставите `MONERO_NETWORK=mainnet`, `ALLOW_PRIVATE_WEBHOOKS=false`, `REQUIRE_HTTPS_WEBHOOKS=true` (при `REQUIRE_HTTPS_WEBHOOKS=false` и `ALLOW_PRIVATE_WEBHOOKS=false` на `mainnet` запуск **отклоняется fail-closed**, а `config doctor` выдаёт `FAIL`), настройте `SCANNER_SUBADDRESS_BATCH_SIZE=100` (`1..=1000`), свежие раздельные `API_SECRET_KEY`/`OPERATOR_API_KEY` (`OPERATOR_API_KEY` строго обязателен для `WALLET_MODE=hot_wallet` / `ENABLE_AUTO_SWEEP=true`), прогоните `config doctor` и `dev health-rbac`.
+- **Переход Stagenet → Mainnet:** используйте отдельный файл окружения и отдельную БД (`/var/lib/xmr-gateway`), создайте **новый выделенный Mainnet-кошелёк** без истории переводов на субадресах, выставите `MONERO_NETWORK=mainnet`, `ALLOW_PRIVATE_WEBHOOKS=false`, `REQUIRE_HTTPS_WEBHOOKS=true` (при `REQUIRE_HTTPS_WEBHOOKS=false` и `ALLOW_PRIVATE_WEBHOOKS=false` на `mainnet` запуск **отклоняется fail-closed**, а `config doctor` выдаёт `FAIL`), настройте `SCANNER_SUBADDRESS_BATCH_SIZE=100` (`1..=1000`), свежие раздельные `API_SECRET_KEY`/`OPERATOR_API_KEY` (`OPERATOR_API_KEY` строго обязателен для `WALLET_MODE=hot_wallet` / `ENABLE_AUTO_SWEEP=true`), убедитесь в `[PASS] wallet_daemon_sync ... (lag=0, daemon_synchronized=true)` в `config doctor` и прогоните `dev health-rbac` до открытия трафика.
 - **Изоляция RPC-пароля и разблокированная финальность:** systemd-юниты (`render-wallet-rpc-conf.sh`), контейнеры, `start.sh`, `admin/service.sh` и `demo-stagenet.sh` передают учётные данные `monero-wallet-rpc` строго через `0600` `--config-file` (никогда через `--rpc-login` в `argv`). Финальность `SETTLED`/`COMPLETED` требует разблокированных покрывающих выходов на сумму инвойса при глубине `>= SETTLEMENT_CONFIRMATIONS` (защита от кастомного `unlock_time` и mempool Dust-DoS).
 
 ---

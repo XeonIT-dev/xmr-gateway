@@ -101,6 +101,28 @@ The package automatically:
    sudo xmr-gateway-admin --env /etc/xmr-gateway/.env config doctor
    ```
 
+> [!WARNING]
+> **Critical Production Requirements Before Opening Payment Traffic**
+>
+> **1. Never accept live payments or create invoices while `lag > 0` (`wallet_daemon_sync`):**
+> - **Rule:** After creating or importing a wallet (especially `WALLET_MODE=view_only` or after any `wallet rescan`), wait until initial blockchain synchronization finishes (`lag=0`) before opening checkout traffic.
+> - **Mechanism:** `monero-wallet-rpc` observes unconfirmed mempool transactions (`pool`) directly from the daemon even when `wallet_height` lags behind `daemon_height`, so the gateway immediately moves a paid invoice to `MEMPOOL` and emits the `MEMPOOL` webhook. As soon as that transaction is mined into a block above `wallet_height`, it leaves `pool` but does not appear in `in` until the wallet scans up to that block height. Observing the transaction absent from both `pool` and `in`, the scanner fail-closed transitions the invoice to `REORGED`, increments `reorg_epoch`, and sends a **false `REORGED` webhook**.
+> - **Recovery:** No funds are lost — once the wallet reaches the block height (`lag=0`), the scanner automatically recovers the invoice from `REORGED` to `CONFIRMED` / `SETTLED` / `COMPLETED` and emits fresh signed webhooks. However, a false `REORGED` event can trigger premature order cancellation or false security alerts in merchant billing systems.
+> - **Verification command (must pass before enabling checkout):**
+>   ```bash
+>   # System package / systemd install:
+>   sudo xmr-gateway-admin --env /etc/xmr-gateway/.env config doctor | grep wallet_daemon_sync
+>   # Local / tarball install:
+>   ./admin.sh config doctor
+>   # Target output:
+>   # [PASS] wallet_daemon_sync ... (lag=0, daemon_synchronized=true)
+>   ```
+>
+> **2. Always use a dedicated, clean Monero wallet (never pair a used wallet with a fresh SQLite DB):**
+> - **Rule:** Provision a brand-new Monero wallet dedicated exclusively to `xmr-gateway` (in both `view_only` and `hot_wallet` modes). Never delete or reset `xmr_gateway.db` while keeping an already-used wallet.
+> - **Why this is critical (risk of free order settlement):** Monero subaddresses are deterministic (`account=0, index=1, 2, 3...`). A fresh `xmr_gateway.db` assigns subaddresses starting from `index=1`. If the attached wallet already has historical incoming transactions on those subaddresses, the scanner will match those historical inflows against newly created invoices — automatically transitioning them to `CONFIRMED` / `COMPLETED` (and emitting `OVERPAYMENT`) without any payment from the customer.
+> - **Migration & backup rule:** When migrating hosts or restoring from a backup, always back up and restore the wallet files (`gateway_wallet*`) and `xmr_gateway.db` **together** as a consistent pair.
+
 ### 3.3. Starting `systemd` & Daily Hot Backup Timer
 ```bash
 sudo systemctl daemon-reload
@@ -238,13 +260,13 @@ loginctl enable-linger "$USER"
   2. Install the new package (`apt-get install ./xmr-gateway_...deb` or `dnf upgrade ./xmr-gateway-...rpm`) — `/etc/xmr-gateway/.env` and `/var/lib/xmr-gateway/` are never overwritten or deleted.
   3. Restart & audit: `sudo systemctl restart xmr-gateway.service && sudo -u xmr-gateway xmr-gateway-admin db audit-invariants`.
 - **Secret Rotation & SELinux Context:** `sudo xmr-gateway-admin --env /etc/xmr-gateway/.env config rotate-keys all` (creates a `0600` `.env.bak.<UTC>` backup, writes atomically inside `/etc/xmr-gateway/`, preserves owner and `etc_t` SELinux label via `restorecon`), then `sudo systemctl restart monero-wallet-rpc.service xmr-gateway.service`.
-- **SQLite Backup Restore:** stop `xmr-gateway.service`, remove stale `xmr_gateway.db-wal` and `xmr_gateway.db-shm`, copy verified backup to `xmr_gateway.db` (`chmod 600`, `chown xmr-gateway:xmr-gateway`), run `xmr-gateway-admin db audit-invariants`, and start the service.
+- **SQLite Backup Restore:** stop `xmr-gateway.service`, remove stale `xmr_gateway.db-wal` and `xmr_gateway.db-shm`, copy verified backup to `xmr_gateway.db` (`chmod 600`, `chown xmr-gateway:xmr-gateway`), run `xmr-gateway-admin db audit-invariants`, and start the service. Always restore wallet files and `xmr_gateway.db` together — never attach a wallet with prior subaddress history to an empty database.
 - **Trust Model & Architectural Boundaries:**
-  - **Self-hosted, single-instance / single-merchant:** `xmr-gateway` runs without a third-party payment processor intermediary, using one SQLite WAL database and one `monero-wallet-rpc` wallet per instance (strictly enforced via `<db_path>.lock`).
+  - **Self-hosted, single-instance / single-merchant:** `xmr-gateway` runs without a third-party payment processor intermediary, using one SQLite WAL database and one dedicated `monero-wallet-rpc` wallet per instance (strictly enforced via `<db_path>.lock`).
   - **View-only vs. hot-wallet:** In `WALLET_MODE=view_only` (recommended default), no private spend key resides on the host. In `WALLET_MODE=hot_wallet`, the spend key resides inside `monero-wallet-rpc` — keep only minimal operational transit balances, strictly isolate the host/RPC, require distinct `OPERATOR_API_KEY`, and sweep promptly to an offline/hardware `COLD_WALLET_ADDRESS`.
   - **Opaque `order_id` without PII:** Never embed emails, usernames, or customer PII in `order_id` because it is persisted in operational logs, `monero:` URIs, and wallet labels.
 - **Webhook Verification Contract (Retries & Freshness):** Each delivery attempt (initial send, automatic backoff retry, and manual `webhooks retry`) emits a fresh Unix epoch `X-Webhook-Timestamp` and freshly computed `X-Webhook-Signature = HMAC-SHA256(WEBHOOK_SECRET, "{X-Webhook-Timestamp}.{raw_body}")`, while keeping `X-Webhook-Event-Id` (`payload.event_id`) and the JSON payload bytes immutable. Consumers should verify `abs(now - ts) <= 300s`, check `X-Webhook-Signature` in constant time, and deduplicate by `event_id` (legacy `X-Signature-256` is also sent).
-- **Stagenet → Mainnet Cutover:** isolate `.env` and SQLite path, set `MONERO_NETWORK=mainnet`, `ALLOW_PRIVATE_WEBHOOKS=false`, `REQUIRE_HTTPS_WEBHOOKS=true` (setting `REQUIRE_HTTPS_WEBHOOKS=false` with `ALLOW_PRIVATE_WEBHOOKS=false` on mainnet **fails closed** at startup and in `config doctor`), tune `SCANNER_SUBADDRESS_BATCH_SIZE=100` (`1..=1000`), rotate distinct `API_SECRET_KEY`/`OPERATOR_API_KEY` (`OPERATOR_API_KEY` is strictly required for `WALLET_MODE=hot_wallet` / `ENABLE_AUTO_SWEEP=true`), and pass `config doctor` + `dev health-rbac`.
+- **Stagenet → Mainnet Cutover:** isolate `.env` and SQLite path, provision a **fresh dedicated Mainnet wallet** (no historical subaddress inflows), set `MONERO_NETWORK=mainnet`, `ALLOW_PRIVATE_WEBHOOKS=false`, `REQUIRE_HTTPS_WEBHOOKS=true` (setting `REQUIRE_HTTPS_WEBHOOKS=false` with `ALLOW_PRIVATE_WEBHOOKS=false` on mainnet **fails closed** at startup and in `config doctor`), tune `SCANNER_SUBADDRESS_BATCH_SIZE=100` (`1..=1000`), rotate distinct `API_SECRET_KEY`/`OPERATOR_API_KEY` (`OPERATOR_API_KEY` is strictly required for `WALLET_MODE=hot_wallet` / `ENABLE_AUTO_SWEEP=true`), and confirm `config doctor` reports `[PASS] wallet_daemon_sync ... (lag=0, daemon_synchronized=true)` + `dev health-rbac` before accepting live traffic.
 - **Zero-Argv-Leak RPC & Unlocked Settlement:** systemd units (`render-wallet-rpc-conf.sh`), containers, `start.sh`, `admin/service.sh`, and `demo-stagenet.sh` all pass `monero-wallet-rpc` credentials via a `0600` `--config-file` (never `--rpc-login` in `argv`). `SETTLED`/`COMPLETED` finality requires unlocked covering outputs `>= invoice amount` at `>= SETTLEMENT_CONFIRMATIONS` (blocking custom `unlock_time` attacks while remaining immune to mempool dust DoS).
 
 ---

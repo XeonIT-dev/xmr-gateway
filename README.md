@@ -183,6 +183,12 @@ What `./start.sh` handles automatically:
 4. Starts `monero-wallet-rpc` bound strictly to `127.0.0.1:18082` connected to `MONERO_REMOTE_NODE` (zero local blockchain disk bloat), optionally routed through Tor (`MONERO_RPC_PROXY=127.0.0.1:9050`).
 5. Starts `./target/release/xmr-gateway` and gracefully shuts down both processes on `SIGINT`/`SIGTERM`.
 
+> [!WARNING]
+> **Two Critical Production Rules Before Accepting Payments** (full details in [DEPLOY_EN.md](DEPLOY_EN.md#32-configuring-etcxmr-gatewayenv--wallet-initialization) and [admin/GUIDE_EN.md](admin/GUIDE_EN.md)):
+> 1. **Wait for initial wallet sync (`lag=0`) before creating invoices:** After creating, importing (`view_only`), or rescanning a wallet, do **not** open payment traffic while `config doctor` reports `lag > 0` on `wallet_daemon_sync`. While `wallet_height < daemon_height`, `monero-wallet-rpc` still sees unconfirmed mempool transactions (`pool`) immediately, but as soon as the transaction is mined into a block above `wallet_height` it disappears from `pool` before appearing in `in` — causing the scanner to fail-closed into `REORGED` and emit a transient **false `REORGED` webhook** (which self-heals to `CONFIRMED`/`SETTLED`/`COMPLETED` once `lag=0`, but can disrupt merchant order state). Verify sync first:
+>    `./admin.sh config doctor` (or `sudo xmr-gateway-admin --env /etc/xmr-gateway/.env config doctor | grep wallet_daemon_sync`) $\rightarrow$ `[PASS] wallet_daemon_sync ... (lag=0, daemon_synchronized=true)`.
+> 2. **Always use a dedicated clean wallet (never attach a used wallet to a fresh DB):** Monero subaddresses are deterministic (`account=0, index=1, 2, 3...`). A fresh `xmr_gateway.db` allocates subaddresses starting from `index=1`; if the wallet already has historical incoming transactions on those subaddresses, the scanner will credit those old inflows toward newly created invoices — marking them `CONFIRMED`/`COMPLETED` (and emitting `OVERPAYMENT`) without any new payment from the customer. Never delete `xmr_gateway.db` while keeping an already-used wallet, and always back up/restore wallet files and `xmr_gateway.db` together.
+
 ### 4. Single-Terminal Stagenet Live Demo
 
 To test end-to-end payments with free Stagenet faucet coins in one terminal (with color-coded `[RPC]`, `[GATEWAY]`, and `[WEBHOOK]` logs plus an HMAC-verifying Python webhook listener):
@@ -339,6 +345,11 @@ sudo bash install.sh
 | `X-Delivery-Id` | Backwards-compatible alias of `X-Webhook-Event-Id` (`webhook_deliveries.id`) |
 | `X-Signature-256` | Backwards-compatible legacy lowercase hex `HMAC-SHA256(WEBHOOK_SECRET, raw_body)` digest |
 | `X-Webhook-Event` | Event type: `UNDERPAID`, `MEMPOOL`, `CONFIRMED`, `SETTLED`, `REORGED`, `SWEPT`, `EXPIRED`, `LATE_PAYMENT`, or `OVERPAYMENT` |
+
+> [!NOTE]
+> **Operational Edge Cases for `REORGED` and `OVERPAYMENT`:**
+> - **Transient false `REORGED` when wallet is still syncing (`lag > 0`):** If an invoice is paid while `wallet_height` lags behind `daemon_height`, the gateway detects the 0-conf payment in `pool` (`MEMPOOL`), then temporarily loses sight of it when the transaction is mined at a block height the wallet has not scanned yet — triggering a fail-closed `REORGED` webhook (`reorg_epoch + 1`). Once the wallet catches up (`lag=0`), the invoice automatically recovers to `CONFIRMED` / `SETTLED` / `COMPLETED`. Prevent this by opening traffic only after `config doctor` reports `wallet_daemon_sync` `lag=0`.
+> - **Unexpected immediate `CONFIRMED` / `COMPLETED` / `OVERPAYMENT` on a new invoice:** Occurs if a wallet with prior subaddress transaction history (`account=0, index=1, 2...`) is connected to a new or wiped `xmr_gateway.db`. Always provision a dedicated clean wallet for `xmr-gateway`.
 
 ### JSON Payload Schema
 

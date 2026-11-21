@@ -78,7 +78,7 @@
 | `ssrf_policy` | WARN / PASS | На `mainnet` флаги `ALLOW_PRIVATE_WEBHOOKS=true` или (`REQUIRE_HTTPS_WEBHOOKS=false` при `ALLOW_PRIVATE_WEBHOOKS=false`, `XMR-AUDIT-006`) помечаются как `WARN`; в продакшене оставляйте `ALLOW_PRIVATE_WEBHOOKS=false` + `REQUIRE_HTTPS_WEBHOOKS=true`. |
 | `rpc_auth`, `daemon_rpc_security` | FAIL / WARN | При `ALLOW_UNAUTHENTICATED_RPC=false` обязательны `MONERO_RPC_USER`/`PASS`; при заданном `MONERO_DAEMON_RPC_URL` проверяются транспорт и креды (`AUDIT-001`). Отсутствие `MONERO_DAEMON_RPC_URL` — `WARN` (нужен для `allow_resweep`). |
 | `health_anon_privacy`, `health_auth_api`, `health_auth_operator` | FAIL | Проверяет на живом шлюзе, что анонимный `GET /health` НЕ раскрывает `service`/`monero_rpc`/`database`, а авторизованный возвращает полную телеметрию (`AUDIT-002`). |
-| `wallet_daemon_sync` | WARN / PASS | Сравнивает `get_height` кошелька и `get_info` демона; отставание `> 5` блоков помечается `WARN`. |
+| `wallet_daemon_sync` | WARN / PASS | Сравнивает `get_height` кошелька и `get_info` демона; отставание `> 5` блоков помечается `WARN`. **Не открывайте приём боевых платежей до `lag=0` (`[PASS] wallet_daemon_sync ... (lag=0, daemon_synchronized=true)`).** |
 
 - **`./admin.sh config rotate-keys [api|operator|webhook|rpc|all]`** — создаёт резервную копию `<env>.bak.<UTC>` с правами `0600`, генерирует новые секреты через `openssl rand -hex 32` (`24` байта для `rpc`), гарантирует `OPERATOR_API_KEY != API_SECRET_KEY`. После ротации выполните `./admin.sh service restart` и обновите ключи в боте/клиентах.
 - **`./admin.sh config set-mode <view_only|hot_wallet>`** — безопасно переключает `WALLET_MODE` (и `ENABLE_AUTO_SWEEP`) после проверки наличия `COLD_WALLET_ADDRESS` или `MONERO_VIEW_ONLY_ADDRESS`+`MONERO_VIEW_ONLY_KEY` / `.keys`, предварительно сохраняя `0600`-бэкап `.env`.
@@ -106,6 +106,11 @@
 ./admin.sh config set-mode view_only
 ./admin.sh config doctor
 ```
+
+> [!WARNING]
+> **Критические правила работы с кошельком в продакшене (`view_only` и `hot_wallet`):**
+> 1. **Дождитесь `lag=0` перед открытием трафика:** после создания/импорта кошелька или `wallet rescan` убедитесь, что `sudo xmr-gateway-admin --env /etc/xmr-gateway/.env config doctor | grep wallet_daemon_sync` (или `./admin.sh config doctor`) возвращает `[PASS] wallet_daemon_sync ... (lag=0, daemon_synchronized=true)`. Приём платежей при `lag > 0` приводит к тому, что транзакция из мемпула (`pool` $\rightarrow$ `MEMPOOL`) при включении в блок выше `wallet_height` пропадает из `pool` до появления в `in`, вызывая отправку **ложного вебхука `REORGED`** (`reorg_epoch + 1`) до тех пор, пока кошелёк не догонит блокчейн.
+> 2. **Всегда используйте выделенный чистый кошелёк (не подключайте кошелёк с историей к новой БД):** субадреса детерминированы (`account=0, index=1, 2, 3...`). Если подключить кошелёк с историей входящих переводов на субадресах к новой или обнулённой `xmr_gateway.db`, старые поступления на `index=1, 2...` автоматически закроют новые инвойсы (`CONFIRMED`/`COMPLETED` + `OVERPAYMENT`) без оплаты со стороны покупателя. Всегда сохраняйте и восстанавливайте файлы кошелька и `xmr_gateway.db` вместе.
 
 ### Остальные команды `wallet`
 - `./admin.sh wallet info` (или `balance`) — основной адрес, общий и разблокированный баланс, балансы по субадресам, высота кошелька vs демона (`--json`).
@@ -216,12 +221,18 @@
 1. Создайте отдельный конфиг `.env.mainnet` (`chmod 600 .env.mainnet`) с изолированным `DATABASE_URL=sqlite://data.mainnet/xmr_gateway.db`.
 2. Установите `MONERO_NETWORK=mainnet`, mainnet `MONERO_REMOTE_NODE`, `ALLOW_PRIVATE_WEBHOOKS=false`, `REQUIRE_HTTPS_WEBHOOKS=true`, `REQUIRED_CONFIRMATIONS=10`, `SETTLEMENT_CONFIRMATIONS=15` (рекомендуемо).
 3. Сгенерируйте свежие раздельные секреты: `./admin.sh --env .env.mainnet config rotate-keys all` (проверьте, что задан отдельный `OPERATOR_API_KEY`).
-4. Настройте `WALLET_MODE=view_only` (или `hot_wallet` + проверенный mainnet `COLD_WALLET_ADDRESS`) и настройте `MONERO_DAEMON_RPC_URL`.
-5. Выполните финальный гейт перед запуском:
+4. Настройте `WALLET_MODE=view_only` (или `hot_wallet` + проверенный mainnet `COLD_WALLET_ADDRESS`), используя **новый выделенный кошелёк без истории входящих переводов на субадресах**, и задайте `MONERO_DAEMON_RPC_URL`.
+5. Выполните финальный гейт перед запуском и убедитесь, что `wallet_daemon_sync` достиг `lag=0` до открытия трафика:
    ```bash
    ./admin.sh --env .env.mainnet config doctor
    ./admin.sh --env .env.mainnet service build
    ./admin.sh --env .env.mainnet service start
+   ./admin.sh --env .env.mainnet config doctor | grep wallet_daemon_sync
+   # Ожидается: [PASS] wallet_daemon_sync ... (lag=0, daemon_synchronized=true)
    ./admin.sh --env .env.mainnet dev health-rbac
    ./admin.sh --env .env.mainnet db audit-invariants
    ```
+
+### Сценарий 6: Ложный `REORGED` сразу после `MEMPOOL` или автозакрытие неоплаченного инвойса (`OVERPAYMENT`)
+- **Инвойс переходит `MEMPOOL` → `REORGED` сразу после включения транзакции в блок:** кошелёк отставал от ноды (`lag > 0` в `wallet_daemon_sync`). `monero-wallet-rpc` увидел 0-conf платёж в `pool`, а после майнинга блока на высоте выше `wallet_height` транзакция ушла из `pool`, ещё не появившись в `in`. Выполните `./admin.sh wallet refresh` и дождитесь `lag=0` — сканер автоматически восстановит инвойс в `CONFIRMED` / `SETTLED` / `COMPLETED`.
+- **Новый инвойс сразу после создания переходит в `CONFIRMED` / `COMPLETED` (или шлёт `OVERPAYMENT`) без оплаты покупателем:** к чистой базе `xmr_gateway.db` был подключён старый кошелёк с историей входящих переводов на субадресах `account=0, index=1, 2...`. Немедленно остановите шлюз и создайте новый выделенный кошелёк вместе с чистой БД (либо восстановите из бэкапа ту БД `xmr_gateway.db`, которая соответствует этому кошельку).
