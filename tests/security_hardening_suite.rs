@@ -81,6 +81,7 @@ fn test_config(
         monero_network: MoneroNetwork::Mainnet,
         monero_rpc_url: rpc_url,
         monero_daemon_rpc_url: None,
+        monero_remote_node: None,
         monero_daemon_rpc_user: None,
         monero_daemon_rpc_pass: None,
         monero_rpc_user: None,
@@ -4637,6 +4638,7 @@ async fn regression_audit_001_verify_wallet_synced_contract_and_daemon_security(
         monero_network: MoneroNetwork::Mainnet,
         monero_rpc_url: "http://127.0.0.1:18082/json_rpc".to_string(),
         monero_daemon_rpc_url: Some("http://192.168.10.20:18081/json_rpc".to_string()),
+        monero_remote_node: None,
         monero_daemon_rpc_user: Some("daemon_user".to_string()),
         monero_daemon_rpc_pass: Some("daemon-strong-secret-pass".to_string()),
         monero_rpc_user: Some("wallet_user".to_string()),
@@ -11564,4 +11566,325 @@ async fn regression_v014_cross_batch_size_1_subaddress_amounts_and_height_consis
     assert_eq!(loaded1.received_piconero, Piconero(1_000_000_000_000));
     assert_eq!(loaded2.status, InvoiceStatus::Completed);
     assert_eq!(loaded2.received_piconero, Piconero(2_000_000_000_000));
+}
+
+#[tokio::test]
+async fn regression_v015_mempool_missing_reorg_deferred_while_wallet_lagging_and_fires_when_synced()
+{
+    let pool = init_sqlite_pool("sqlite::memory:").await.unwrap();
+    let repo = InvoiceRepository::new(pool);
+    let mock_wallet_rpc = MockServer::start().await;
+    let mock_daemon_rpc = MockServer::start().await;
+
+    let mut cfg_owned = (*test_config(
+        format!("{}/json_rpc", mock_wallet_rpc.uri()),
+        Some("http://127.0.0.1:9000/hook".to_string()),
+        false,
+        2,
+        10,
+    ))
+    .clone();
+    // Use MONERO_REMOTE_NODE (stripped of scheme) to verify fallback normalization too!
+    cfg_owned.monero_remote_node = Some(
+        mock_daemon_rpc
+            .uri()
+            .trim_start_matches("http://")
+            .to_string(),
+    );
+    let cfg = Arc::new(cfg_owned);
+    let rpc = MoneroRpcClient::new(&cfg.monero_rpc_url, None, None).unwrap();
+    let scanner = ScannerService::new(repo.clone(), rpc, cfg);
+
+    // Invoice 1: pays in mempool, vanishes while wallet lags -> must defer REORGED and later confirm cleanly!
+    let inv_lag = make_invoice(
+        501,
+        1_000_000_000_000,
+        Some("http://127.0.0.1:9000/hook".to_string()),
+    );
+    // Invoice 2: pays in mempool, gets real double_spend_seen while wallet lags -> MUST still REORG immediately!
+    let inv_ds = make_invoice(
+        502,
+        1_000_000_000_000,
+        Some("http://127.0.0.1:9000/hook".to_string()),
+    );
+    // Invoice 3: pays in mempool, vanishes when wallet is synced (lag=0) -> MUST transition to REORGED!
+    let inv_synced = make_invoice(
+        503,
+        1_000_000_000_000,
+        Some("http://127.0.0.1:9000/hook".to_string()),
+    );
+    repo.insert_invoice(&inv_lag).await.unwrap();
+    repo.insert_invoice(&inv_ds).await.unwrap();
+    repo.insert_invoice(&inv_synced).await.unwrap();
+
+    // Tick 1: All 3 invoices observe 0-conf payments in mempool (`pool`) -> MEMPOOL
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_transfers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "gt1",
+            "result": {
+                "in": [],
+                "pool": [
+                    {
+                        "txid": "a1".repeat(32),
+                        "amount": 1_000_000_000_000_u64,
+                        "confirmations": 0,
+                        "double_spend_seen": false,
+                        "subaddr_index": { "major": 0, "minor": 501 }
+                    },
+                    {
+                        "txid": "a2".repeat(32),
+                        "amount": 1_000_000_000_000_u64,
+                        "confirmations": 0,
+                        "double_spend_seen": false,
+                        "subaddr_index": { "major": 0, "minor": 502 }
+                    },
+                    {
+                        "txid": "a3".repeat(32),
+                        "amount": 1_000_000_000_000_u64,
+                        "confirmations": 0,
+                        "double_spend_seen": false,
+                        "subaddr_index": { "major": 0, "minor": 503 }
+                    }
+                ]
+            }
+        })))
+        .mount(&mock_wallet_rpc)
+        .await;
+
+    scanner.scan_once().await.unwrap();
+    for id in [inv_lag.id, inv_ds.id, inv_synced.id] {
+        assert_eq!(
+            repo.get_invoice_by_id(id).await.unwrap().unwrap().status,
+            InvoiceStatus::Mempool
+        );
+    }
+
+    // Tick 2: Wallet lags behind daemon (wallet_height=2_000_000 < daemon_height=2_050_000, lag=50_000).
+    // inv_lag vanishes from pool & in (mined into a block wallet hasn't scanned yet);
+    // inv_ds has explicit double_spend_seen=true;
+    // inv_synced stays in pool for now.
+    mock_wallet_rpc.reset().await;
+    mock_daemon_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_transfers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "gt2",
+            "result": {
+                "in": [],
+                "pool": [
+                    {
+                        "txid": "a2".repeat(32),
+                        "amount": 1_000_000_000_000_u64,
+                        "confirmations": 0,
+                        "double_spend_seen": true,
+                        "subaddr_index": { "major": 0, "minor": 502 }
+                    },
+                    {
+                        "txid": "a3".repeat(32),
+                        "amount": 1_000_000_000_000_u64,
+                        "confirmations": 0,
+                        "double_spend_seen": false,
+                        "subaddr_index": { "major": 0, "minor": 503 }
+                    }
+                ]
+            }
+        })))
+        .mount(&mock_wallet_rpc)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_height"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "gh2",
+            "result": { "height": 2_000_000_u64 }
+        })))
+        .mount(&mock_wallet_rpc)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "gi2",
+            "result": {
+                "height": 2_050_000_u64,
+                "target_height": 2_050_000_u64,
+                "synchronized": true
+            }
+        })))
+        .mount(&mock_daemon_rpc)
+        .await;
+
+    scanner.scan_once().await.unwrap();
+
+    let lag_after = repo.get_invoice_by_id(inv_lag.id).await.unwrap().unwrap();
+    assert_eq!(
+        lag_after.status,
+        InvoiceStatus::Mempool,
+        "missing pool tx while wallet lags (lag > 0) MUST NOT transition invoice to REORGED"
+    );
+    assert_eq!(lag_after.reorg_epoch, 0);
+    assert!(
+        repo.list_webhooks_for_invoice(inv_lag.id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|w| w.event_type != WebhookEventType::Reorged),
+        "must not emit false REORGED webhook while wallet is lagging"
+    );
+
+    let ds_after = repo.get_invoice_by_id(inv_ds.id).await.unwrap().unwrap();
+    assert_eq!(
+        ds_after.status,
+        InvoiceStatus::Reorged,
+        "explicit double_spend_seen MUST still transition to REORGED even while lagging"
+    );
+    assert_eq!(ds_after.reorg_epoch, 1);
+
+    // Tick 3: Daemon reports synchronized=false (even with equal heights) -> still defer REORGED for inv_lag!
+    mock_wallet_rpc.reset().await;
+    mock_daemon_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_transfers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "gt3",
+            "result": {
+                "in": [],
+                "pool": [
+                    {
+                        "txid": "a3".repeat(32),
+                        "amount": 1_000_000_000_000_u64,
+                        "confirmations": 0,
+                        "double_spend_seen": false,
+                        "subaddr_index": { "major": 0, "minor": 503 }
+                    }
+                ]
+            }
+        })))
+        .mount(&mock_wallet_rpc)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_height"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "gh3",
+            "result": { "height": 2_050_000_u64 }
+        })))
+        .mount(&mock_wallet_rpc)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "gi3",
+            "result": {
+                "height": 2_050_000_u64,
+                "target_height": 2_050_000_u64,
+                "synchronized": false
+            }
+        })))
+        .mount(&mock_daemon_rpc)
+        .await;
+
+    scanner.scan_once().await.unwrap();
+    assert_eq!(
+        repo.get_invoice_by_id(inv_lag.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        InvoiceStatus::Mempool,
+        "missing pool tx while daemon reports synchronized=false MUST defer REORGED"
+    );
+
+    // Tick 4: Wallet is fully synced (wallet_height == daemon_height == 2_050_000, synchronized=true, lag=0).
+    // inv_lag now appears mined in `in` with 2 confs -> transitions cleanly MEMPOOL -> CONFIRMED (reorg_epoch stays 0)!
+    // inv_synced genuinely vanishes from pool & in at lag=0 -> MUST fail-closed transition MEMPOOL -> REORGED!
+    mock_wallet_rpc.reset().await;
+    mock_daemon_rpc.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_transfers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "gt4",
+            "result": {
+                "in": [
+                    {
+                        "txid": "a1".repeat(32),
+                        "amount": 1_000_000_000_000_u64,
+                        "confirmations": 2,
+                        "double_spend_seen": false,
+                        "locked": true,
+                        "subaddr_index": { "major": 0, "minor": 501 }
+                    }
+                ],
+                "pool": []
+            }
+        })))
+        .mount(&mock_wallet_rpc)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_height"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "gh4",
+            "result": { "height": 2_050_000_u64 }
+        })))
+        .mount(&mock_wallet_rpc)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/json_rpc"))
+        .and(body_string_contains("get_info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "gi4",
+            "result": {
+                "height": 2_050_000_u64,
+                "target_height": 2_050_000_u64,
+                "synchronized": true
+            }
+        })))
+        .mount(&mock_daemon_rpc)
+        .await;
+
+    scanner.scan_once().await.unwrap();
+
+    let lag_confirmed = repo.get_invoice_by_id(inv_lag.id).await.unwrap().unwrap();
+    assert_eq!(lag_confirmed.status, InvoiceStatus::Confirmed);
+    assert_eq!(
+        lag_confirmed.reorg_epoch, 0,
+        "invoice recovered after sync catchup MUST never have incremented reorg_epoch"
+    );
+
+    let synced_reorged = repo
+        .get_invoice_by_id(inv_synced.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        synced_reorged.status,
+        InvoiceStatus::Reorged,
+        "missing pool tx when wallet is synced (lag == 0) MUST fail-closed into REORGED"
+    );
+    assert_eq!(synced_reorged.reorg_epoch, 1);
+    assert!(
+        repo.list_webhooks_for_invoice(inv_synced.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|w| w.event_type == WebhookEventType::Reorged),
+        "real mempool eviction at lag=0 MUST emit a REORGED webhook"
+    );
 }

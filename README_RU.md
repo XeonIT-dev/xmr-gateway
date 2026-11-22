@@ -156,7 +156,7 @@ PENDING ----------+-----------------------------> MEMPOOL (0-conf, не исте
 | Заголовок | Значение |
 |---|---|
 | `Content-Type` | `application/json` |
-| `User-Agent` | `xmr-gateway/0.1.4` |
+| `User-Agent` | `xmr-gateway/0.1.5` |
 | `X-Webhook-Timestamp` | Свежий Unix epoch timestamp (секунды) текущей попытки доставки (обновляется при каждом retry) |
 | `X-Webhook-Signature` | **Рекомендуемая основная подпись:** lowercase hex `HMAC-SHA256(WEBHOOK_SECRET, "{X-Webhook-Timestamp}.{raw_body}")` |
 | `X-Webhook-Event-Id` | Стабильный UUID бизнес-события (`payload.event_id`, неизменен между ретраями для идемпотентности) |
@@ -371,7 +371,7 @@ PENDING ----------+-----------------------------> MEMPOOL (0-conf, не исте
 | Переменная | По умолчанию | Назначение |
 |---|---|---|
 | `MONERO_REMOTE_NODE` | `xmr-node.cakewallet.com:18081` (`start.sh`) / `node.monerodevs.org:38089` (`demo-stagenet.sh`) | Адрес `host:port` удалённой (или локальной) ноды `monerod`, передаваемый в `--daemon-address`. |
-| `WALLET_RESTORE_HEIGHT` | пусто (`mainnet=3280000`, `stagenet=1600000`, `testnet=2600000`) | Начальная высота блока при первичном создании кошелька (`--restore-height`); если оставить пустой, подбирается автоматически под `MONERO_NETWORK`. |
+| `WALLET_RESTORE_HEIGHT` | пусто (динамически `height - 1000`; оффлайн-fallback `mainnet=3500000`, `stagenet=2000000`, `testnet=2900000`) | Начальная высота блока при первичном создании кошелька (`--restore-height`); если оставить пустой, запрашивается текущая высота `MONERO_REMOTE_NODE` минус 1000 блоков. |
 | `MONERO_RPC_PROXY` | `""` | Опциональный SOCKS5-прокси для трафика `monero-wallet-rpc -> monerod` (например `127.0.0.1:9050` для Tor). |
 | `MONERO_VIEW_ONLY_ADDRESS` | `""` | Основной адрес кошелька. **Обязателен** в `start.sh` при первом создании кошелька в `WALLET_MODE=view_only`. |
 | `MONERO_VIEW_ONLY_KEY` | `""` | Приватный view-ключ (64 hex). **Обязателен** в `start.sh` при первом создании кошелька в `WALLET_MODE=view_only`. |
@@ -580,7 +580,7 @@ RUST_LOG=info,xmr_gateway=debug
    {
      "status": "ok",
      "service": "xmr-gateway",
-     "version": "0.1.4",
+     "version": "0.1.5",
      "database": "connected",
      "monero_rpc": {
        "connected": true,

@@ -244,6 +244,8 @@ load_env() {
     if [[ -z "${MONERO_REMOTE_NODE:-}" ]]; then
         MONERO_REMOTE_NODE="$(default_remote_node_for_network "$MONERO_NETWORK")"
     fi
+    # Preserve whether operator explicitly configured WALLET_RESTORE_HEIGHT in .env (`v0.1.5`)
+    WALLET_RESTORE_HEIGHT_EXPLICIT="${WALLET_RESTORE_HEIGHT:-}"
     if [[ -z "${WALLET_RESTORE_HEIGHT:-}" ]]; then
         WALLET_RESTORE_HEIGHT="$(default_restore_height_for_network "$MONERO_NETWORK")"
     fi
@@ -284,7 +286,7 @@ load_env() {
     ADMIN_ENV_LOADED=1
     export ACTIVE_ENV_FILE GATEWAY_BASE_URL DB_PATH DATA_DIR WALLET_DIR WALLET_FILE WALLET_PASS_FILE
     export RPC_LOG_FILE CLI_LOG_FILE GATEWAY_LOG_FILE PID_DIR RPC_PID_FILE GATEWAY_PID_FILE
-    export GATEWAY_BIN BIN_DIR WALLET_MODE MONERO_NETWORK MONERO_REMOTE_NODE WALLET_RESTORE_HEIGHT
+    export GATEWAY_BIN BIN_DIR WALLET_MODE MONERO_NETWORK MONERO_REMOTE_NODE WALLET_RESTORE_HEIGHT WALLET_RESTORE_HEIGHT_EXPLICIT
 }
 
 default_remote_node_for_network() {
@@ -297,10 +299,106 @@ default_remote_node_for_network() {
 
 default_restore_height_for_network() {
     case "${1:-mainnet}" in
-        stagenet) printf '1600000\n' ;;
-        testnet)  printf '2600000\n' ;;
-        *)        printf '3280000\n' ;;
+        stagenet) printf '2000000\n' ;;
+        testnet)  printf '2900000\n' ;;
+        *)        printf '3500000\n' ;;
     esac
+}
+
+# Queries current chain tip height from MONERO_DAEMON_RPC_URL or MONERO_REMOTE_NODE via
+# `/get_height` with fallback to JSON-RPC `get_block_count` using a short timeout (`v0.1.5`).
+query_daemon_tip_height() {
+    command -v curl >/dev/null 2>&1 || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+
+    local base_url="" rpc_user="" rpc_pass=""
+    if [[ -n "${MONERO_DAEMON_RPC_URL:-}" ]]; then
+        base_url="${MONERO_DAEMON_RPC_URL%/}"
+        base_url="${base_url%/json_rpc}"
+        rpc_user="${MONERO_DAEMON_RPC_USER:-}"
+        rpc_pass="${MONERO_DAEMON_RPC_PASS:-}"
+    elif [[ -n "${MONERO_REMOTE_NODE:-}" ]]; then
+        local node="$MONERO_REMOTE_NODE"
+        if [[ "$node" == http://* || "$node" == https://* ]]; then
+            base_url="${node%/}"
+            base_url="${base_url%/json_rpc}"
+        else
+            base_url="http://${node%/}"
+        fi
+    else
+        return 1
+    fi
+
+    local cfg_lines=()
+    if [[ -n "$rpc_user" ]]; then
+        cfg_lines+=("digest")
+        cfg_lines+=("user = \"$(curl_cfg_escape "${rpc_user}:${rpc_pass}")\"")
+    fi
+
+    local resp="" h=""
+    if [[ ${#cfg_lines[@]} -gt 0 ]]; then
+        resp="$(printf '%s\n' "${cfg_lines[@]}" | curl -fsS --connect-timeout 3 --max-time 5 --config - "${base_url}/get_height" 2>/dev/null || true)"
+    else
+        resp="$(curl -fsS --connect-timeout 3 --max-time 5 "${base_url}/get_height" 2>/dev/null || true)"
+    fi
+    if [[ -n "$resp" ]]; then
+        h="$(python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); v=int(d.get("height",0) or 0); print(v if v > 0 else "")' <<< "$resp" 2>/dev/null || true)"
+        if [[ "$h" =~ ^[0-9]+$ && "$h" -gt 0 ]]; then
+            printf '%s\n' "$h"
+            return 0
+        fi
+    fi
+
+    local rpc_cfg=('header = "Content-Type: application/json"')
+    if [[ ${#cfg_lines[@]} -gt 0 ]]; then
+        rpc_cfg+=("${cfg_lines[@]}")
+    fi
+    resp="$(printf '%s\n' "${rpc_cfg[@]}" | curl -fsS --connect-timeout 3 --max-time 5 \
+        -X POST --data-raw '{"jsonrpc":"2.0","id":"0","method":"get_block_count"}' \
+        --config - "${base_url}/json_rpc" 2>/dev/null || true)"
+    if [[ -n "$resp" ]]; then
+        h="$(python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); v=int(d.get("result",{}).get("count",0) or 0); print(v if v > 0 else "")' <<< "$resp" 2>/dev/null || true)"
+        if [[ "$h" =~ ^[0-9]+$ && "$h" -gt 0 ]]; then
+            printf '%s\n' "$h"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Resolves wallet restore height in priority order (`v0.1.5`):
+#   1. Explicit CLI --restore-height <N>
+#   2. Explicit WALLET_RESTORE_HEIGHT in .env (non-empty)
+#   3. Live daemon tip height minus 1000 blocks (floored at 0)
+#   4. Network fallback height with a warning
+resolve_wallet_restore_height() {
+    local cli_height="${1:-}"
+    if [[ -n "$cli_height" ]]; then
+        [[ "$cli_height" =~ ^[0-9]+$ ]] || die "Invalid --restore-height: $cli_height"
+        printf '%s\n' "$cli_height"
+        return 0
+    fi
+    if [[ -n "${WALLET_RESTORE_HEIGHT_EXPLICIT:-}" ]]; then
+        [[ "$WALLET_RESTORE_HEIGHT_EXPLICIT" =~ ^[0-9]+$ ]] || die "Invalid WALLET_RESTORE_HEIGHT: $WALLET_RESTORE_HEIGHT_EXPLICIT"
+        printf '%s\n' "$WALLET_RESTORE_HEIGHT_EXPLICIT"
+        return 0
+    fi
+
+    local tip_height="" safe_height="" fallback_height=""
+    if tip_height="$(query_daemon_tip_height)"; then
+        if [[ "$tip_height" -gt 1000 ]]; then
+            safe_height=$((tip_height - 1000))
+        else
+            safe_height=0
+        fi
+        log_info "Resolved dynamic restore height ${safe_height} (daemon tip=${tip_height}, safety margin=1000 blocks)." >&2
+        printf '%s\n' "$safe_height"
+        return 0
+    fi
+
+    fallback_height="$(default_restore_height_for_network "${MONERO_NETWORK:-mainnet}")"
+    log_warn "Could not query current height from ${MONERO_DAEMON_RPC_URL:-${MONERO_REMOTE_NODE:-remote daemon}}; falling back to default restore height ${fallback_height} (${MONERO_NETWORK:-mainnet})." >&2
+    printf '%s\n' "$fallback_height"
 }
 
 is_truthy() {
@@ -438,9 +536,13 @@ find_gateway_bin() {
     return 1
 }
 
-# Finds monero-wallet-rpc / monero-wallet-cli in ./bin/, standard system paths, or PATH.
+# Finds monero-wallet-rpc / monero-wallet-cli in optional XMR_MONERO_BIN_DIR, ./bin/, standard system paths, or PATH.
 find_monero_bin() {
     local name="$1"
+    if [[ -n "${XMR_MONERO_BIN_DIR:-}" && -x "${XMR_MONERO_BIN_DIR}/$name" ]]; then
+        printf '%s\n' "${XMR_MONERO_BIN_DIR}/$name"
+        return 0
+    fi
     local candidate
     for candidate in \
         "$REPO_ROOT/bin/$name" \

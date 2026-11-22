@@ -175,8 +175,11 @@ pub struct Config {
     /// Full HTTP/HTTPS URL to `monero-wallet-rpc` JSON-RPC endpoint.
     pub monero_rpc_url: String,
     /// Optional explicit `monerod` JSON-RPC URL (`MONERO_DAEMON_RPC_URL`) used for `get_info`
-    /// height verification during incident resolution (`AUDIT-001`).
+    /// height verification during incident resolution (`AUDIT-001`) and mempool sync-lag checks.
     pub monero_daemon_rpc_url: Option<String>,
+    /// Optional remote Monero daemon address (`MONERO_REMOTE_NODE`, e.g. `host:port`) used as a
+    /// read-only fallback for mempool sync-lag checks when `MONERO_DAEMON_RPC_URL` is unset (`v0.1.5`).
+    pub monero_remote_node: Option<String>,
     /// Optional RPC username for `MONERO_DAEMON_RPC_URL` Digest/Basic authentication (`AUDIT-001`).
     pub monero_daemon_rpc_user: Option<String>,
     /// Optional RPC password for `MONERO_DAEMON_RPC_URL` Digest/Basic authentication (`AUDIT-001`).
@@ -239,6 +242,7 @@ impl fmt::Debug for Config {
             .field("monero_network", &self.monero_network)
             .field("monero_rpc_url", &self.monero_rpc_url)
             .field("monero_daemon_rpc_url", &self.monero_daemon_rpc_url)
+            .field("monero_remote_node", &self.monero_remote_node)
             .field("monero_daemon_rpc_user", &self.monero_daemon_rpc_user)
             .field(
                 "monero_daemon_rpc_pass",
@@ -308,6 +312,7 @@ impl Config {
         )?;
         let monero_rpc_url = env_or_default("MONERO_RPC_URL", "http://127.0.0.1:18082/json_rpc");
         let monero_daemon_rpc_url = optional_non_empty_env("MONERO_DAEMON_RPC_URL");
+        let monero_remote_node = optional_non_empty_env("MONERO_REMOTE_NODE");
         let monero_daemon_rpc_user = optional_non_empty_env("MONERO_DAEMON_RPC_USER");
         let monero_daemon_rpc_pass = optional_non_empty_env("MONERO_DAEMON_RPC_PASS");
         let monero_rpc_user = optional_non_empty_env("MONERO_RPC_USER");
@@ -361,6 +366,7 @@ impl Config {
             monero_network,
             monero_rpc_url,
             monero_daemon_rpc_url,
+            monero_remote_node,
             monero_daemon_rpc_user,
             monero_daemon_rpc_pass,
             monero_rpc_user,
@@ -1061,6 +1067,7 @@ mod tests {
             monero_network: MoneroNetwork::Mainnet,
             monero_rpc_url: "http://127.0.0.1:18082/json_rpc".to_string(),
             monero_daemon_rpc_url: None,
+            monero_remote_node: None,
             monero_daemon_rpc_user: None,
             monero_daemon_rpc_pass: None,
             monero_rpc_user: Some("rpcuser".to_string()),

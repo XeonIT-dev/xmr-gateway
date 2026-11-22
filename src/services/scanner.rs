@@ -62,6 +62,44 @@ pub const PREPARED_INDEXING_GRACE_SECS: i64 = 60;
 /// `RECONCILED`) remain monitored unconditionally regardless of age (`A4-4`).
 const DEFAULT_CONFIRMED_SWEEP_MONITOR_DAYS: i64 = 30;
 
+/// Snapshot of wallet vs. daemon sync state used to defer false `MEMPOOL -> REORGED` transitions
+/// while the wallet is still scanning behind the daemon tip (`v0.1.5`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalletSyncSnapshot {
+    wallet_height: u64,
+    daemon_height: u64,
+    lag: u64,
+    daemon_synchronized: Option<bool>,
+}
+
+impl WalletSyncSnapshot {
+    const fn is_syncing(&self) -> bool {
+        self.wallet_height < self.daemon_height
+            || self.daemon_height == 0
+            || matches!(self.daemon_synchronized, Some(false))
+    }
+}
+
+/// Normalizes a `MONERO_REMOTE_NODE` (`host:port` or `http(s)://host:port[/json_rpc]`) into a
+/// JSON-RPC endpoint URL suitable for read-only daemon `get_info` queries.
+fn normalize_daemon_rpc_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    };
+    let normalized = with_scheme.trim_end_matches('/');
+    if normalized.ends_with("/json_rpc") {
+        Some(normalized.to_string())
+    } else {
+        Some(format!("{normalized}/json_rpc"))
+    }
+}
+
 /// Returns `true` ONLY for Monero Wallet RPC / JSON-RPC error codes proven to be emitted before
 /// `wallet2::commit_tx` broadcasts a transaction (`A3-1`, verified against `monero-wallet-rpc`
 /// `v0.18.5.4` `on_sweep_all` / `handle_rpc_exception`).
@@ -289,6 +327,8 @@ impl ScannerService {
             }
         }
 
+        let mut sync_check_cache: Option<Option<WalletSyncSnapshot>> = None;
+
         for invoice in monitored_invoices {
             let subaddr_transfers = grouped
                 .get(&(invoice.account_index, invoice.address_index))
@@ -332,7 +372,9 @@ impl ScannerService {
                     invoice.clone()
                 }
             } else {
-                let res = self.persist_evaluation(&invoice, &eval).await?;
+                let res = self
+                    .persist_evaluation(&invoice, &eval, &mut sync_check_cache)
+                    .await?;
                 if res.status != invoice.status {
                     report.status_transitions += 1;
                 }
@@ -477,13 +519,15 @@ impl ScannerService {
             .unwrap_or(&[]);
 
         let eval = evaluate_subaddress_transfers(invoice.amount_piconero, subaddr_transfers);
+        let mut sync_check_cache: Option<Option<WalletSyncSnapshot>> = None;
         let mut updated = if matches!(
             invoice.status,
             InvoiceStatus::Swept | InvoiceStatus::Expired
         ) {
             invoice.clone()
         } else {
-            self.persist_evaluation(&invoice, &eval).await?
+            self.persist_evaluation(&invoice, &eval, &mut sync_check_cache)
+                .await?
         };
         let min_sweep_confs = self.min_sweep_confs();
         if invoice.status == InvoiceStatus::Reorged
@@ -491,7 +535,9 @@ impl ScannerService {
             && updated.confirmations >= min_sweep_confs
             && eval.all_unlocked
         {
-            updated = self.persist_evaluation(&updated, &eval).await?;
+            updated = self
+                .persist_evaluation(&updated, &eval, &mut sync_check_cache)
+                .await?;
         }
         let updated = self
             .reconcile_subaddress_transfer_ledger(&updated, &eval)
@@ -880,10 +926,125 @@ impl ScannerService {
         Ok(latest_invoice)
     }
 
+    fn resolve_sync_check_daemon_endpoint(&self) -> Option<(String, Option<&str>, Option<&str>)> {
+        if let Some(url) = self
+            .config
+            .monero_daemon_rpc_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some((
+                url.to_string(),
+                self.config
+                    .monero_daemon_rpc_user
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty()),
+                self.config
+                    .monero_daemon_rpc_pass
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty()),
+            ));
+        }
+        self.config
+            .monero_remote_node
+            .as_deref()
+            .and_then(normalize_daemon_rpc_url)
+            .map(|url| (url, None, None))
+    }
+
+    /// Queries `monero-wallet-rpc` `get_height` and `monerod` `get_info` (at most once per scan
+    /// tick via `cache`) to determine whether the wallet lags behind the daemon tip (`v0.1.5`).
+    ///
+    /// Returns `None` when no daemon RPC/remote node endpoint is configured or when either RPC
+    /// fails so callers preserve fail-closed reorg behavior on daemon outages.
+    async fn check_wallet_sync_for_mempool_deferral(
+        &self,
+        cache: &mut Option<Option<WalletSyncSnapshot>>,
+    ) -> Option<WalletSyncSnapshot> {
+        if let Some(cached) = cache {
+            return *cached;
+        }
+
+        let Some((daemon_url, daemon_user, daemon_pass)) =
+            self.resolve_sync_check_daemon_endpoint()
+        else {
+            *cache = Some(None);
+            return None;
+        };
+
+        let wallet_height = match self.rpc.get_height().await {
+            Ok(resp) => match resp.height {
+                Some(h) => h,
+                None => {
+                    tracing::warn!(
+                        "monero-wallet-rpc get_height omitted height during mempool sync check; proceeding fail-closed"
+                    );
+                    *cache = Some(None);
+                    return None;
+                }
+            },
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to query wallet get_height during mempool sync check; proceeding fail-closed"
+                );
+                *cache = Some(None);
+                return None;
+            }
+        };
+
+        let daemon_client = match MoneroRpcClient::new(
+            &daemon_url,
+            daemon_user.map(ToOwned::to_owned),
+            daemon_pass.map(ToOwned::to_owned),
+        ) {
+            Ok(client) => client,
+            Err(err) => {
+                tracing::warn!(
+                    daemon_url = %daemon_url,
+                    error = %err,
+                    "invalid daemon RPC URL during mempool sync check; proceeding fail-closed"
+                );
+                *cache = Some(None);
+                return None;
+            }
+        };
+
+        let daemon_info = match daemon_client.get_info().await {
+            Ok(info) => info,
+            Err(err) => {
+                tracing::warn!(
+                    daemon_url = %daemon_url,
+                    error = %err,
+                    "failed to query daemon get_info during mempool sync check; proceeding fail-closed"
+                );
+                *cache = Some(None);
+                return None;
+            }
+        };
+
+        let daemon_height = daemon_info
+            .height
+            .unwrap_or(0)
+            .max(daemon_info.target_height.unwrap_or(0));
+        let snap = WalletSyncSnapshot {
+            wallet_height,
+            daemon_height,
+            lag: daemon_height.saturating_sub(wallet_height),
+            daemon_synchronized: daemon_info.synchronized,
+        };
+        *cache = Some(Some(snap));
+        Some(snap)
+    }
+
     async fn persist_evaluation(
         &self,
         invoice: &Invoice,
         eval: &SubaddressEvaluation,
+        sync_cache: &mut Option<Option<WalletSyncSnapshot>>,
     ) -> GatewayResult<Invoice> {
         let now = Utc::now();
         let mut next_status = compute_next_status_with_settlement(
@@ -895,6 +1056,28 @@ impl ScannerService {
             now,
             invoice.expires_at,
         );
+
+        // Guard against false `MEMPOOL -> REORGED` when a 0-conf tx is mined into a block above a
+        // lagging wallet's current `wallet_height` (`v0.1.5`). Never defer explicit double-spends!
+        if invoice.status == InvoiceStatus::Mempool
+            && next_status == InvoiceStatus::Reorged
+            && !eval.double_spend_seen
+            && let Some(sync_snap) = self
+                .check_wallet_sync_for_mempool_deferral(sync_cache)
+                .await
+            && sync_snap.is_syncing()
+        {
+            tracing::warn!(
+                invoice_id = %invoice.id,
+                order_id = %invoice.order_id,
+                wallet_height = sync_snap.wallet_height,
+                daemon_height = sync_snap.daemon_height,
+                lag = sync_snap.lag,
+                daemon_synchronized = ?sync_snap.daemon_synchronized,
+                "deferring mempool-missing reorg check while wallet is syncing"
+            );
+            return Ok(invoice.clone());
+        }
 
         // In View-Only mode with no webhook destination, only SETTLED immediately completes
         // so CONFIRMED invoices remain actively monitored for reorgs until settlement finality.
@@ -2291,6 +2474,7 @@ mod tests {
             monero_network: crate::config::MoneroNetwork::Mainnet,
             monero_rpc_url: rpc_url,
             monero_daemon_rpc_url: None,
+            monero_remote_node: None,
             monero_daemon_rpc_user: None,
             monero_daemon_rpc_pass: None,
             monero_rpc_user: None,

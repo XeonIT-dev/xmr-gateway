@@ -1511,7 +1511,7 @@ if grep -qE '^WALLET_RESTORE_HEIGHT=$' "$REPO_ROOT/.env.example" && grep -qE '^W
 else
     fail ".env.example or .env.docker.example still hardcodes non-empty WALLET_RESTORE_HEIGHT"
 fi
-assert_contains "$STAGE_SHOW_JSON" '"wallet_restore_height": "1600000"' "stagenet auto-selects default WALLET_RESTORE_HEIGHT=1600000 when empty"
+assert_contains "$STAGE_SHOW_JSON" '"wallet_restore_height": "2000000"' "stagenet auto-selects default WALLET_RESTORE_HEIGHT=2000000 when empty"
 
 TESTNET_NODE_ENV="$TMP_DIR/testnet_default.env"
 cp "$STAGE_NODE_ENV" "$TESTNET_NODE_ENV"
@@ -1519,7 +1519,7 @@ chmod 600 "$TESTNET_NODE_ENV"
 sed -i 's/^MONERO_NETWORK=stagenet$/MONERO_NETWORK=testnet/' "$TESTNET_NODE_ENV"
 TESTNET_SHOW_JSON="$("$ADMIN_SH" --env "$TESTNET_NODE_ENV" --json config show)"
 assert_contains "$TESTNET_SHOW_JSON" '"monero_remote_node": "testnet.xmr-tw.org:28081"' "testnet auto-selects testnet default MONERO_REMOTE_NODE"
-assert_contains "$TESTNET_SHOW_JSON" '"wallet_restore_height": "2600000"' "testnet auto-selects default WALLET_RESTORE_HEIGHT=2600000 when empty"
+assert_contains "$TESTNET_SHOW_JSON" '"wallet_restore_height": "2900000"' "testnet auto-selects default WALLET_RESTORE_HEIGHT=2900000 when empty"
 
 # 12e) SELinux-safe same-directory atomic .env rewrite + timestamped webhook verify-sig
 SELINUX_ENV_DIR="$TMP_DIR/selinux_env_dir"
@@ -1619,6 +1619,242 @@ assert_eq "$(stat -c '%a' "$TAR_PREFIX/admin/db.sh")" "755" "install_tarball set
 assert_eq "$(stat -c '%a' "$TAR_PREFIX/admin/service.sh")" "755" "install_tarball sets 0755 on admin/service.sh under umask 077"
 assert_eq "$(stat -c '%a' "$TAR_PREFIX/deploy/systemd/render-wallet-rpc-conf.sh")" "755" "install_tarball sets 0755 on deploy/systemd/render-wallet-rpc-conf.sh"
 assert_eq "$(stat -c '%a' "$TAR_USR_SHARE/scripts/render-wallet-rpc-conf.sh")" "755" "install_tarball installs 0755 render-wallet-rpc-conf.sh into usr/share scripts dir"
+
+# ==============================================================================
+# 17. v0.1.5 Dynamic Restore-Height, Wallet CLI Stdin/Args & GHCR Packaging Tests
+# ==============================================================================
+printf '\n=== 17. v0.1.5 Dynamic Restore-Height, Wallet CLI & GHCR Tests ===\n'
+
+# 17a) Mock daemon HTTP server testing /get_height, /json_rpc get_block_count fallback, and floor-at-0
+HEIGHT_MOCK_DIR="$TMP_DIR/height_mock"
+mkdir -p "$HEIGHT_MOCK_DIR"
+HEIGHT_PORT_FILE="$HEIGHT_MOCK_DIR/port"
+HEIGHT_MODE_FILE="$HEIGHT_MOCK_DIR/mode"
+printf 'get_height:2075432\n' > "$HEIGHT_MODE_FILE"
+
+python3 - "$HEIGHT_PORT_FILE" "$HEIGHT_MODE_FILE" <<'PYEOF' &
+import http.server, json, socketserver, sys
+
+port_file, mode_file = sys.argv[1], sys.argv[2]
+
+class HeightHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+    def _mode(self):
+        with open(mode_file, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    def do_GET(self):
+        mode = self._mode()
+        if self.path == "/get_height" and mode.startswith("get_height:"):
+            val = int(mode.split(":", 1)[1])
+            body = json.dumps({"height": val, "status": "OK"}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(503)
+            self.end_headers()
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length).decode("utf-8", errors="replace")
+        mode = self._mode()
+        if self.path == "/json_rpc" and "get_block_count" in raw and mode.startswith("rpc_count:"):
+            val = int(mode.split(":", 1)[1])
+            body = json.dumps({"jsonrpc": "2.0", "id": "0", "result": {"count": val, "status": "OK"}}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(503)
+            self.end_headers()
+
+class ReuseServer(socketserver.TCPServer):
+    allow_reuse_address = True
+
+httpd = ReuseServer(("127.0.0.1", 0), HeightHandler)
+with open(port_file, "w", encoding="utf-8") as f:
+    f.write(str(httpd.server_address[1]))
+httpd.serve_forever()
+PYEOF
+HEIGHT_MOCK_PID=$!
+
+for _ in $(seq 1 40); do
+    if [[ -s "$HEIGHT_PORT_FILE" ]]; then
+        break
+    fi
+    sleep 0.05
+done
+HEIGHT_PORT="$(cat "$HEIGHT_PORT_FILE")"
+
+# 1) Dynamic /get_height -> height - 1000
+DYN_H1="$(bash -c '
+    set -euo pipefail
+    source "$1"
+    MONERO_NETWORK=stagenet
+    MONERO_REMOTE_NODE="127.0.0.1:'"$HEIGHT_PORT"'"
+    MONERO_DAEMON_RPC_URL=""
+    WALLET_RESTORE_HEIGHT_EXPLICIT=""
+    resolve_wallet_restore_height ""
+' _ "$REPO_ROOT/admin/lib/common.sh" 2>/dev/null)"
+assert_eq "$DYN_H1" "2074432" "resolve_wallet_restore_height computes height - 1000 from /get_height"
+
+# 2) Fallback to /json_rpc get_block_count when /get_height returns 503
+printf 'rpc_count:2080500\n' > "$HEIGHT_MODE_FILE"
+DYN_H2="$(bash -c '
+    set -euo pipefail
+    source "$1"
+    MONERO_NETWORK=stagenet
+    MONERO_REMOTE_NODE="127.0.0.1:'"$HEIGHT_PORT"'"
+    MONERO_DAEMON_RPC_URL=""
+    WALLET_RESTORE_HEIGHT_EXPLICIT=""
+    resolve_wallet_restore_height ""
+' _ "$REPO_ROOT/admin/lib/common.sh" 2>/dev/null)"
+assert_eq "$DYN_H2" "2079500" "resolve_wallet_restore_height falls back to JSON-RPC get_block_count"
+
+# 3) Floor at 0 when height <= 1000
+printf 'get_height:500\n' > "$HEIGHT_MODE_FILE"
+DYN_H3="$(bash -c '
+    set -euo pipefail
+    source "$1"
+    MONERO_NETWORK=stagenet
+    MONERO_REMOTE_NODE="127.0.0.1:'"$HEIGHT_PORT"'"
+    MONERO_DAEMON_RPC_URL=""
+    WALLET_RESTORE_HEIGHT_EXPLICIT=""
+    resolve_wallet_restore_height ""
+' _ "$REPO_ROOT/admin/lib/common.sh" 2>/dev/null)"
+assert_eq "$DYN_H3" "0" "resolve_wallet_restore_height floors max(0, height - 1000) at 0"
+
+# 4) Explicit CLI flag overrides .env and daemon; explicit .env overrides daemon
+printf 'get_height:2075432\n' > "$HEIGHT_MODE_FILE"
+DYN_CLI="$(bash -c '
+    set -euo pipefail
+    source "$1"
+    MONERO_NETWORK=stagenet
+    MONERO_REMOTE_NODE="127.0.0.1:'"$HEIGHT_PORT"'"
+    WALLET_RESTORE_HEIGHT_EXPLICIT="1900000"
+    resolve_wallet_restore_height "1950000"
+' _ "$REPO_ROOT/admin/lib/common.sh" 2>/dev/null)"
+assert_eq "$DYN_CLI" "1950000" "explicit CLI --restore-height overrides .env and daemon"
+
+DYN_ENV="$(bash -c '
+    set -euo pipefail
+    source "$1"
+    MONERO_NETWORK=stagenet
+    MONERO_REMOTE_NODE="127.0.0.1:'"$HEIGHT_PORT"'"
+    WALLET_RESTORE_HEIGHT_EXPLICIT="1900000"
+    resolve_wallet_restore_height ""
+' _ "$REPO_ROOT/admin/lib/common.sh" 2>/dev/null)"
+assert_eq "$DYN_ENV" "1900000" "explicit WALLET_RESTORE_HEIGHT in .env overrides daemon"
+
+# 5) Unreachable daemon logs warning and falls back to network default
+printf 'fail\n' > "$HEIGHT_MODE_FILE"
+DYN_FB_ERR="$HEIGHT_MOCK_DIR/fb.err"
+DYN_FB="$(bash -c '
+    set -euo pipefail
+    source "$1"
+    MONERO_NETWORK=stagenet
+    MONERO_REMOTE_NODE="127.0.0.1:'"$HEIGHT_PORT"'"
+    MONERO_DAEMON_RPC_URL=""
+    WALLET_RESTORE_HEIGHT_EXPLICIT=""
+    resolve_wallet_restore_height ""
+' _ "$REPO_ROOT/admin/lib/common.sh" 2>"$DYN_FB_ERR")"
+assert_eq "$DYN_FB" "2000000" "unreachable daemon falls back to updated stagenet default (2000000)"
+assert_contains "$(cat "$DYN_FB_ERR")" "falling back to default restore height 2000000" "fallback logs warning on stderr"
+
+# 17b) Shim monero-wallet-cli test for create-view-only & create-hot args, stdin, and set refresh-from-block-height
+printf 'get_height:2075432\n' > "$HEIGHT_MODE_FILE"
+SHIM_WALLET_DIR="$TMP_DIR/shim_wallet_test"
+mkdir -p "$SHIM_WALLET_DIR/bin" "$SHIM_WALLET_DIR/data"
+SHIM_LOG="$SHIM_WALLET_DIR/cli_calls.log"
+cat > "$SHIM_WALLET_DIR/bin/monero-wallet-cli" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+stdin_data="\$(cat)"
+printf 'ARGS:%s\nSTDIN:%s\n---END---\n' "\$*" "\$stdin_data" >> "$SHIM_LOG"
+# Create dummy .keys file when generating wallet
+for ((i=1; i<=\$#; i++)); do
+    arg="\${!i}"
+    if [[ "\$arg" == "--generate-from-view-key" || "\$arg" == "--generate-new-wallet" ]]; then
+        next_i=\$((i + 1))
+        wpath="\${!next_i}"
+        touch "\${wpath}.keys" "\${wpath}"
+    fi
+done
+EOF
+chmod 0755 "$SHIM_WALLET_DIR/bin/monero-wallet-cli"
+
+SHIM_VO_ENV="$SHIM_WALLET_DIR/vo.env"
+cat > "$SHIM_VO_ENV" <<EOF
+HOST=127.0.0.1
+PORT=${MOCK_PORT}
+DATABASE_URL=sqlite://${SHIM_WALLET_DIR}/data/vo.db
+API_SECRET_KEY=${API_KEY}
+OPERATOR_API_KEY=${OP_KEY}
+WEBHOOK_SECRET=${WH_SECRET}
+MONERO_NETWORK=stagenet
+MONERO_REMOTE_NODE=127.0.0.1:${HEIGHT_PORT}
+WALLET_RESTORE_HEIGHT=
+WALLET_MODE=view_only
+MONERO_RPC_USER=rpc_user
+MONERO_RPC_PASS=${RPC_PASS}
+MONERO_VIEW_ONLY_ADDRESS=55zKPMSB5n8DnR2YG3NUrAPcAJzHywxiPSWFMnz3gWSa1bajbFKHpv9FAK4bUfYyQrPhvZjBkgmiKh5puzLJ1U4o4XM8vjd
+MONERO_VIEW_ONLY_KEY=3f333e848712a7f3a3b3dbd27478e4fa9757e349e6f2945afa1138e572beb70b
+EOF
+chmod 600 "$SHIM_VO_ENV"
+
+XMR_MONERO_BIN_DIR="$SHIM_WALLET_DIR/bin" PATH="$SHIM_WALLET_DIR/bin:$PATH" "$ADMIN_SH" --env "$SHIM_VO_ENV" wallet create-view-only >/dev/null 2>&1
+VO_SHIM_CONTENT="$(cat "$SHIM_LOG")"
+assert_contains "$VO_SHIM_CONTENT" "--generate-from-view-key" "create-view-only invokes --generate-from-view-key"
+assert_contains "$VO_SHIM_CONTENT" "--restore-height 2074432" "create-view-only passes dynamically resolved --restore-height 2074432"
+assert_contains "$VO_SHIM_CONTENT" "set refresh-from-block-height 2074432" "create-view-only pins refresh-from-block-height via set command"
+VO_FIRST_STDIN="$(python3 - "$SHIM_LOG" <<'PYEOF'
+import sys
+txt = open(sys.argv[1], encoding="utf-8").read().split("---END---")[0]
+stdin_part = txt.split("STDIN:", 1)[1].strip("\n")
+lines = stdin_part.splitlines()
+print(len(lines))
+PYEOF
+)"
+assert_eq "$VO_FIRST_STDIN" "2" "create-view-only pipes exact 2 stdin lines (address + view_key) with --restore-height"
+
+# Test create-hot with explicit --restore-height override
+: > "$SHIM_LOG"
+rm -f "$SHIM_WALLET_DIR/data/wallet/gateway_wallet"*
+XMR_MONERO_BIN_DIR="$SHIM_WALLET_DIR/bin" PATH="$SHIM_WALLET_DIR/bin:$PATH" "$ADMIN_SH" --env "$SHIM_VO_ENV" --yes wallet create-hot --restore-height 2071111 >/dev/null 2>&1
+HOT_SHIM_CONTENT="$(cat "$SHIM_LOG")"
+assert_contains "$HOT_SHIM_CONTENT" "--generate-new-wallet" "create-hot invokes --generate-new-wallet"
+assert_contains "$HOT_SHIM_CONTENT" "--restore-height 2071111" "create-hot passes explicit --restore-height 2071111"
+assert_contains "$HOT_SHIM_CONTENT" "set refresh-from-block-height 2071111" "create-hot pins refresh-from-block-height 2071111 via set command"
+
+kill "$HEIGHT_MOCK_PID" 2>/dev/null || true
+wait "$HEIGHT_MOCK_PID" 2>/dev/null || true
+
+# 17c) Verify GHCR multi-arch container publishing workflow, Compose & Quadlet image specs
+python3 - "$REPO_ROOT" <<'PYEOF'
+import os, sys
+
+repo = sys.argv[1]
+rel = open(os.path.join(repo, ".github/workflows/release.yml"), encoding="utf-8").read()
+assert "packages: write" in rel, "release.yml must grant packages: write for GHCR"
+assert "docker/setup-qemu-action" in rel, "release.yml must set up QEMU"
+assert "docker/setup-buildx-action" in rel, "release.yml must set up Buildx"
+assert "docker/login-action" in rel, "release.yml must log in to GHCR"
+assert "docker/build-push-action" in rel, "release.yml must use docker/build-push-action"
+assert "linux/amd64,linux/arm64" in rel, "release.yml must build linux/amd64,linux/arm64"
+assert "xmr-gateway-wallet-rpc" in rel, "release.yml must publish xmr-gateway-wallet-rpc image"
+
+compose = open(os.path.join(repo, "deploy/docker/docker-compose.yml"), encoding="utf-8").read()
+assert "ghcr.io/xeonit-dev/xmr-gateway:v0.1.5" in compose, "docker-compose.yml must reference GHCR gateway image"
+assert "ghcr.io/xeonit-dev/xmr-gateway-wallet-rpc:v0.1.5" in compose, "docker-compose.yml must reference GHCR wallet-rpc image"
+
+q_gw = open(os.path.join(repo, "deploy/podman/quadlet/xmr-gateway.container"), encoding="utf-8").read()
+q_rpc = open(os.path.join(repo, "deploy/podman/quadlet/monero-wallet-rpc.container"), encoding="utf-8").read()
+assert "Image=ghcr.io/xeonit-dev/xmr-gateway:v0.1.5" in q_gw, "xmr-gateway.container must use GHCR v0.1.5 image"
+assert "Image=ghcr.io/xeonit-dev/xmr-gateway-wallet-rpc:v0.1.5" in q_rpc, "monero-wallet-rpc.container must use GHCR v0.1.5 image"
+PYEOF
+pass "GHCR multi-arch release.yml, docker-compose.yml, and Quadlet container images verified"
 
 printf '\n====================================================================\n'
 printf 'Admin Test Summary: %d PASSED, %d FAILED\n' "$PASS_COUNT" "$FAIL_COUNT"

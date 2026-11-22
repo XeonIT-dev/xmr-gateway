@@ -2,6 +2,17 @@
 
 All notable changes to `xmr-gateway` are documented in this file.
 
+## [0.1.5] - 2026-11-22
+
+### Added
+- **Multi-Arch GHCR Container Publishing (`.github/workflows/release.yml`, `deploy/docker/docker-compose.yml`, `deploy/podman/quadlet/*.container`):** Added automated `linux/amd64` + `linux/arm64` image publishing to GitHub Container Registry (`ghcr.io/xeonit-dev/xmr-gateway` and `ghcr.io/xeonit-dev/xmr-gateway-wallet-rpc`) tagged with `<tag>`, `<version>`, and `latest` (with `dry_run: true` build-only verification), and updated Compose & Quadlet manifests to pull prebuilt GHCR images by default while preserving local build support.
+- **Dynamic Daemon Restore-Height Resolution (`admin/lib/common.sh`, `admin/wallet.sh`, `start.sh`):** When neither `--restore-height` nor `WALLET_RESTORE_HEIGHT` is explicitly set, wallet creation now queries `MONERO_DAEMON_RPC_URL` / `MONERO_REMOTE_NODE` (`/get_height` with JSON-RPC `get_block_count` fallback) and derives `max(0, height - 1000)` (with updated safe offline fallbacks `mainnet=3500000`, `stagenet=2000000`, `testnet=2900000`).
+
+### Fixed
+- **Scanner Sync-Lag Guard Against False `MEMPOOL -> REORGED` (`src/services/scanner.rs`, `src/config.rs`):** When a `MEMPOOL` transaction leaves `pool` before appearing in `in` (without `double_spend_seen`), the scanner now checks `wallet_height` vs. daemon `get_info` (`MONERO_DAEMON_RPC_URL` or read-only `MONERO_REMOTE_NODE` fallback) and defers the `REORGED` transition with a `WARN` log while `wallet_height < daemon_height` or `synchronized == false`, preserving strict fail-closed `REORGED` detection when synced (`lag == 0`) or on explicit double-spends.
+- **Exact `refresh-from-block-height` Persistence in `wallet create-view-only` & `create-hot` (`admin/wallet.sh`, `start.sh`):** Cleaned up `stdin` piping for `monero-wallet-cli --generate-from-view-key` (`address` + `view_key` when `--restore-height` is passed) and explicitly pinned `set refresh-from-block-height <height>` inside `.keys` for both `create-view-only` and `create-hot` so `--generate-new-wallet` and `--generate-from-view-key` reliably persist the resolved height.
+- **Container Deployment Guides (`DEPLOY_EN.md`, `DEPLOY_RU.md`, `README.md`, `README_RU.md`):** Replaced `podman run` in Docker Compose instructions with native `docker compose run`, added GHCR `pull && up -d` quick-start paths, replaced stale hardcoded restore heights with `<CURRENT_HEIGHT>` guidance (`curl -s http://<node>/get_height`), and added post-start `lag=0` sync verification reminders.
+
 ## [0.1.4] - 2026-11-21
 
 ### Fixed

@@ -215,14 +215,15 @@ ensure_env_file() {
             *)        MONERO_REMOTE_NODE="xmr-node.cakewallet.com:18081" ;;
         esac
     fi
+    WALLET_RESTORE_HEIGHT_EXPLICIT="${WALLET_RESTORE_HEIGHT:-}"
     if [[ -z "${WALLET_RESTORE_HEIGHT:-}" ]]; then
         case "$MONERO_NETWORK" in
-            stagenet) WALLET_RESTORE_HEIGHT="1600000" ;;
-            testnet)  WALLET_RESTORE_HEIGHT="2600000" ;;
-            *)        WALLET_RESTORE_HEIGHT="3280000" ;;
+            stagenet) WALLET_RESTORE_HEIGHT="2000000" ;;
+            testnet)  WALLET_RESTORE_HEIGHT="2900000" ;;
+            *)        WALLET_RESTORE_HEIGHT="3500000" ;;
         esac
     fi
-    export MONERO_NETWORK MONERO_REMOTE_NODE WALLET_RESTORE_HEIGHT
+    export MONERO_NETWORK MONERO_REMOTE_NODE WALLET_RESTORE_HEIGHT WALLET_RESTORE_HEIGHT_EXPLICIT
 
     if [[ -z "${WALLET_MODE:-}" ]]; then
         if [[ "${ENABLE_AUTO_SWEEP,,}" == "true" || "${ENABLE_AUTO_SWEEP}" == "1" ]]; then
@@ -430,6 +431,70 @@ EOF
     exit 1
 }
 
+query_daemon_tip_height() {
+    command -v curl >/dev/null 2>&1 || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+
+    local base_url=""
+    if [[ -n "${MONERO_DAEMON_RPC_URL:-}" ]]; then
+        base_url="${MONERO_DAEMON_RPC_URL%/}"
+        base_url="${base_url%/json_rpc}"
+    elif [[ -n "${MONERO_REMOTE_NODE:-}" ]]; then
+        local node="$MONERO_REMOTE_NODE"
+        if [[ "$node" == http://* || "$node" == https://* ]]; then
+            base_url="${node%/}"
+            base_url="${base_url%/json_rpc}"
+        else
+            base_url="http://${node%/}"
+        fi
+    else
+        return 1
+    fi
+
+    local resp="" h=""
+    resp="$(curl -fsS --connect-timeout 3 --max-time 5 "${base_url}/get_height" 2>/dev/null || true)"
+    if [[ -n "$resp" ]]; then
+        h="$(python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); v=int(d.get("height",0) or 0); print(v if v > 0 else "")' <<< "$resp" 2>/dev/null || true)"
+        if [[ "$h" =~ ^[0-9]+$ && "$h" -gt 0 ]]; then
+            printf '%s\n' "$h"
+            return 0
+        fi
+    fi
+
+    resp="$(curl -fsS --connect-timeout 3 --max-time 5 -X POST \
+        -H 'Content-Type: application/json' \
+        --data-raw '{"jsonrpc":"2.0","id":"0","method":"get_block_count"}' \
+        "${base_url}/json_rpc" 2>/dev/null || true)"
+    if [[ -n "$resp" ]]; then
+        h="$(python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); v=int(d.get("result",{}).get("count",0) or 0); print(v if v > 0 else "")' <<< "$resp" 2>/dev/null || true)"
+        if [[ "$h" =~ ^[0-9]+$ && "$h" -gt 0 ]]; then
+            printf '%s\n' "$h"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+resolve_wallet_restore_height() {
+    if [[ -n "${WALLET_RESTORE_HEIGHT_EXPLICIT:-}" ]]; then
+        printf '%s\n' "$WALLET_RESTORE_HEIGHT_EXPLICIT"
+        return 0
+    fi
+    local tip_height="" safe_height=""
+    if tip_height="$(query_daemon_tip_height)"; then
+        if [[ "$tip_height" -gt 1000 ]]; then
+            safe_height=$((tip_height - 1000))
+        else
+            safe_height=0
+        fi
+        log_info "Resolved dynamic restore height ${safe_height} (daemon tip=${tip_height}, safety margin=1000 blocks)." >&2
+        printf '%s\n' "$safe_height"
+        return 0
+    fi
+    log_warn "Could not query current height from ${MONERO_REMOTE_NODE}; falling back to default restore height ${WALLET_RESTORE_HEIGHT} (${MONERO_NETWORK})." >&2
+    printf '%s\n' "$WALLET_RESTORE_HEIGHT"
+}
+
 ensure_wallet() {
     mkdir -p "$WALLET_DIR"
     chmod 700 "$WALLET_DIR"
@@ -445,15 +510,19 @@ ensure_wallet() {
         return 0
     fi
 
-    local wallet_cli
+    local wallet_cli restore_height wallet_pw
     wallet_cli="$(find_monero_bin monero-wallet-cli)"
+    restore_height="$(resolve_wallet_restore_height)"
+    wallet_pw="$(cat "$WALLET_PASS_FILE")"
 
     local net_args=()
     if [[ "$MONERO_NETWORK" == "stagenet" ]]; then
         net_args+=(--stagenet)
+    elif [[ "$MONERO_NETWORK" == "testnet" ]]; then
+        net_args+=(--testnet)
     fi
 
-    log_info "Initializing $MONERO_NETWORK wallet at $WALLET_FILE (restore height: $WALLET_RESTORE_HEIGHT)..."
+    log_info "Initializing $MONERO_NETWORK wallet at $WALLET_FILE (restore height: $restore_height)..."
 
     if [[ "$WALLET_MODE" == "view_only" ]]; then
         if [[ -z "${MONERO_VIEW_ONLY_ADDRESS:-}" || -z "${MONERO_VIEW_ONLY_KEY:-}" ]]; then
@@ -461,17 +530,23 @@ ensure_wallet() {
             exit 1
         fi
         log_info "Creating View-Only wallet non-interactively from MONERO_VIEW_ONLY_ADDRESS/KEY..."
-        printf '%s\n%s\n%s\nN\n' \
+        printf '%s\n%s\n' \
             "$MONERO_VIEW_ONLY_ADDRESS" \
-            "$MONERO_VIEW_ONLY_KEY" \
-            "$WALLET_RESTORE_HEIGHT" | "$wallet_cli" \
+            "$MONERO_VIEW_ONLY_KEY" | "$wallet_cli" \
             --offline \
             "${net_args[@]}" \
             --generate-from-view-key "$WALLET_FILE" \
             --password-file "$WALLET_PASS_FILE" \
-            --restore-height "$WALLET_RESTORE_HEIGHT" \
+            --restore-height "$restore_height" \
             --log-file "$CLI_LOG_FILE" \
             --command address
+        printf '%s\n' "$wallet_pw" | "$wallet_cli" \
+            --offline \
+            "${net_args[@]}" \
+            --wallet-file "$WALLET_FILE" \
+            --password-file "$WALLET_PASS_FILE" \
+            --log-file "$CLI_LOG_FILE" \
+            set refresh-from-block-height "$restore_height" >/dev/null
     elif [[ "$WALLET_MODE" == "hot_wallet" ]]; then
         log_warn "WALLET_MODE=hot_wallet: generating new $MONERO_NETWORK wallet at $WALLET_FILE. Back up the 25-word seed phrase below!"
         printf 'N\n' | "$wallet_cli" \
@@ -479,10 +554,17 @@ ensure_wallet() {
             "${net_args[@]}" \
             --generate-new-wallet "$WALLET_FILE" \
             --password-file "$WALLET_PASS_FILE" \
-            --restore-height "$WALLET_RESTORE_HEIGHT" \
+            --restore-height "$restore_height" \
             --mnemonic-language English \
             --log-file "$CLI_LOG_FILE" \
             --command address
+        printf '%s\n' "$wallet_pw" | "$wallet_cli" \
+            --offline \
+            "${net_args[@]}" \
+            --wallet-file "$WALLET_FILE" \
+            --password-file "$WALLET_PASS_FILE" \
+            --log-file "$CLI_LOG_FILE" \
+            set refresh-from-block-height "$restore_height" >/dev/null
     else
         log_err "Refusing wallet generation for unrecognized WALLET_MODE='$WALLET_MODE'."
         exit 1

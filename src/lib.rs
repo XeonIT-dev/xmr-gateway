@@ -77,6 +77,7 @@ mod integration_tests {
             monero_network: crate::config::MoneroNetwork::Mainnet,
             monero_rpc_url: rpc_url,
             monero_daemon_rpc_url: None,
+            monero_remote_node: None,
             monero_daemon_rpc_user: None,
             monero_daemon_rpc_pass: None,
             monero_rpc_user: None,

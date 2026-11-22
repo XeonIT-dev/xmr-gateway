@@ -29,15 +29,15 @@ sudo bash install.sh
 Дополнительные опции:
 ```bash
 # Явный метод и версия:
-sudo bash install.sh --method deb --version v0.1.4
-sudo bash install.sh --method rpm --version v0.1.4
-sudo bash install.sh --method tarball --prefix /opt/xmr-gateway --version v0.1.4
+sudo bash install.sh --method deb --version v0.1.5
+sudo bash install.sh --method rpm --version v0.1.5
+sudo bash install.sh --method tarball --prefix /opt/xmr-gateway --version v0.1.5
 
 # Непривилегированная установка tarball в домашний каталог (без sudo):
-bash install.sh --method tarball --prefix "$HOME/xmr-gateway" --version v0.1.4
+bash install.sh --method tarball --prefix "$HOME/xmr-gateway" --version v0.1.5
 
 # Fail-closed проверка GPG-подписи SHA256SUMS.asc:
-sudo bash install.sh --version v0.1.4 --gpg-key ./RELEASE_SIGNING_KEY.asc --require-gpg
+sudo bash install.sh --version v0.1.5 --gpg-key ./RELEASE_SIGNING_KEY.asc --require-gpg
 ```
 
 ### 2.2. Ручная криптографическая верификация релиза
@@ -51,7 +51,7 @@ gpg --import RELEASE_SIGNING_KEY.asc
 gpg --verify SHA256SUMS.asc SHA256SUMS
 
 # 3. Проверка GitHub Build Provenance Attestation (требует GitHub CLI `gh`)
-gh attestation verify xmr-gateway_0.1.4_amd64.deb --owner XeonIT-dev
+gh attestation verify xmr-gateway_0.1.5_amd64.deb --owner XeonIT-dev
 ```
 
 ---
@@ -61,10 +61,10 @@ gh attestation verify xmr-gateway_0.1.4_amd64.deb --owner XeonIT-dev
 ### 3.1. Установка пакета `.deb` или `.rpm`
 ```bash
 # Debian / Ubuntu:
-sudo apt-get install -y ./xmr-gateway_0.1.4_amd64.deb
+sudo apt-get install -y ./xmr-gateway_0.1.5_amd64.deb
 
 # Fedora / RHEL / Rocky:
-sudo dnf install -y ./xmr-gateway-0.1.4-1.x86_64.rpm
+sudo dnf install -y ./xmr-gateway-0.1.5-1.x86_64.rpm
 ```
 Пакет автоматически:
 - создаёт системного пользователя и группу `xmr-gateway` (`/usr/sbin/nologin`);
@@ -172,33 +172,47 @@ sudo -u xmr-gateway xmr-gateway-admin --env /etc/xmr-gateway/.env dev health-rba
      chcon -Rt container_file_t data/gateway data/wallet
      podman unshare chown -R 10001:10001 data/gateway data/wallet
      ```
-2. Соберите образы и инициализируйте кошелёк в `data/wallet` (`gateway_wallet`, `gateway_wallet.keys` и `0600` `gateway_wallet.password`) одноразовым контейнером до `up -d`:
+2. Скачайте готовые multi-arch образы из GHCR (либо при желании соберите локально) и инициализируйте **новый выделенный кошелёк** в `data/wallet` (`gateway_wallet`, `gateway_wallet.keys` и `0600` `gateway_wallet.password`) до запуска стека:
    ```bash
-   # Сборка воспроизводимых образов (официальный Monero CLI проверяется по SHA256):
-   docker compose -f deploy/docker/docker-compose.yml --env-file deploy/docker/.env.docker build
-   # (Или через podman-compose: podman-compose -f deploy/docker/docker-compose.yml --env-file deploy/docker/.env.docker build)
+   # Вариант A (быстрый старт из готовых multi-arch образов GHCR — рекомендуется):
+   docker compose -f deploy/docker/docker-compose.yml --env-file deploy/docker/.env.docker pull
+   # Вариант B (локальная сборка из исходников):
+   # docker compose -f deploy/docker/docker-compose.yml --env-file deploy/docker/.env.docker build
 
-   # Пример инициализации кошелька одноразовым контейнером (для view_only используйте --generate-from-view-key):
-   podman run --rm -it --entrypoint /bin/sh \
-     --user 10001:10001 -v "$PWD/data/wallet:/wallet:rw" \
-     localhost/docker_monero-wallet-rpc:latest -c '
+   # Узнайте текущую высоту сети (подставьте высоту минус ~1000 блоков вместо <CURRENT_HEIGHT>):
+   curl -s http://xmr-node.cakewallet.com:18081/get_height
+   # (Для Stagenet: curl -s http://node.monerodevs.org:38089/get_height)
+
+   # Инициализация кошелька через нативный Docker Compose (для podman-compose используйте ту же команду,
+   # заменив `docker compose` на `podman-compose`; для view_only используйте --generate-from-view-key):
+   docker compose -f deploy/docker/docker-compose.yml --env-file deploy/docker/.env.docker \
+     run --rm --entrypoint /bin/sh monero-wallet-rpc -c '
        umask 077
        head -c 24 /dev/urandom | od -An -tx1 | tr -d " \n" > /wallet/gateway_wallet.password
        chmod 600 /wallet/gateway_wallet.password
+       # Замените <CURRENT_HEIGHT> на текущую высоту сети минус ~1000 блоков:
        printf "N\n" | /usr/local/bin/monero-wallet-cli --offline --stagenet \
          --generate-new-wallet /wallet/gateway_wallet \
          --password-file /wallet/gateway_wallet.password \
-         --restore-height 1600000 --mnemonic-language English --command address
+         --restore-height <CURRENT_HEIGHT> --mnemonic-language English --command address
+       printf "%s\n" "$(cat /wallet/gateway_wallet.password)" | /usr/local/bin/monero-wallet-cli --offline --stagenet \
+         --wallet-file /wallet/gateway_wallet --password-file /wallet/gateway_wallet.password \
+         set refresh-from-block-height <CURRENT_HEIGHT> >/dev/null
        chmod 600 /wallet/gateway_wallet*
      '
    ```
-3. Запустите стек:
+3. Запустите стек и убедитесь в синхронизации кошелька (`lag=0`) до открытия боевого трафика:
    ```bash
    docker compose -f deploy/docker/docker-compose.yml --env-file deploy/docker/.env.docker up -d
 
    # Опционально с встроенным Caddy (автоматический HTTPS):
    docker compose -f deploy/docker/docker-compose.yml --env-file deploy/docker/.env.docker --profile caddy up -d
+
+   # Проверьте, что wallet_height догнал высоту ноды (lag=0) до приёма первых платежей:
+   docker compose -f deploy/docker/docker-compose.yml --env-file deploy/docker/.env.docker \
+     exec monero-wallet-rpc sh -c 'curl -sS --digest -u "$MONERO_RPC_USER:$MONERO_RPC_PASS" -d "{\"jsonrpc\":\"2.0\",\"id\":\"0\",\"method\":\"get_height\"}" http://127.0.0.1:18082/json_rpc'
    ```
+- Используйте строго **выделенный чистый кошелёк** (без истории входящих переводов на субадресах) и открывайте приём платежей только после достижения `lag=0`.
 - Порт `18082` `monero-wallet-rpc` **никогда не публикуется на хост** (общение идёт по изолированной сети `xmr_internal` с `internal: true`).
 - Порт `8080` шлюза привязан строго к `127.0.0.1:8080:8080` и снабжён нативным Compose `healthcheck:`.
 - Оба контейнера работают от непривилегированного `10001:10001`, с `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges:true` и `stop_grace_period: 30s` для чистого `WAL TRUNCATE` и сохранения кошелька.
@@ -207,9 +221,12 @@ sudo -u xmr-gateway xmr-gateway-admin --env /etc/xmr-gateway/.env dev health-rba
 Quadlet пробрасывает вашего непривилегированного пользователя в UID `10001` (`UserNS=keep-id:uid=10001,gid=10001`), применяет приватные SELinux-метки `:Z` к **непересекающимся** соседним каталогам `data/` и `wallet/`, использует две bridge-сети (`xmr-gateway-internal.network` + `xmr-gateway-egress.network`, исключая конфликт `pasta`/bridge в Podman 5) и задаёт нативные `HealthCmd=` и `StopTimeout=30`.
 
 ```bash
-# 1. Соберите оба локальных образа от непривилегированного пользователя:
-podman build -t localhost/xmr-gateway:latest -f Containerfile .
-podman build -t localhost/xmr-gateway-wallet-rpc:latest -f deploy/docker/Containerfile.monero-rpc .
+# 1. Скачайте готовые multi-arch образы из GHCR от непривилегированного пользователя:
+podman pull ghcr.io/xeonit-dev/xmr-gateway:v0.1.5
+podman pull ghcr.io/xeonit-dev/xmr-gateway-wallet-rpc:v0.1.5
+# (При локальной сборке замените Image= в обоих .container файлах на localhost/xmr-gateway*:latest:
+#  podman build -t localhost/xmr-gateway:latest -f Containerfile .
+#  podman build -t localhost/xmr-gateway-wallet-rpc:latest -f deploy/docker/Containerfile.monero-rpc .)
 
 # 2. Создайте изолированные соседние каталоги (0700) и 0600 конфиг:
 mkdir -p ~/.local/share/xmr-gateway/data ~/.local/share/xmr-gateway/wallet ~/.config/xmr-gateway ~/.config/containers/systemd
@@ -218,38 +235,50 @@ cp deploy/docker/.env.docker.example ~/.config/xmr-gateway/gateway.env
 chmod 600 ~/.config/xmr-gateway/gateway.env
 # Отредактируйте ~/.config/xmr-gateway/gateway.env и замените все placeholder-секреты!
 
-# 3. Инициализируйте кошелёк в ~/.local/share/xmr-gateway/wallet/ одноразовым контейнером
+# 3. Узнайте текущую высоту сети (подставьте высоту минус ~1000 блоков вместо <CURRENT_HEIGHT>):
+curl -s http://xmr-node.cakewallet.com:18081/get_height
+
+# 4. Инициализируйте новый выделенный кошелёк в ~/.local/share/xmr-gateway/wallet/ одноразовым контейнером
 #    (создаёт gateway_wallet* и 0600 gateway_wallet.password; для view_only используйте --generate-from-view-key):
 podman run --rm -it --entrypoint /bin/sh \
   --userns=keep-id:uid=10001,gid=10001 --user 10001:10001 \
   -v "$HOME/.local/share/xmr-gateway/wallet:/wallet:Z" \
-  localhost/xmr-gateway-wallet-rpc:latest -c '
+  ghcr.io/xeonit-dev/xmr-gateway-wallet-rpc:v0.1.5 -c '
     umask 077
     head -c 24 /dev/urandom | od -An -tx1 | tr -d " \n" > /wallet/gateway_wallet.password
     chmod 600 /wallet/gateway_wallet.password
+    # Замените <CURRENT_HEIGHT> на текущую высоту сети минус ~1000 блоков:
     printf "N\n" | /usr/local/bin/monero-wallet-cli --offline \
       --generate-new-wallet /wallet/gateway_wallet \
       --password-file /wallet/gateway_wallet.password \
-      --restore-height 3280000 --mnemonic-language English --command address
+      --restore-height <CURRENT_HEIGHT> --mnemonic-language English --command address
+    printf "%s\n" "$(cat /wallet/gateway_wallet.password)" | /usr/local/bin/monero-wallet-cli --offline \
+      --wallet-file /wallet/gateway_wallet --password-file /wallet/gateway_wallet.password \
+      set refresh-from-block-height <CURRENT_HEIGHT> >/dev/null
     chmod 600 /wallet/gateway_wallet*
   '
 
-# 4. Скопируйте ВСЕ 4 Quadlet-файла (internal + egress сети + оба контейнера):
+# 5. Скопируйте ВСЕ 4 Quadlet-файла (internal + egress сети + оба контейнера):
 cp deploy/podman/quadlet/xmr-gateway-internal.network \
    deploy/podman/quadlet/xmr-gateway-egress.network \
    deploy/podman/quadlet/monero-wallet-rpc.container \
    deploy/podman/quadlet/xmr-gateway.container \
    ~/.config/containers/systemd/
 
-# 5. Перечитайте генератор и запустите (динамические Quadlet-юниты НЕ поддерживают `systemctl --user enable`;
+# 6. Перечитайте генератор и запустите (динамические Quadlet-юниты НЕ поддерживают `systemctl --user enable`;
 #    автозапуск уже задан секцией `[Install] WantedBy=default.target` + linger):
 systemctl --user daemon-reload
 systemctl --user start monero-wallet-rpc.service xmr-gateway.service
 systemctl --user status monero-wallet-rpc.service xmr-gateway.service
 
-# 6. Включите linger, чтобы сервисы работали после выхода из SSH и перезагрузки:
+# 7. Проверьте синхронизацию кошелька (lag=0) до открытия боевого трафика:
+podman exec xmr-gateway-wallet-rpc sh -c \
+  'curl -sS --digest -u "$MONERO_RPC_USER:$MONERO_RPC_PASS" -d "{\"jsonrpc\":\"2.0\",\"id\":\"0\",\"method\":\"get_height\"}" http://127.0.0.1:18082/json_rpc'
+
+# 8. Включите linger, чтобы сервисы работали после выхода из SSH и перезагрузки:
 loginctl enable-linger "$USER"
 ```
+> Всегда используйте выделенный чистый кошелёк без истории входящих переводов на субадресах и открывайте приём платежей только после того, как `get_height` догонит ноду (`lag=0`).
 
 ---
 
@@ -286,13 +315,13 @@ gpg --armor --export-secret-keys <KEY_FINGERPRINT>
 
 ### Выпуск релиза (3 шага)
 ```bash
-# 1. Убедитесь, что version в Cargo.toml совпадает с тегом (например, 0.1.4), и main актуален:
+# 1. Убедитесь, что version в Cargo.toml совпадает с тегом (например, 0.1.5), и main актуален:
 git checkout main && git pull --ff-only
 
 # 2. Создайте (подписанный) аннотированный тег:
-git tag -s v0.1.4 -m "Release v0.1.4"
+git tag -s v0.1.5 -m "Release v0.1.5"
 
 # 3. Запушьте тег — GitHub Actions автоматически соберёт и опубликует релиз:
-git push origin v0.1.4
+git push origin v0.1.5
 ```
 Для пробного прогона без публикации релиза запустите **Actions → Release → Run workflow** с параметром `dry_run: true`.

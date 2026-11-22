@@ -269,20 +269,42 @@ fix_system_wallet_ownership() {
     fi
 }
 
+pin_wallet_restore_height() {
+    local wallet_cli="$1"
+    local restore_height="$2"
+    shift 2
+    local net_args=("$@")
+    local wallet_pw=""
+    if [[ -f "$WALLET_PASS_FILE" ]]; then
+        wallet_pw="$(cat "$WALLET_PASS_FILE")"
+    fi
+    # Persists exact refresh-from-block-height inside `.keys` for both `--generate-new-wallet`
+    # (which otherwise ignores `--restore-height`) and `--generate-from-view-key` (`v0.1.5`).
+    printf '%s\n' "$wallet_pw" | "$wallet_cli" \
+        --offline \
+        "${net_args[@]}" \
+        --wallet-file "$WALLET_FILE" \
+        --password-file "$WALLET_PASS_FILE" \
+        --log-file "$CLI_LOG_FILE" \
+        set refresh-from-block-height "$restore_height" >/dev/null
+}
+
 cmd_create_hot() {
     load_env
     require_cmd openssl
-    local restore_height="$WALLET_RESTORE_HEIGHT"
+    local cli_restore_height=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --restore-height)
                 [[ $# -ge 2 ]] || die "--restore-height requires a height"
-                restore_height="$2"
+                cli_restore_height="$2"
                 shift 2
                 ;;
             *) die "Unknown create-hot option: $1" ;;
         esac
     done
+    local restore_height
+    restore_height="$(resolve_wallet_restore_height "$cli_restore_height")"
     [[ "$restore_height" =~ ^[0-9]+$ ]] || die "Invalid restore height: $restore_height"
     [[ ! -f "${WALLET_FILE}.keys" ]] || die "Wallet already exists at ${WALLET_FILE}.keys. Refusing to overwrite."
 
@@ -315,6 +337,7 @@ cmd_create_hot() {
         --mnemonic-language English \
         --log-file "$CLI_LOG_FILE" \
         --command address
+    pin_wallet_restore_height "$wallet_cli" "$restore_height" "${net_args[@]}"
 
     chmod 600 "${WALLET_FILE}"* 2>/dev/null || true
     fix_system_wallet_ownership
@@ -326,13 +349,13 @@ cmd_create_view_only() {
     require_cmd openssl
     local addr="${MONERO_VIEW_ONLY_ADDRESS:-}"
     local view_key="${MONERO_VIEW_ONLY_KEY:-}"
-    local restore_height="$WALLET_RESTORE_HEIGHT"
+    local cli_restore_height=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --address)        [[ $# -ge 2 ]] || die "--address requires a value"; addr="$2"; shift 2 ;;
             --view-key)       [[ $# -ge 2 ]] || die "--view-key requires a value"; view_key="$2"; shift 2 ;;
-            --restore-height) [[ $# -ge 2 ]] || die "--restore-height requires a value"; restore_height="$2"; shift 2 ;;
+            --restore-height) [[ $# -ge 2 ]] || die "--restore-height requires a value"; cli_restore_height="$2"; shift 2 ;;
             *) die "Unknown create-view-only option: $1" ;;
         esac
     done
@@ -350,6 +373,8 @@ cmd_create_view_only() {
 
     [[ -n "$addr" ]] || die "Primary address is required (--address or MONERO_VIEW_ONLY_ADDRESS)."
     [[ "$view_key" =~ ^[0-9a-fA-F]{64}$ ]] || die "Private view key must be exactly 64 hex characters."
+    local restore_height
+    restore_height="$(resolve_wallet_restore_height "$cli_restore_height")"
     [[ "$restore_height" =~ ^[0-9]+$ ]] || die "Invalid restore height: $restore_height"
 
     local wallet_cli
@@ -370,7 +395,9 @@ cmd_create_view_only() {
     [[ "$MONERO_NETWORK" == "testnet" ]] && net_args+=(--testnet)
 
     log_step "$(t wallet.vo_creating "$WALLET_FILE" "$restore_height")"
-    printf '%s\n%s\n%s\nN\n' "$addr" "$view_key" "$restore_height" | "$wallet_cli" \
+    # When --restore-height is passed to --generate-from-view-key, monero-wallet-cli reads
+    # exactly two stdin lines: standard address + secret view key (`v0.1.5`).
+    printf '%s\n%s\n' "$addr" "$view_key" | "$wallet_cli" \
         --offline \
         "${net_args[@]}" \
         --generate-from-view-key "$WALLET_FILE" \
@@ -378,6 +405,7 @@ cmd_create_view_only() {
         --restore-height "$restore_height" \
         --log-file "$CLI_LOG_FILE" \
         --command address
+    pin_wallet_restore_height "$wallet_cli" "$restore_height" "${net_args[@]}"
 
     chmod 600 "${WALLET_FILE}"* 2>/dev/null || true
     fix_system_wallet_ownership

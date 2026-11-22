@@ -7,7 +7,9 @@
 #   mkdir -p ~/.local/share/xmr-gateway/data ~/.local/share/xmr-gateway/wallet ~/.config/xmr-gateway
 #   chmod 700 ~/.local/share/xmr-gateway ~/.local/share/xmr-gateway/data ~/.local/share/xmr-gateway/wallet ~/.config/xmr-gateway
 #   # Put 0600 env file at ~/.config/xmr-gateway/gateway.env and initialize wallet in ~/.local/share/xmr-gateway/wallet/
-#   podman build -t localhost/xmr-gateway-wallet-rpc:latest -f deploy/docker/Containerfile.monero-rpc .
+#   # Pull prebuilt GHCR image (or build locally with `podman build -t localhost/xmr-gateway-wallet-rpc:latest -f deploy/docker/Containerfile.monero-rpc .`
+#   # and switch Image= below to `localhost/xmr-gateway-wallet-rpc:latest`):
+#   podman pull ghcr.io/xeonit-dev/xmr-gateway-wallet-rpc:v0.1.5
 #   # Quadlet units are generated dynamically (do NOT use `systemctl --user enable`):
 #   systemctl --user daemon-reload && systemctl --user start monero-wallet-rpc xmr-gateway
 #   loginctl enable-linger "$USER"
@@ -19,7 +21,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Container]
-Image=localhost/xmr-gateway-wallet-rpc:latest
+# Prebuilt multi-arch GHCR image (change to `localhost/xmr-gateway-wallet-rpc:latest` for local builds)
+Image=ghcr.io/xeonit-dev/xmr-gateway-wallet-rpc:v0.1.5
 ContainerName=xmr-gateway-wallet-rpc
 EnvironmentFile=%h/.config/xmr-gateway/gateway.env
 

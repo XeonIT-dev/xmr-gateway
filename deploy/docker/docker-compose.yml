@@ -1,9 +1,13 @@
 # ==============================================================================
 # xmr-gateway Production Docker / Podman Compose Stack
 # ==============================================================================
-# Usage:
+# Usage (prebuilt GHCR multi-arch images — recommended):
 #   cp deploy/docker/.env.docker.example deploy/docker/.env.docker
 #   chmod 600 deploy/docker/.env.docker
+#   docker compose -f deploy/docker/docker-compose.yml --env-file deploy/docker/.env.docker pull
+#   docker compose -f deploy/docker/docker-compose.yml --env-file deploy/docker/.env.docker up -d
+#
+# Or build locally from source:
 #   docker compose -f deploy/docker/docker-compose.yml --env-file deploy/docker/.env.docker up -d --build
 #
 # Optional automatic HTTPS via Caddy:
@@ -12,6 +16,7 @@
 
 services:
   monero-wallet-rpc:
+    image: ${XMR_WALLET_RPC_IMAGE:-ghcr.io/xeonit-dev/xmr-gateway-wallet-rpc:v0.1.5}
     build:
       context: ../..
       dockerfile: deploy/docker/Containerfile.monero-rpc
@@ -37,6 +42,7 @@ services:
       - xmr_egress
 
   xmr-gateway:
+    image: ${XMR_GATEWAY_IMAGE:-ghcr.io/xeonit-dev/xmr-gateway:v0.1.5}
     build:
       context: ../..
       dockerfile: Containerfile
